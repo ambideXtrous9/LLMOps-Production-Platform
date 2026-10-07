@@ -1,0 +1,30 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: "vllm"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["vllm:8000"]
+
+  - job_name: "litellm"
+    metrics_path: /metrics/
+    bearer_token: "sk-litellm-master-key-1234"
+    static_configs:
+      - targets: ["litellm:4000"]
+
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: "dcgm"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["dcgm-exporter:9400"]
+
+  - job_name: "node-exporter"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["node-exporter:9100"]
+

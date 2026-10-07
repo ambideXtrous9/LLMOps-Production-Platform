@@ -1,0 +1,13 @@
+model_list:
+  - model_name: smollm2
+    litellm_params:
+      model: openai/HuggingFaceTB/SmolLM2-360M-Instruct
+      api_base: http://vllm:8000/v1
+      api_key: "none"
+
+litellm_settings:
+  success_callback: ["prometheus"]
+  failure_callback: ["prometheus"]
+
+general_settings:
+  master_key: "sk-litellm-master-key-1234"

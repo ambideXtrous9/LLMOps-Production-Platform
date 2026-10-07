@@ -1,0 +1,213 @@
+services:
+  # ==========================================
+  # 1. INFERENCE ENGINE (vLLM)
+  # ==========================================
+  vllm:
+    image: vllm/vllm-openai:v0.6.6
+    container_name: vllm-inference
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ports:
+      - "8000:8000"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      - HF_HUB_ENABLE_HF_TRANSFER=0
+    command: >
+      --model HuggingFaceTB/SmolLM2-360M-Instruct
+      --dtype half
+      --gpu-memory-utilization 0.60
+      --max-model-len 2048
+      --enforce-eager
+      --host 0.0.0.0
+      --port 8000
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - llmops-net
+
+  # ==========================================
+  # 2. AI GATEWAY (LiteLLM Proxy)
+  # ==========================================
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    container_name: litellm-gateway
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./config/litellm.yaml:/app/config.yaml:ro
+    command: >
+      --config /app/config.yaml
+      --port 4000
+      --num_workers 1
+    depends_on:
+      vllm:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - llmops-net
+
+  # ==========================================
+  # 3. OBSERVABILITY DB (Postgres for Langfuse)
+  # ==========================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: langfuse-postgres
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgrespassword
+      - POSTGRES_DB=langfuse
+    volumes:
+      - langfuse_pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    networks:
+      - llmops-net
+
+  # ==========================================
+  # 4. TRACING & EVALUATION (Langfuse)
+  # ==========================================
+  langfuse:
+    image: langfuse/langfuse:2
+    container_name: langfuse-server
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgrespassword@postgres:5432/langfuse
+      - NEXTAUTH_SECRET=my-super-secret-nextauth-token-1234
+      - SALT=my-salt-salt-salt-salt-1234
+      - NEXTAUTH_URL=http://localhost:3000
+      - TELEMETRY_ENABLED=false
+    depends_on:
+      - postgres
+    restart: unless-stopped
+    networks:
+      - llmops-net
+
+  # ==========================================
+  # 5. METRICS SCRAPER (Prometheus)
+  # ==========================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus-scraper
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus.yaml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+    restart: unless-stopped
+    networks:
+      - llmops-net
+
+  # ==========================================
+  # 6. VISUALIZATION DASHBOARD (Grafana)
+  # ==========================================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana-dashboard
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./config/grafana-datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml:ro
+      - ./config/grafana-dashboards.yaml:/etc/grafana/provisioning/dashboards/dashboards.yaml:ro
+      - ./config/llmops-dashboard.json:/var/lib/grafana/dashboards/llmops-dashboard.json:ro
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks:
+      - llmops-net
+
+  # ==========================================
+  # 7. HARDWARE AGENT (NVIDIA DCGM Exporter)
+  # ==========================================
+  dcgm-exporter:
+    image: nvcr.io/nvidia/k8s/dcgm-exporter:latest
+    container_name: dcgm-hardware-exporter
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    cap_add:
+      - SYS_ADMIN
+    ports:
+      - "9400:9400"
+    restart: unless-stopped
+    networks:
+      - llmops-net
+
+  # ==========================================
+  # 8. LOG AGGREGATION ENGINE (Grafana Loki)
+  # ==========================================
+  loki:
+    image: grafana/loki:3.0.0
+    container_name: loki-engine
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./config/loki.yaml:/etc/loki/local-config.yaml:ro
+    command: -config.file=/etc/loki/local-config.yaml
+    restart: unless-stopped
+    networks:
+      - llmops-net
+
+  # ==========================================
+  # 9. CONTAINER LOG COLLECTOR (Promtail)
+  # ==========================================
+  promtail:
+    image: grafana/promtail:3.0.0
+    container_name: promtail-shipper
+    volumes:
+      - ./config/promtail.yaml:/etc/promtail/config.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: -config.file=/etc/promtail/config.yaml
+    depends_on:
+      - loki
+    restart: unless-stopped
+    networks:
+      - llmops-net
+
+  # ==========================================
+  # 10. SYSTEM METRICS AGENT (Node Exporter)
+  # ==========================================
+  node-exporter:
+    image: prom/node-exporter:v1.8.0
+    container_name: node-exporter
+    ports:
+      - "9100:9100"
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--path.rootfs=/rootfs'
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    restart: unless-stopped
+    networks:
+      - llmops-net
+
+volumes:
+  langfuse_pgdata:
+
+networks:
+  llmops-net:
+    driver: bridge
+
