@@ -7,7 +7,7 @@
 # device wiring:
 #   docker-compose.gpu.yml    NVIDIA CUDA  (vllm/vllm-openai)       + NVIDIA DCGM exporter
 #   docker-compose.rocm.yml   AMD ROCm     (vllm/vllm-openai-rocm)
-#   docker-compose.cpu.yml    x86_64/arm64 CPU (vllm/vllm-openai-cpu)
+#   docker-compose.cpu.yml    x86_64/arm64 CPU (llama.cpp server, GGUF)
 #   docker-compose.metal.yml  Apple Silicon: native vllm-metal on macOS, bridged in
 #   docker-compose.mock.yml   no inference at all: emulated engine for UI / pipeline dev
 #

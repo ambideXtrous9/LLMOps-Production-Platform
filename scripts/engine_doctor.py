@@ -38,17 +38,21 @@ RULES = [
     ("gpu_share", r"less than desired GPU memory utilization"),
     ("context", r"estimated maximum model length is|larger than the maximum number of tokens that can be stored in KV cache"),
     ("memory", r"No available memory for the cache blocks|CUDA out of memory|torch\.OutOfMemoryError|HIP out of memory"
-               r"|Cannot allocate memory|std::bad_alloc|Failed core proc\(s\): \{[^}]*-9\}"),
+               r"|Cannot allocate memory|std::bad_alloc|Failed core proc\(s\): \{[^}]*-9\}"
+               r"|failed to allocate|unable to allocate|insufficient memory"),
     ("access", r"GatedRepoError|Cannot access gated repo|is restricted\. You must|401 Client Error|RepositoryNotFoundError"
-               r"|Repository Not Found|Invalid credentials"),
-    ("unsupported", r"are not supported for now|Unrecognized model in|trust_remote_code=True|Model architectures .* not supported"),
+               r"|Repository Not Found|Invalid credentials|failed with status (401|403|404)"),
+    ("unsupported", r"are not supported for now|Unrecognized model in|trust_remote_code=True|Model architectures .* not supported"
+                    r"|unknown model architecture"),
     ("network", r"Temporary failure in name resolution|Name or service not known|Max retries exceeded|ConnectionError"
-                r"|Connection reset|Connection refused|ReadTimeout|IncompleteRead|50[0234] Server Error|LocalEntryNotFoundError"),
+                r"|Connection reset|Connection refused|ReadTimeout|IncompleteRead|50[0234] Server Error|LocalEntryNotFoundError"
+                r"|failed to download model|Could not resolve host"),
 ]
 
 
 def engine_output(platform_name: str) -> Tuple[str, bool]:
-    """Recent engine output and whether the kernel OOM-killed it."""
+    """Recent engine output and whether the kernel killed it for memory. llama.cpp dies
+    without a message when RAM runs out: exit 137 that run_all.sh did not cause counts too."""
     if platform_name == "metal":
         try:
             with open(os.path.join(ROOT_DIR, "reports", "metal-engine.log"), encoding="utf-8", errors="replace") as f:
@@ -58,9 +62,10 @@ def engine_output(platform_name: str) -> Tuple[str, bool]:
     try:
         logs = subprocess.run(["docker", "logs", "--tail", "400", CONTAINER], capture_output=True, text=True,
                               errors="replace", timeout=60)
-        state = subprocess.run(["docker", "inspect", "-f", "{{.State.OOMKilled}}", CONTAINER],
-                               capture_output=True, text=True, timeout=30)
-        return logs.stdout + logs.stderr, state.stdout.strip() == "true"
+        state = subprocess.run(["docker", "inspect", "-f", "{{.State.OOMKilled}} {{.State.ExitCode}}", CONTAINER],
+                               capture_output=True, text=True, timeout=30).stdout.split()
+        killed = bool(state) and (state[0] == "true" or (state[-1] == "137" and os.getenv("ENGINE_STALLED") != "1"))
+        return logs.stdout + logs.stderr, killed
     except (OSError, subprocess.SubprocessError):
         return "", False
 
@@ -114,6 +119,11 @@ def decide(env: Dict[str, str], text: str, oom_killed: bool, platform_name: str 
                     "DOCTOR_REASON": f"context length {env.get('MAX_MODEL_LEN')} does not fit this accelerator{fits}: "
                                      "MAX_MODEL_LEN=auto (saved in .env)"}
         kind = "memory"
+    if kind == "memory" and platform_name == "cpu":
+        ctx = int(env.get("LLAMACPP_CTX") or 0)
+        if ctx > 4096:  # llama.cpp: a smaller KV cache before a smaller model
+            return {"DOCTOR_ACTION": "set", "DOCTOR_KEY": "LLAMACPP_CTX", "DOCTOR_VALUE": str(ctx // 2), "DOCTOR_PERSIST": "0",
+                    "DOCTOR_REASON": f"not enough RAM for a {ctx}-token llama.cpp context: context {ctx // 2}"}
     if kind == "network":
         if retries < 3:
             return {"DOCTOR_ACTION": "retry", "DOCTOR_REASON": f"download / network error: retry {retries + 1} of 3"}
@@ -128,7 +138,7 @@ def decide(env: Dict[str, str], text: str, oom_killed: bool, platform_name: str 
         "memory": f"{model} does not fit this machine's memory",
         "disk": f"not enough disk space for the {model} weights",
         "access": f"{model} is gated or private (accept its license and set HF_TOKEN in .env)",
-        "unsupported": f"{model} is not supported by this vLLM release",
+        "unsupported": f"{model} is not supported by this {'llama.cpp' if platform_name == 'cpu' else 'vLLM'} release",
     }.get(kind or "", f"{model} failed to start twice")
     nxt = fallback_model(env)
     if nxt:

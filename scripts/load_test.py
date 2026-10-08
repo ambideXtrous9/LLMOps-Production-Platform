@@ -19,6 +19,7 @@ Env: CONCURRENCY (default 32), REQUESTS (default = CONCURRENCY), MAX_TOKENS (def
 
 import argparse
 import concurrent.futures
+import json
 import multiprocessing
 import os
 import sys
@@ -63,15 +64,28 @@ def send_streaming_request(req_id: int) -> ChatResult:
     return res
 
 
+# llama.cpp (CPU engine) equivalents of the vLLM gauges
+LLAMACPP_GAUGES = {"llamacpp:requests_processing": "vllm:num_requests_running",
+                   "llamacpp:requests_deferred": "vllm:num_requests_waiting"}
+
+
 def scrape_engine() -> Dict[str, float]:
-    """Sums the engine gauges we care about (labels vary by vLLM version)."""
+    """Sums the engine gauges we care about (labels vary by vLLM version). llama.cpp has no
+    KV-cache gauge: its load is busy / total request slots from /slots."""
     wanted = {"vllm:num_requests_running": 0.0, "vllm:num_requests_waiting": 0.0, "vllm:kv_cache_usage_perc": 0.0}
+    llamacpp = False
     try:
         with urllib.request.urlopen(VLLM_METRICS_URL, timeout=3) as resp:
             for line in resp.read().decode("utf-8").splitlines():
                 name = line.split("{", 1)[0].split(" ", 1)[0]
-                if name in wanted:
+                llamacpp = llamacpp or name.startswith("llamacpp:")
+                name = LLAMACPP_GAUGES.get(name, name)
+                if name in wanted and not line.startswith("#"):
                     wanted[name] += float(line.rsplit(" ", 1)[-1])
+        if llamacpp:
+            with urllib.request.urlopen(VLLM_METRICS_URL.rsplit("/metrics", 1)[0] + "/slots", timeout=3) as resp:
+                slots = json.loads(resp.read().decode("utf-8"))
+            wanted["vllm:kv_cache_usage_perc"] = sum(1 for s in slots if s.get("is_processing")) / max(len(slots), 1)
     except Exception:
         pass
     return wanted

@@ -48,11 +48,11 @@ sys.path.insert(0, "scripts")
 from configure_model import DEFAULTS, MODEL_KEYS, parse_env_file
 
 env = {**DEFAULTS, **{k: v for k, v in parse_env_file(".env").items() if v != ""}}
-model_keys = MODEL_KEYS + ["VLLM_EXTRA_ARGS", "VLLM_CPU_KVCACHE_SPACE"]
+model_keys = MODEL_KEYS + ["VLLM_EXTRA_ARGS", "LLAMACPP_EXTRA_ARGS", "LLAMACPP_CTX", "LLAMACPP_PARALLEL"]
 secret_keys = ["LITELLM_MASTER_KEY", "POSTGRES_USER", "POSTGRES_PASSWORD", "REDIS_PASSWORD", "HF_TOKEN"]
 os.makedirs("k8s/base/generated", exist_ok=True)
 with open("k8s/base/generated/model.env", "w") as f:
-    # Unset rather than empty: vLLM rejects empty numeric env vars (e.g. VLLM_CPU_KVCACHE_SPACE='').
+    # Unset rather than empty: engines reject empty numeric env vars (e.g. LLAMACPP_CTX='').
     f.writelines(f"{k}={env[k]}\n" for k in model_keys if env.get(k, "") != "")
 with open("k8s/base/generated/secrets.env", "w") as f:
     f.writelines(f"{k}={env.get(k, '')}\n" for k in secret_keys)

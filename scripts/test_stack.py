@@ -73,8 +73,8 @@ def fail(msg: str) -> bool:
 def test_vllm_engine() -> bool:
     status, body = http_json(f"{VLLM_URL}/health")
     if status != 200:
-        return fail(f"vLLM /health returned {status}: {str(body)[:120]}")
-    ok("vLLM engine is HEALTHY")
+        return fail(f"engine /health returned {status}: {str(body)[:120]}")
+    ok("Inference engine is HEALTHY")
     status, body = http_json(f"{VLLM_URL}/v1/models")
     served = [m.get("id") for m in body.get("data", [])] if isinstance(body, dict) else []
     if SERVED_MODEL not in served:
@@ -251,8 +251,8 @@ def test_traces() -> bool:
     ok("Tempo ONLINE")
     # The gateway forwards the caller's W3C traceparent, so the trace id injected in
     # the streaming check must hold both gateway and engine spans once flushed.
-    # Engines on cuda / rocm / cpu export OTLP spans; mock and native metal may not.
-    engine_exports_spans = os.getenv("LLMOPS_PLATFORM", "") in ("cuda", "rocm", "cpu")
+    # vLLM on cuda / rocm exports OTLP spans; llama.cpp (cpu), mock and native metal do not.
+    engine_exports_spans = os.getenv("LLMOPS_PLATFORM", "") in ("cuda", "rocm")
     wanted = {"litellm-gateway", "vllm-engine"} if engine_exports_spans else {"litellm-gateway"}
     services: List[str] = []
     for _ in range(15):  # gateway and engine flush their span batches independently
@@ -343,7 +343,7 @@ def test_grafana() -> bool:
 
 
 CHECKS: List[Tuple[str, str, Callable[[], bool]]] = [
-    ("engine", "Plane 2: vLLM Inference Engine", test_vllm_engine),
+    ("engine", "Plane 2: Inference Engine (vLLM / llama.cpp)", test_vllm_engine),
     ("router", "Plane 1/2: KV-Cache-Aware Router", test_kv_router),
     ("gateway", "Plane 1: Gateway SSE Streaming via Virtual Key", test_streaming_inference),
     ("thinking", "Plane 1/2: Thinking (Reasoning) Alias", test_thinking_alias),

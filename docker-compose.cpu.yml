@@ -1,20 +1,38 @@
 # ==============================================================================
 # CPU Platform Overlay (x86_64 / arm64 Linux, Docker Desktop on any OS)
 # ==============================================================================
-# Real inference on CPU with vLLM's CPU backend (vllm/vllm-openai-cpu), so the full
-# architecture - router, gateway, guardrails, telemetry, eval gates - runs unchanged
-# on machines without an accelerator. Use a small model (default preset qwen3-4b:
-# ~10 tok/s/stream on 30 EPYC cores): CPU decode is memory-bandwidth bound.
+# On CPUs the engine is llama.cpp's server (ggml-org/llama.cpp): GGUF quantised
+# weights and hand-tuned CPU kernels make it the fastest CPU inference engine. It
+# keeps the engine contract of every other platform - service `vllm`, port 8000,
+# OpenAI API, /health, Prometheus /metrics - so router, gateway, tests and dashboards
+# are unchanged (config/prometheus-rules.yaml publishes llamacpp:* metrics under the
+# vLLM names). The GGUF build comes from the model block (GGUF_REPO / GGUF_FILE /
+# GGUF_REVISION, pinned) and is downloaded once into HF_CACHE_DIR/gguf.
 #
+# Sizing (run_all.sh, from RAM and CPU threads): LLAMACPP_CTX tokens of KV cache
+# shared by LLAMACPP_PARALLEL request slots.
 # No GPU: the hardware exporter stub reports the platform without GPU samples.
 # ==============================================================================
 
 services:
   vllm:
-    image: vllm/vllm-openai-cpu:${VLLM_VERSION:-v0.31.0}
-    environment:
-      # GiB of RAM reserved for the KV cache (CPU equivalent of --gpu-memory-utilization);
-      # run_all.sh sizes it from RAM when .env leaves it empty
-      - VLLM_CPU_KVCACHE_SPACE=${VLLM_CPU_KVCACHE_SPACE:-4}
-      # Pin OpenMP threads to physical cores ("auto" lets vLLM pick NUMA-local cores)
-      - VLLM_CPU_OMP_THREADS_BIND=${VLLM_CPU_OMP_THREADS_BIND:-auto}
+    image: ghcr.io/ggml-org/llama.cpp:${LLAMACPP_IMAGE_TAG:-server-b10902}
+    command: >
+      --model-url https://huggingface.co/${GGUF_REPO:-Qwen/Qwen3-4B-GGUF}/resolve/${GGUF_REVISION:-main}/${GGUF_FILE:-Qwen3-4B-Q4_K_M.gguf}
+      --model /models/${GGUF_FILE:-Qwen3-4B-Q4_K_M.gguf}
+      --alias ${SERVED_MODEL_NAME:-qwen3-4b}
+      --ctx-size ${LLAMACPP_CTX:-16384}
+      --parallel ${LLAMACPP_PARALLEL:-4}
+      --kv-unified
+      ${LLAMACPP_SLOT_ARGS:-}
+      --metrics
+      --host 0.0.0.0
+      --port 8000
+      ${LLAMACPP_MODEL_ARGS:-}
+      ${LLAMACPP_EXTRA_ARGS:-}
+    volumes:
+      - ${HF_CACHE_DIR:-~/.cache/huggingface}/gguf:/models
+    healthcheck:
+      # the llama.cpp image ships curl (no python3)
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      start_period: 600s

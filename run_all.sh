@@ -16,11 +16,12 @@ set -eo pipefail
 #   - platform changed since last run   -> model re-sized for the new hardware
 #   - .env regenerated, old database    -> Postgres password re-synced
 #
-# Same architecture on every platform; only the vLLM engine build changes:
+# Same architecture on every platform; only the inference engine changes (chosen
+# automatically from the detected hardware):
 #   1. Apple Silicon (M1-M4) -> native vllm-metal on macOS (started here), bridged into compose
 #   2. NVIDIA CUDA GPUs     -> vllm/vllm-openai + DCGM telemetry
 #   3. AMD ROCm GPUs        -> vllm/vllm-openai-rocm
-#   4. CPU (x86_64/arm64)   -> vllm/vllm-openai-cpu (real inference)
+#   4. CPU (x86_64/arm64)   -> llama.cpp server with GGUF weights (fastest on CPU)
 #   (--mock: emulated engine, no inference - pipeline / dashboard development)
 #
 # Model: any Hugging Face repo or curated preset, e.g.
@@ -86,6 +87,7 @@ while [ $# -gt 0 ]; do
 done
 
 REMEDIATIONS=()     # automatic fixes applied this run (final report)
+ADVISORIES=()       # findings that do not fail the run (final report)
 PORT_EXPORTS=""     # this run's host ports   (scripts/preflight.py ports)
 FIT_EXPORTS=""      # this run's sizing       (scripts/preflight.py fit)
 FIT_DONE=false
@@ -156,7 +158,7 @@ set_platform() {
         rocm)  COMPOSE_OVERLAY="docker-compose.rocm.yml";  PLATFORM_LABEL="🔥 AMD ROCm (vllm/vllm-openai-rocm)" ;;
         metal) COMPOSE_OVERLAY="docker-compose.metal.yml"; PLATFORM_LABEL="🍏 Apple Silicon Metal (native vllm-metal, bridged)" ;;
         mock)  COMPOSE_OVERLAY="docker-compose.mock.yml";  PLATFORM_LABEL="🧪 Mock engine (no inference)" ;;
-        *)     TARGET_BACKEND="cpu"; COMPOSE_OVERLAY="docker-compose.cpu.yml"; PLATFORM_LABEL="💻 CPU (vllm/vllm-openai-cpu)" ;;
+        *)     TARGET_BACKEND="cpu"; COMPOSE_OVERLAY="docker-compose.cpu.yml"; PLATFORM_LABEL="💻 CPU (llama.cpp server, GGUF)" ;;
     esac
     COMPOSE_FILES=("-f" "docker-compose.yml" "-f" "$COMPOSE_OVERLAY")
     # SELinux enforcing (Fedora / RHEL family): containers cannot read bind mounts otherwise
@@ -164,6 +166,18 @@ set_platform() {
         COMPOSE_FILES+=("-f" "docker-compose.selinux.yml")
     fi
     export LLMOPS_PLATFORM="$TARGET_BACKEND"
+}
+
+# running_platform: platform of the stack that is up right now (what --test verifies)
+running_platform() {
+    case "$(docker inspect -f '{{.Config.Image}}' vllm-inference 2>/dev/null || true)" in
+        *llama.cpp*) echo cpu ;;
+        *vllm-openai-rocm*) echo rocm ;;
+        *vllm-openai*) echo cuda ;;
+        *socat*) echo metal ;;
+        *mock*) echo mock ;;
+        *) echo "" ;;
+    esac
 }
 
 # load_env: .env, then this run's host ports and sizing on top of it
@@ -539,8 +553,15 @@ if [ -n "$FORCE_MODE" ]; then
             fixed "Platform '${FORCE_MODE}' is not usable on this machine: using ${TARGET_BACKEND} instead" ;;
     esac
 fi
+if [ "$TEST_ONLY" = true ] && [ -z "$FORCE_MODE" ]; then
+    RUNNING_PLATFORM="$(running_platform)"
+    if [ -n "$RUNNING_PLATFORM" ] && [ "$RUNNING_PLATFORM" != "$TARGET_BACKEND" ]; then
+        echo -e "  ${YELLOW}ℹ --test:${NC} verifying the running ${RUNNING_PLATFORM} stack"
+        TARGET_BACKEND="$RUNNING_PLATFORM"
+    fi
+fi
 set_platform "$TARGET_BACKEND"
-if [ "$TARGET_BACKEND" = "metal" ]; then ensure_metal_cli; fi
+if [ "$TARGET_BACKEND" = "metal" ] && [ "$TEST_ONLY" != true ]; then ensure_metal_cli; fi
 echo -e "  ${GREEN}${BOLD}${PLATFORM_LABEL}${NC}"
 echo -e "  • ${BOLD}Hardware:${NC} $HARDWARE_SUMMARY"
 echo -e "  • ${BOLD}Compose:${NC} docker-compose.yml + ${COMPOSE_OVERLAY}"
@@ -562,7 +583,13 @@ else
     # Existing deployment: only back-fill secrets introduced by newer stack versions.
     INIT_STATUS=$(python3 scripts/init_env.py)
     if [ "$INIT_STATUS" != "exists" ]; then echo -e "  ${GREEN}✓${NC} .env ${INIT_STATUS}"; fi
-    decide_model
+    if [ "$TEST_ONLY" = true ]; then
+        # --test verifies the stack as it runs: the model block stays untouched
+        if [ -n "$MODEL_ARG" ]; then echo -e "  ${YELLOW}ℹ --test ignores --model (the running model is verified)${NC}"; fi
+        MODEL_ARG=""
+    else
+        decide_model
+    fi
 fi
 if [ -n "$MODEL_ARG" ]; then
     echo -e "  • Configuring served model: ${BOLD}${MODEL_ARG}${NC}"
@@ -577,7 +604,7 @@ load_env
 echo -e "  ${GREEN}✓${NC} Environment secrets loaded from .env (model: ${MODEL_NAME:-unset} as '${SERVED_MODEL_NAME:-unset}')"
 
 # Ensure host cache directory exists (bind-mounted into the engine)
-mkdir -p "${HF_CACHE_DIR:-$HOME/.cache/huggingface}"
+mkdir -p "${HF_CACHE_DIR:-$HOME/.cache/huggingface}/gguf"  # gguf/: llama.cpp weights (CPU)
 
 if [ "$TEST_ONLY" = true ]; then
     echo -e "\n${YELLOW}ℹ --test flag provided. Skipping container boot and running verification...${NC}"
@@ -639,7 +666,9 @@ print(" ".join(i for i in images if subprocess.run(["docker", "image", "inspect"
     # ------------------------------------------------------------------------------
     # STEP 6: Start the Inference Engine (loads in the background)
     # ------------------------------------------------------------------------------
-    echo -e "\n${BLUE}${BOLD}[6/10] Starting Inference Engine (vLLM: ${MODEL_NAME:-default model})...${NC}"
+    ENGINE_DESC="vLLM: ${MODEL_NAME:-default model}"
+    if [ "$TARGET_BACKEND" = "cpu" ]; then ENGINE_DESC="llama.cpp: ${GGUF_REPO:-?}/${GGUF_FILE:-?}"; fi
+    echo -e "\n${BLUE}${BOLD}[6/10] Starting Inference Engine (${ENGINE_DESC})...${NC}"
     start_engine
     echo -e "  ${GREEN}✓${NC} Engine started; continuing while the model loads."
 
@@ -714,7 +743,15 @@ else
         echo -e "\n${YELLOW}ℹ Mock engine: skipping the model eval gate and LLM-as-judge (no real model).${NC}"
     else
         echo -e "\n${CYAN}>>> [C] CI/CD Model Evaluation Gate (Plane 9)...${NC}"
-        python3 scripts/eval_gate.py --model "$GATEWAY_MODEL" || FAILED_STAGES+=("eval_gate")
+        if ! python3 scripts/eval_gate.py --model "$GATEWAY_MODEL"; then
+            # Presets carry thresholds calibrated on verified hardware: a miss is a regression.
+            # Any other Hub model gets the verdict as a report unless EVAL_ENFORCE=true (CI).
+            if [ "${MODEL_PRESET:-}" = "auto" ] && [ "${EVAL_ENFORCE:-false}" != "true" ]; then
+                ADVISORIES+=("Model quality gate rejected ${MODEL_NAME} (advisory for models outside the verified presets; EVAL_ENFORCE=true makes it fail the run)")
+            else
+                FAILED_STAGES+=("eval_gate")
+            fi
+        fi
 
         echo -e "\n${CYAN}>>> [D] Online LLM-as-Judge Evaluation Worker...${NC}"
         python3 scripts/online_eval_judge.py || FAILED_STAGES+=("online_eval_judge")
@@ -740,6 +777,11 @@ if [ ${#REMEDIATIONS[@]} -gt 0 ]; then
     for item in "${REMEDIATIONS[@]}"; do echo -e "  • ${YELLOW}↻${NC} ${item}"; done
     echo ""
 fi
+if [ ${#ADVISORIES[@]} -gt 0 ]; then
+    echo -e "  ${BOLD}Advisories:${NC}"
+    for item in "${ADVISORIES[@]}"; do echo -e "  • ${YELLOW}⚠${NC} ${item}"; done
+    echo ""
+fi
 echo -e "  ${BOLD}Hardware Diagnostic Summary:${NC}"
 echo -e "  • ${PURPLE}Detected Architecture${NC} : $HARDWARE_SUMMARY"
 echo -e "  • ${PURPLE}Active Backend Profile${NC}: config/profiles/$HARDWARE_PROFILE"
@@ -747,11 +789,13 @@ THINKING_ALIAS=""
 if [ "${MODEL_SUPPORTS_REASONING:-false}" = "true" ]; then THINKING_ALIAS=", ${GATEWAY_MODEL}-thinking"; fi
 echo -e "  • ${PURPLE}Platform              ${NC}: ${TARGET_BACKEND} (${COMPOSE_OVERLAY})"
 echo -e "  • ${PURPLE}Served Model          ${NC}: ${MODEL_NAME:-?} (gateway aliases: ${GATEWAY_MODEL}, ${GATEWAY_MODEL}-direct${THINKING_ALIAS})"
-SIZING="gateway workers ${LITELLM_NUM_WORKERS:-4}, context ${MAX_MODEL_LEN:-auto}"
 case "$TARGET_BACKEND" in
-    cuda|rocm) SIZING="${SIZING}, engine memory fraction ${GPU_MEMORY_UTILIZATION:-0.90}" ;;
-    cpu)       SIZING="${SIZING}, CPU KV cache ${VLLM_CPU_KVCACHE_SPACE:-4} GiB" ;;
+    cuda|rocm) SIZING="vLLM, context ${MAX_MODEL_LEN:-auto}, engine memory fraction ${GPU_MEMORY_UTILIZATION:-0.90}" ;;
+    cpu)       SIZING="llama.cpp ${GGUF_FILE:-?}, ${LLAMACPP_CTX:-16384}-token context shared by ${LLAMACPP_PARALLEL:-4} slots" ;;
+    metal)     SIZING="vllm-metal, context ${MAX_MODEL_LEN:-auto}" ;;
+    *)         SIZING="mock engine" ;;
 esac
+SIZING="${SIZING}, gateway workers ${LITELLM_NUM_WORKERS:-4}"
 echo -e "  • ${PURPLE}Sizing                ${NC}: ${SIZING}"
 echo -e "  • ${PURPLE}Switch Model          ${NC}: ./run_all.sh --model <preset | any/hf-repo>"
 echo ""

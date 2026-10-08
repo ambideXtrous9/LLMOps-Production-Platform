@@ -13,6 +13,8 @@ drives the vLLM engine (docker-compose.yml), the generated gateway routes
 Auto-profiling reads only Hugging Face Hub metadata (model info, config.json, chat
 template) - no weights are downloaded - and derives the reasoning parser, tool-call
 parser, thinking toggle, vision limits and served name, plus a weight-memory estimate.
+On CPU the engine is llama.cpp: the configurator also finds a GGUF build of the model
+on the Hub (Q4_K_M preferred) and pins it (GGUF_REPO / GGUF_FILE / GGUF_REVISION).
 Everything it writes can be edited in .env afterwards. Then (re)start the stack:
   ./run_all.sh              or   docker compose -f docker-compose.yml -f docker-compose.<platform>.yml up -d
 """
@@ -23,8 +25,9 @@ import os
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from init_env import ENV_PATH, ROOT_DIR, ensure_env, quote  # noqa: E402
@@ -37,14 +40,19 @@ MODEL_KEYS = [
     "MODEL_PRESET", "MODEL_NAME", "MODEL_REVISION", "SERVED_MODEL_NAME", "MODEL_DTYPE", "MAX_MODEL_LEN",
     "GPU_MEMORY_UTILIZATION", "VLLM_MODEL_ARGS", "MODEL_SUPPORTS_REASONING", "MODEL_REASONING_BY_DEFAULT",
     "MODEL_SUPPORTS_TOOLS", "MODEL_SUPPORTS_VISION", "MODEL_THINKING_EXTRA_BODY",
+    "GGUF_REPO", "GGUF_FILE", "GGUF_REVISION", "LLAMACPP_MODEL_ARGS",
     "EVAL_MIN_ACCURACY", "EVAL_MAX_TTFT", "EVAL_MIN_TPS", "MODEL_PLATFORM",
 ]
 DEFAULTS = {
     "MODEL_REVISION": "main", "MODEL_DTYPE": "auto", "MAX_MODEL_LEN": "auto", "GPU_MEMORY_UTILIZATION": "0.90",
     "VLLM_MODEL_ARGS": "", "MODEL_SUPPORTS_REASONING": "false", "MODEL_REASONING_BY_DEFAULT": "false",
     "MODEL_SUPPORTS_TOOLS": "false", "MODEL_SUPPORTS_VISION": "false", "MODEL_THINKING_EXTRA_BODY": "",
+    "GGUF_REPO": "", "GGUF_FILE": "", "GGUF_REVISION": "main", "LLAMACPP_MODEL_ARGS": "",
     "EVAL_MIN_ACCURACY": "0.75", "EVAL_MAX_TTFT": "1.5", "EVAL_MIN_TPS": "20", "MODEL_PLATFORM": "",
 }
+# llama.cpp quantisations, best CPU speed/quality trade-off first
+QUANT_PREFERENCE = ["Q4_K_M", "Q4_K_S", "IQ4_XS", "Q4_0", "Q5_K_M", "Q5_0", "Q6_K", "Q8_0"]
+GGUF_PUBLISHERS = ["ggml-org", "unsloth", "bartowski", "lmstudio-community"]
 
 
 # ------------------------------------------------------------------------------
@@ -227,8 +235,51 @@ def profile_hf_model(repo: str, revision: str, token: Optional[str]) -> Tuple[Di
         "weights_gb": round(params * bytes_per_param / 1e9, 1), "vision": vision, "gated": info.get("gated"),
         "max_position_embeddings": cfg.get("max_position_embeddings") or text_cfg.get("max_position_embeddings"),
         "reasoning_parser": reasoning_parser, "tool_parser": tool_parser,
+        "thinking_toggle": "enable_thinking" in template, "info": info,
     }
     return block, facts
+
+
+def gguf_files(info: Dict) -> List[str]:
+    return [s["rfilename"] for s in info.get("siblings", []) if s.get("rfilename", "").lower().endswith(".gguf")]
+
+
+def pick_quant(files: List[str]) -> Optional[str]:
+    """A single-file weight GGUF in the preferred quantisation (no projectors, no splits)."""
+    plain = [f for f in files if "/" not in f and "mmproj" not in f.lower()
+             and not re.search(r"-\d{5}-of-\d{5}\.gguf$", f, re.I)]
+    for quant in QUANT_PREFERENCE:
+        for name in plain:
+            if re.search(rf"(^|[._-]){quant}([._-]|$)", name, re.I):
+                return name
+    return plain[0] if plain else None
+
+
+def find_gguf(repo: str, info: Dict, token: Optional[str]) -> Optional[Dict[str, str]]:
+    """GGUF build of `repo` for llama.cpp: the repo itself, a <repo>-GGUF sibling, a known
+    publisher, then a Hub search. Returns GGUF_* values plus the vision projector, if any."""
+    name = repo.split("/")[-1]
+    candidates = ([repo] if gguf_files(info) else []) + [f"{repo}-GGUF"] + \
+        [f"{org}/{name}-GGUF" for org in GGUF_PUBLISHERS] + [f"bartowski/{repo.replace('/', '_')}-GGUF"]
+    found = hub_get(f"api/models?search={urllib.parse.quote(name)}&filter=gguf&sort=downloads&direction=-1&limit=10", token)
+    candidates += [m["id"] for m in json.loads(found or "[]") if name.lower() in m.get("id", "").lower()]
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        raw = info if candidate == repo else hub_get(f"api/models/{candidate}", token)
+        cinfo = raw if isinstance(raw, dict) else (json.loads(raw) if raw else None)
+        if not cinfo:
+            continue
+        files = gguf_files(cinfo)
+        weights = pick_quant(files)
+        if weights:
+            projectors = sorted(f for f in files if "mmproj" in f.lower() and "/" not in f)
+            mmproj = next((f for f in projectors if "f16" in f.lower()), projectors[0] if projectors else "")
+            return {"GGUF_REPO": candidate, "GGUF_FILE": weights, "GGUF_REVISION": cinfo.get("sha") or "main",
+                    "mmproj": mmproj}
+    return None
 
 
 # ------------------------------------------------------------------------------
@@ -262,6 +313,25 @@ def main() -> int:
         print(f"✗ '{args.model}' is neither a preset ({', '.join(presets)}) nor a Hugging Face repo id (org/name).")
         return 1
 
+    if facts and args.platform == "cpu":
+        # CPU engine = llama.cpp: needs a GGUF build of the model
+        token = os.getenv("HF_TOKEN") or (parse_env_file(ENV_PATH).get("HF_TOKEN") if os.path.exists(ENV_PATH) else None)
+        gguf = find_gguf(block["MODEL_NAME"], facts["info"], token or None)
+        if not gguf:
+            print(f"✗ {block['MODEL_NAME']}: no GGUF build found on the Hub (CPU inference runs on llama.cpp).")
+            return 1
+        llama_args = []
+        if facts["reasoning_parser"]:
+            llama_args += ["--reasoning-format", "deepseek"] + (["--reasoning", "off"] if facts["thinking_toggle"] else [])
+        if gguf["mmproj"] and facts["vision"]:
+            local = f"{gguf['GGUF_FILE'].rsplit('.', 1)[0]}-{gguf['mmproj']}"
+            llama_args += ["--mmproj-url", f"{HF}/{gguf['GGUF_REPO']}/resolve/{gguf['GGUF_REVISION']}/{gguf['mmproj']}",
+                           "--mmproj", f"/models/{local}"]
+        elif facts["vision"]:
+            block["MODEL_SUPPORTS_VISION"] = "false"  # GGUF build has no vision projector
+        block.update({k: v for k, v in gguf.items() if k.startswith("GGUF_")})
+        block["LLAMACPP_MODEL_ARGS"] = " ".join(llama_args)
+        facts["gguf"] = f"{gguf['GGUF_REPO']}/{gguf['GGUF_FILE']}"
     if args.platform in ("cpu", "metal"):
         # CPU / unified-memory decode speed varies ~10x between machines (cores, memory
         # bandwidth): the gate checks quality there and only catches pathological speed.
@@ -282,7 +352,8 @@ def main() -> int:
         print(f"🔎 Auto-profiled {block['MODEL_NAME']}@{block['MODEL_REVISION'][:12]}: "
               f"{facts['model_type']} | {facts['params_b']}B params | quant {facts['quantization']} | "
               f"~{facts['weights_gb']} GB weights | vision={facts['vision']} | "
-              f"reasoning={facts['reasoning_parser']} | tools={facts['tool_parser']}")
+              f"reasoning={facts['reasoning_parser']} | tools={facts['tool_parser']}"
+              + (f" | GGUF {facts['gguf']}" if facts.get("gguf") else ""))
         if facts.get("gated"):
             print("  ⚠ Gated repo: the engine needs HF_TOKEN in .env (license accepted on huggingface.co).")
     for key in MODEL_KEYS:

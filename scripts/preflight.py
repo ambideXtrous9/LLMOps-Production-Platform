@@ -14,8 +14,9 @@ ports  A port held by another program moves to the next free one and is saved in
        an address of this machine falls back to 127.0.0.1 for this run.
 fit    Gateway workers follow the CPU count (LITELLM_NUM_WORKERS empty = auto). On GPUs the
        engine memory fraction follows the memory that is free right now (GPUs shared with
-       other processes); on CPU hosts the KV cache follows RAM (VLLM_CPU_KVCACHE_SPACE
-       empty = auto). Exported for this run only: .env keeps the configured values.
+       other processes); on CPU hosts llama.cpp's context and request slots follow RAM and
+       threads (LLAMACPP_CTX / LLAMACPP_PARALLEL empty = auto). Exported for this run only:
+       .env keeps the configured values.
 """
 
 import argparse
@@ -198,12 +199,19 @@ def cmd_fit(platform_name: str) -> int:
                 note(f"  ↻ GPU is shared with other processes: engine memory fraction {configured:.2f} -> {fraction:.2f}")
 
     if platform_name == "cpu":
-        kv = (cfg.get("VLLM_CPU_KVCACHE_SPACE") or "").strip().lower()
-        if kv in ("", "auto"):
-            ram = host_ram_gb()
-            n = 8 if ram >= 64 else 4 if ram >= 32 else 2 if ram >= 16 else 1
-            exports["VLLM_CPU_KVCACHE_SPACE"] = str(n)
-            note(f"  • CPU KV cache      : {n} GiB (auto, {ram:.0f} GB RAM)")
+        # llama.cpp: one KV cache of LLAMACPP_CTX tokens shared (--kv-unified) by the slots
+        ram = host_ram_gb()
+        ctx = (cfg.get("LLAMACPP_CTX") or "").strip().lower()
+        if ctx in ("", "auto"):
+            exports["LLAMACPP_CTX"] = str(32768 if ram >= 32 else 16384 if ram >= 16 else 8192)
+        slots = (cfg.get("LLAMACPP_PARALLEL") or "").strip().lower()
+        if slots in ("", "auto"):
+            exports["LLAMACPP_PARALLEL"] = str(8 if threads >= 16 else 4)
+        # a preset with a fixed context (e.g. 2048 for SmolLM2) caps every request at it
+        max_len = (cfg.get("MAX_MODEL_LEN") or "").strip()
+        exports["LLAMACPP_SLOT_ARGS"] = f"--kv-unified-per-slot {max_len}" if max_len.isdigit() else ""
+        note(f"  • llama.cpp context : {exports.get('LLAMACPP_CTX', ctx)} tokens shared by "
+             f"{exports.get('LLAMACPP_PARALLEL', slots)} slots ({ram:.0f} GB RAM, {threads} threads)")
 
     for key, value in exports.items():
         print(f"export {key}={shlex.quote(value)}")

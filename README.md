@@ -36,7 +36,7 @@
 
 | Capability | What it does | Built with |
 | :--- | :--- | :--- |
-| **Serve** | Any Hugging Face model; continuous batching; prefix caching | vLLM v0.31 |
+| **Serve** | Any Hugging Face model; continuous batching; prefix caching; engine picked per hardware | vLLM v0.31 (GPU) · vllm-metal (Apple) · llama.cpp (CPU) |
 | **Run anywhere** | NVIDIA CUDA · AMD ROCm · CPU · Apple Silicon — same architecture | Compose overlays · Kubernetes overlays |
 | **Govern** | Virtual keys, budgets, rate limits, PII masking, response cache | LiteLLM · Postgres · Redis |
 | **Route** | Prompt-prefix affinity across engine replicas | KV-cache-aware router |
@@ -62,20 +62,20 @@
 │    LiteLLM AI Gateway (:4000) - routes rendered from the .env model block                             │
 │    • Team Virtual Keys (Postgres)   • Spend Limits & Budgets         • PII Masking Guardrail          │
 │    • Redis Rate-Limit Sync          • Redis Response Cache           • traceparent Forwarded          │
-│    • Aliases: <name> → router · <name>-thinking → router · <name>-direct → vLLM (fallback)            │
+│    • Aliases: <name> → router · <name>-thinking → router · <name>-direct → engine (fallback)          │
 │    KV-Cache-Aware Router (:8001)                                                                      │
 │    • Prefix-Hash Affinity           • Health-Tracked Backends        • Streaming Pass-Through         │
 └──────────────────┬───────────────────────────────────────────────────┬────────────────────────────────┘
                    │ Forward via Router (:8000/v1)                     │ OTLP LLM traces (langfuse_otel)
                    ▼                                                   ▼
 ┌──────────────────────────────────────────────────┐ ┌──────────────────────────────────────────────────┐
-│ 2. INFERENCE PLANE (vLLM v0.31)                  │ │ 6. LLM OBSERVABILITY PLANE (Langfuse v4)         │
-│    • Any Hugging Face model (.env model block)   │ │    • Web + Worker (async ingestion queue)        │
-│    • cuda | rocm | cpu | metal engines           │ │    • ClickHouse Analytics Store                  │
-│    • Continuous Batching & PagedAttention        │ │    • MinIO Raw Payload Storage                   │
-│    • Automatic Prefix Caching                    │ │    • Traces Keyed by Caller's W3C Trace ID       │
-│    • Reasoning & Tool-Call Parsers               │ │    • Online LLM-as-Judge Scores Written Back     │
-│    • Native OTLP Trace Export                    │ │    • Prompts, Completions, Tokens & Cost         │
+│ 2. INFERENCE PLANE (engine picked per hardware)  │ │ 6. LLM OBSERVABILITY PLANE (Langfuse v4)         │
+│    • GPU: vLLM v0.31 · Apple Silicon: vllm-metal │ │    • Web + Worker (async ingestion queue)        │
+│    • CPU: llama.cpp (GGUF, Q4_K_M)               │ │    • ClickHouse Analytics Store                  │
+│    • Any Hugging Face model (.env model block)   │ │    • MinIO Raw Payload Storage                   │
+│    • Continuous Batching · Prefix Caching        │ │    • Traces Keyed by Caller's W3C Trace ID       │
+│    • Reasoning & Tool-Call Parsing               │ │    • Online LLM-as-Judge Scores Written Back     │
+│    • Prometheus Metrics · OTLP Traces (vLLM)     │ │    • Prompts, Completions, Tokens & Cost         │
 └──────────┬───────────────────────────┬───────────┘ └──────────────────────────────────────────────────┘
            │ Logs & OTLP Spans         │
            │                           └──── /metrics (:8000) · 15 s scrape ──┐
@@ -83,13 +83,13 @@
 ┌──────────────────────────────────────────────────┐ ┌──────────────────────────────────────────────────┐
 │ 5. LOGS & TRACES PLANE                           │ │ 3. METRICS & ALERTING PLANE                      │
 │    Grafana Alloy (:12345)                        │ │    Prometheus (:9090) - 15 s scrape:             │
-│    • Docker Logs + OTLP from Gateway & Engine    │ │    vLLM :8000 · LiteLLM :9095 · router · Plane 4 │
+│    • Docker Logs + OTLP from Gateway & vLLM      │ │    engine · LiteLLM :9095 · KV router · Plane 4  │
 │                                                  │ │    • Golden Signals: TTFT · ITL · KV-Cache %     │
 │    Grafana Loki (:3100)                          │ │      Queue Backlog · Prefix-Cache Hits · Errors  │
 │    • LogQL Log Storage                           │ │                                                  │
 │                                                  │ │    Alertmanager (:9093)                          │
 │    Grafana Tempo (:3200)                         │ │    • SLO Burn-Rate Alerts (fast + slow window)   │
-│    • One Trace Spans Gateway + Engine            │ │    • Saturation & GPU Thermal Alerts             │
+│    • One Trace Spans Gateway + vLLM Engine       │ │    • Saturation & GPU Thermal Alerts             │
 └───────────────┬──────────────────────────────────┘ └──────────────────────────────────┬───────────────┘
                 │ LogQL · TraceQL                           ▲                           │ PromQL
                 │ PromQL                                    │ scraped                   │ polling
@@ -120,19 +120,19 @@
 | # | Plane | Components | Responsibility |
 | :-: | :--- | :--- | :--- |
 | 1 | Ingress & Routing | LiteLLM, KV router, Postgres, Redis | auth · budgets · limits · PII masking · cache · prefix affinity |
-| 2 | Inference | vLLM | batching · prefix caching · reasoning and tool-call parsing |
+| 2 | Inference | vLLM · vllm-metal · llama.cpp | engine picked per hardware · batching · prefix caching · reasoning and tool-call parsing |
 | 3 | Metrics & Alerting | Prometheus, Alertmanager | golden-signal rules · SLO burn-rate alerts |
 | 4 | Hardware | DCGM exporter, node exporter | GPU and host telemetry |
 | 5 | Logs & Traces | Alloy, Loki, Tempo | container logs · OTLP traces |
 | 6 | LLM Observability | Langfuse v4 (ClickHouse, MinIO) | prompts · completions · cost · judge scores |
 | 7 | Visualization | Grafana | dashboards only — never in a control loop |
-| 8 | Autoscaling | KEDA (Kubernetes only) | scale vLLM on saturation signals |
+| 8 | Autoscaling | KEDA (Kubernetes only) | scale the engine on saturation signals |
 | 9 | Model Lifecycle | model block, presets, eval gate, judge, Argo Rollouts | qualify and promote models |
 
 ### 2.3 End-to-End Request & Control Lifecycle
 
 ```text
-Client App       LiteLLM (:4000)     KV Router (:8001)      vLLM (:8000)       Prometheus (:9090)        KEDA         Alloy · Tempo       Langfuse
+Client App       LiteLLM (:4000)     KV Router (:8001)     Engine (:8000)      Prometheus (:9090)        KEDA         Alloy · Tempo       Langfuse
     │                   │                    │                    │                     │                  │                │                 │
  1  │── POST /v1/chat ─>│                    │                    │                     │                  │                │                 │
  2  │                   │── auth · budget    │                    │                     │                  │                │                 │
@@ -150,7 +150,7 @@ Client App       LiteLLM (:4000)     KV Router (:8001)      vLLM (:8000)       P
   ── [ ASYNCHRONOUS TELEMETRY & CONTROL LOOP ] ───────────────────────────────────────────────────────────────────────────────────────────────────────────
     │                   │                    │                    │                     │                  │                │                 │
 10  │                   │┄┄ OTLP spans + logs ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄>│                 │
-11  │                   │                    │                    │┄┄ OTLP spans + logs ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄>│                 │
+11  │                   │                    │                    │┄┄ OTLP spans (vLLM) + logs ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄>│                 │
 12  │                   │┄┄ prompt · completion · tokens · cost ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄>│
 13  │                   │                    │                    │<┄┄ scrape 15 s ┄┄┄┄┄│                  │                │                 │
 14  │                   │<┄┄ scrape :9095 (internal) ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄│                  │                │                 │
@@ -160,7 +160,7 @@ Client App       LiteLLM (:4000)     KV Router (:8001)      vLLM (:8000)       P
 ```
 
 - **One trace id** — the caller's `traceparent` is continued by the gateway and forwarded to the engine; the bundled scripts start a fresh one per request.
-- **Tempo** — gateway and engine spans land in a single trace.
+- **Tempo** — gateway and engine spans land in a single trace (engine spans from vLLM; llama.cpp requests are traced at gateway and router).
 - **Loki** — container logs; the router logs each request's `trace_id=`, which Grafana links to Tempo.
 - **Langfuse** — the same trace id carries prompt, completion, cost and judge scores.
 
@@ -169,7 +169,7 @@ Client App       LiteLLM (:4000)     KV Router (:8001)      vLLM (:8000)       P
 ```text
 ┌─────────────────────┐      ┌──────────────────────────┐      ┌────────────────────────────────────────┐
 │ Hugging Face Hub    │─────>│ configure_model.py       │─────>│ .env  MODEL BLOCK                      │
-│ (metadata only)     │      │ preset | auto-profile    │      │ MODEL_NAME · VLLM_MODEL_ARGS · EVAL_*  │
+│ (metadata only)     │      │ preset | auto-profile    │      │ MODEL_NAME · GGUF_* · *_ARGS · EVAL_*  │
 └─────────────────────┘      └──────────────────────────┘      └───────────────────┬────────────────────┘
 ┌─────────────────────┐ preset that fits  ▲                                        │
 │ detect_hardware.py  │───────────────────┘                                        │
@@ -179,15 +179,15 @@ Client App       LiteLLM (:4000)     KV Router (:8001)      vLLM (:8000)       P
           ┌────────────────────┬────────────────────┬────────────────────┬─────────┴──────────┐
           ▼                    ▼                    ▼                    ▼                    ▼
 ┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
-│ vLLM command     │ │ Gateway routes   │ │ Key scopes       │ │ Tests & gates    │ │ k8s ConfigMap    │
-│ engine flags     │ │ model aliases    │ │ allowed models   │ │ capability-aware │ │ deploy_k8s.sh    │
+│ Engine command   │ │ Gateway routes   │ │ Key scopes       │ │ Tests & gates    │ │ k8s ConfigMap    │
+│ vLLM · llama.cpp │ │ model aliases    │ │ allowed models   │ │ capability-aware │ │ deploy_k8s.sh    │
 └──────────────────┘ └──────────────────┘ └──────────────────┘ └──────────────────┘ └──────────────────┘
           ▲
           │ engine image + devices · sizing for this machine
 ┌─────────┴─────────────────────────────────────────────────────────────────────────────────────────────┐
-│ Platform overlay      gpu · rocm · cpu · metal · mock                                                 │
-│ run_all.sh at boot    preflight.py: free host ports · GPU memory fraction · gateway workers           │
-│ On a failed boot      engine_doctor.py: context auto · fp16 · retry · smaller preset (saved in .env)  │
+│ Platform overlay      gpu · rocm: vLLM   cpu: llama.cpp   metal: vllm-metal   mock                    │
+│ run_all.sh at boot    preflight.py: free ports · GPU memory / llama.cpp context · gateway workers     │
+│ On a failed boot      engine_doctor.py: context · fp16 · retry · smaller preset · CPU (saved in .env) │
 └───────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -208,7 +208,7 @@ Client App       LiteLLM (:4000)     KV Router (:8001)      vLLM (:8000)       P
 ┌──────────────────────────────────────────────────┐ ┌──────────────────────────────────────────────────┐
 │ PUBLISHABLE · LOGIN REQUIRED                     │ │ SERVER-LOCAL · 127.0.0.1 · NO LOGIN              │
 │                                                  │ │                                                  │
-│ Gateway + UI   :4000   GATEWAY_BIND_ADDRESS      │ │ vLLM :8000 · KV router :8001                     │
+│ Gateway + UI   :4000   GATEWAY_BIND_ADDRESS      │ │ engine :8000 · KV router :8001                   │
 │ Grafana        :3001   UI_BIND_ADDRESS           │ │ Prometheus :9090 · Alertmanager :9093            │
 │ Langfuse       :3000   UI_BIND_ADDRESS           │ │ Loki :3100 · Tempo :3200 · Alloy :12345          │
 │                                                  │ │ OTLP :4317/:4318 · DCGM :9400 · node :9100       │
@@ -273,11 +273,13 @@ git clone <repo> && cd LLMOps
 ### 3.3 CPU Host
 
 ```bash
-./run_all.sh                       # no usable GPU: real inference on vLLM's CPU backend
+./run_all.sh                       # no usable GPU: llama.cpp with GGUF weights
 ./run_all.sh --cpu                 # force CPU on a GPU host
 ```
 
-- **Preset** — `qwen3-4b` with ≥ 16 threads and ≥ 24 GB RAM, else `smollm2-360m`.
+- **Engine** — llama.cpp server (`ghcr.io/ggml-org/llama.cpp:server-b10902`), 4-bit GGUF weights: ~2.4× the decode speed of vLLM's CPU backend on the same host.
+- **Preset** — `qwen3-4b` (Q4_K_M) with ≥ 12 GB RAM and ≥ 4 threads, else `smollm2-360m`.
+- **Sizing** — one KV cache of 8K–32K tokens (by RAM) shared by 4 or 8 request slots (by threads).
 
 ### 3.4 Apple Silicon
 
@@ -297,6 +299,7 @@ git clone <repo> && cd LLMOps
 ### 3.6 What Every Run Does
 
 - **Never prompts** — every decision is automatic and listed under *Fixed automatically* in the final report.
+- **Engine** — picked from the detected hardware: vLLM on NVIDIA / AMD GPUs, vllm-metal on Apple Silicon, llama.cpp on CPU (also whenever a run falls back to the CPU).
 - **Secrets** — the first run creates `.env` with fresh keys and passwords; later runs only add new ones.
 - **Model** — the first run picks the preset for the hardware; a platform change re-sizes it.
 - **Ports** — a port used by another program moves to the next free one (saved in `.env`).
@@ -319,7 +322,7 @@ git clone <repo> && cd LLMOps
 | Langfuse | 3000 | `/` | `LANGFUSE_ADMIN_EMAIL` + `LANGFUSE_ADMIN_PASSWORD` | ✅ |
 | Prometheus | 9090 | `/` | none | ❌ |
 | Alertmanager | 9093 | `/` | none | ❌ |
-| vLLM | 8000 | `/docs` | none | ❌ |
+| Engine (vLLM / llama.cpp) | 8000 | `/docs` (vLLM) | none | ❌ |
 | KV router | 8001 | `/health` | none | ❌ |
 | Tempo · Loki · Alloy | 3200 · 3100 · 12345 | `/` | none | ❌ |
 
@@ -370,11 +373,11 @@ python3 scripts/configure_model.py openai/gpt-oss-20b     # any Hub repo (auto-p
 
 ### 5.2 Presets
 
-| Preset | Model | Best for | Verified on |
-| :--- | :--- | :--- | :--- |
-| `qwen3.5-9b` | Qwen/Qwen3.5-9B — vision, tools, thinking, 128K | ≥ 24 GB accelerators | A100-40GB |
-| `qwen3-4b` | Qwen/Qwen3-4B — tools, thinking | CPU hosts, 10–24 GB GPUs | 30-core EPYC CPU |
-| `smollm2-360m` | HuggingFaceTB/SmolLM2-360M-Instruct | 4 GB dev GPUs, smoke tests | — |
+| Preset | Model | CPU build (llama.cpp) | Best for | Verified on |
+| :--- | :--- | :--- | :--- | :--- |
+| `qwen3.5-9b` | Qwen/Qwen3.5-9B — vision, tools, thinking, 128K | `unsloth/Qwen3.5-9B-GGUF` Q4_K_M + vision projector | ≥ 24 GB accelerators | A100-40GB |
+| `qwen3-4b` | Qwen/Qwen3-4B — tools, thinking | `Qwen/Qwen3-4B-GGUF` Q4_K_M | CPU hosts (≥ 12 GB RAM), 10–24 GB GPUs | A100 · 30-core EPYC (llama.cpp) |
+| `smollm2-360m` | HuggingFaceTB/SmolLM2-360M-Instruct | `HuggingFaceTB/SmolLM2-360M-Instruct-GGUF` Q8_0 | small hosts, 4 GB GPUs | A100 (4 GB-class) · EPYC (llama.cpp) |
 
 ### 5.3 Auto-Profiling (any repo)
 
@@ -387,6 +390,7 @@ Reads Hub metadata only — no weights downloaded.
 | Thinking toggle | `enable_thinking` / `thinking` in the template |
 | Vision support | `vision_config` / `image-text-to-text` |
 | Context length | `auto` — largest that fits memory |
+| CPU build | a GGUF on the Hub — the repo itself, `<repo>-GGUF`, ggml-org / unsloth / bartowski / lmstudio-community, then search — Q4_K_M preferred, commit-pinned |
 | Quality gates | fixed bar; speed SLOs relaxed on CPU / Metal |
 | Warnings | gated repos (`HF_TOKEN`), weight-memory estimate |
 
@@ -394,9 +398,9 @@ Reads Hub metadata only — no weights downloaded.
 
 | Alias | Path | Behaviour |
 | :--- | :--- | :--- |
-| `<name>` | gateway → router → vLLM | answers directly (default) |
-| `<name>-thinking` | gateway → router → vLLM | reasoning returned separately (reasoning models) |
-| `<name>-direct` | gateway → vLLM | bypasses the router · fallback target |
+| `<name>` | gateway → router → engine | answers directly (default) |
+| `<name>-thinking` | gateway → router → engine | reasoning returned separately (reasoning models) |
+| `<name>-direct` | gateway → engine | bypasses the router · fallback target |
 
 ---
 
@@ -405,7 +409,7 @@ Reads Hub metadata only — no weights downloaded.
 | Platform | Overlay | Engine image | GPU telemetry | Status |
 | :--- | :--- | :--- | :--- | :--- |
 | NVIDIA CUDA | `docker-compose.gpu.yml` | `vllm/vllm-openai` | DCGM | ✅ verified (A100) |
-| CPU (x86_64 / arm64) | `docker-compose.cpu.yml` | `vllm/vllm-openai-cpu` | — | ✅ verified (EPYC) |
+| CPU (x86_64 / arm64) | `docker-compose.cpu.yml` | `ghcr.io/ggml-org/llama.cpp:server` (GGUF) | — | ✅ verified (EPYC) |
 | AMD ROCm | `docker-compose.rocm.yml` | `vllm/vllm-openai-rocm` | — | not verified |
 | Apple Silicon | `docker-compose.metal.yml` | native `vllm-metal` | — | not verified |
 | Mock | `docker-compose.mock.yml` | emulator | synthetic | emulation only |
@@ -416,7 +420,7 @@ Reads Hub metadata only — no weights downloaded.
 - **SELinux (Fedora / RHEL)** — `docker-compose.selinux.yml` is added automatically when enforcing.
 - **GPU Docker cannot use** — NVIDIA toolkit installed automatically (Linux, passwordless sudo, no other containers running), else CPU.
 - **Override** — `./run_all.sh --platform cuda | rocm | cpu | metal | mock`; a platform the machine cannot run falls back to the detected one.
-- **Same engine** — vLLM `v0.31.0` everywhere: identical API, metrics and tests.
+- **Engine per platform** — vLLM `v0.31.0` on GPUs, vllm-metal on Apple Silicon, llama.cpp `b10902` on CPU, chosen automatically; same OpenAI API, metric names (llama.cpp mapped by `config/prometheus-rules.yaml`) and tests.
 
 ---
 
@@ -520,7 +524,7 @@ client.chat.completions.create(model="qwen3.5-9b", messages=[{"role": "user", "c
 | :--- | :--- |
 | `test_stack.py` | 13 checks: engine · router · streaming · thinking · vision · auth · PII · Prometheus · Alertmanager · Tempo trace · Loki log for the same trace id · Langfuse · Grafana (GPU telemetry reported, not required) |
 | `load_test.py` | concurrent streaming burst: TTFT / latency percentiles, saturation, KEDA trigger state |
-| `eval_gate.py` | accuracy · injection + PII safety · formatting · arithmetic · tool calling |
+| `eval_gate.py` | accuracy · injection + PII safety · formatting · arithmetic · tool calling — enforced for presets, a report for other models (`EVAL_ENFORCE=true`: always) |
 | `online_eval_judge.py` | scores live generations from Langfuse (schema-constrained verdicts), writes scores back; `JUDGE_MODEL` picks a stronger judge than the served model |
 
 ### 10.2 Verified Results (Lambda Cloud, 2026-10-08)
@@ -529,7 +533,10 @@ client.chat.completions.create(model="qwen3.5-9b", messages=[{"role": "user", "c
 | :--- | :-: | :--- | :--- |
 | A100 · Qwen3.5-9B | 13/13 | 8/8 · P95 TTFT 0.11 s · 74 tok/s | 32/32 · 1455 tok/s |
 | A100 · gpt-oss-20b (auto-profiled) | 11/11 | 7/8 (pass) · 213 tok/s | 32/32 · 1912 tok/s |
-| CPU · Qwen3-4B | 13/13 | 8/8 · P95 TTFT 1.67 s · 9.9 tok/s | 8/8 · 23 tok/s |
+| CPU · Qwen3-4B (llama.cpp Q4_K_M) | 13/13 | 8/8 · 23.5 tok/s | 8/8 · P95 TTFT 2.1 s |
+| CPU · SmolLM2-360M (llama.cpp Q8_0) | 13/13 | 71 % (gate 40 %) · 102 tok/s | 8/8 · P95 TTFT 1.0 s |
+| CPU · SmolLM3-3B (auto-profiled, GGUF found) | 13/13 | 50 % — advisory | 8/8 · P95 TTFT 2.5 s |
+| CPU · Qwen3-4B (vLLM CPU, before llama.cpp) | 13/13 | 8/8 · 9.9 tok/s | 8/8 · P95 TTFT 8.6 s |
 | CPU · Qwen3-0.6B / 1.7B | 12/12 | rejected (4/8) — weak model | — |
 | Mock engine | 11/11 | skipped | 32/32 |
 | k3s · Qwen3.5-9B | 10/10 | — | KEDA scaled 1 → 8 |
@@ -566,8 +573,8 @@ client.chat.completions.create(model="qwen3.5-9b", messages=[{"role": "user", "c
 
 | Path | Contents |
 | :--- | :--- |
-| `k8s/base/` | Postgres, Redis, vLLM, KV router, LiteLLM, Prometheus, Alertmanager, Tempo, KEDA |
-| `k8s/overlays/` | `cuda` · `cuda-runtimeclass` (k3s) · `rocm` · `cpu` |
+| `k8s/base/` | Postgres, Redis, engine (vLLM), KV router, LiteLLM, Prometheus, Alertmanager, Tempo, KEDA |
+| `k8s/overlays/` | `cuda` · `cuda-runtimeclass` (k3s) · `rocm` · `cpu` (llama.cpp) |
 | `k8s/extras/` | Argo Rollouts canary · Karpenter · Gateway API · Alloy · kind |
 
 - **Same inputs as Compose** — model block + secrets from `.env`; configs from the repo.
@@ -591,13 +598,14 @@ All settings live in `.env` (template: `.env.example`).
 | :--- | :--- |
 | Model | `MODEL_NAME` · `MODEL_REVISION` · `SERVED_MODEL_NAME` |
 | Engine sizing | `MODEL_DTYPE` · `MAX_MODEL_LEN` · `GPU_MEMORY_UTILIZATION` · `GPU_COUNT` (GPUs used; the emptiest are picked) |
-| Auto when empty | `LITELLM_NUM_WORKERS` · `VLLM_CPU_KVCACHE_SPACE` |
+| Auto when empty | `LITELLM_NUM_WORKERS` · `LLAMACPP_CTX` · `LLAMACPP_PARALLEL` |
+| CPU engine | `GGUF_REPO` · `GGUF_FILE` · `GGUF_REVISION` · `LLAMACPP_MODEL_ARGS` (configurator-owned) · `LLAMACPP_EXTRA_ARGS` (yours) · `LLAMACPP_IMAGE_TAG` |
 | Boot patience | `VLLM_READY_TIMEOUT` (seconds without engine progress) |
 | Host ports | `VLLM_PORT` · `ROUTER_PORT` · `LITELLM_PORT` · `LANGFUSE_PORT` · `GRAFANA_PORT` · `PROMETHEUS_PORT` · `ALERTMANAGER_PORT` · `LOKI_PORT` · `TEMPO_PORT` · `ALLOY_PORT` · `OTLP_GRPC_PORT` · `OTLP_HTTP_PORT` · `POSTGRES_PORT` · `REDIS_PORT` · `DCGM_PORT` · `NODE_EXPORTER_PORT` |
 | Kept by `run_all.sh` | `MODEL_PLATFORM` · `MODEL_FALLBACK_FROM` |
 | Engine flags | `VLLM_MODEL_ARGS` (configurator-owned) · `VLLM_EXTRA_ARGS` (yours) |
 | Capabilities | `MODEL_SUPPORTS_REASONING` · `_TOOLS` · `_VISION` · `MODEL_REASONING_BY_DEFAULT` · `MODEL_THINKING_EXTRA_BODY` |
-| Quality gates | `EVAL_MIN_ACCURACY` · `EVAL_MAX_TTFT` · `EVAL_MIN_TPS` |
+| Quality gates | `EVAL_MIN_ACCURACY` · `EVAL_MAX_TTFT` · `EVAL_MIN_TPS` · `EVAL_ENFORCE` |
 | Exposure | `BIND_ADDRESS` · `GATEWAY_BIND_ADDRESS` · `UI_BIND_ADDRESS` · `PUBLIC_HOST` · `NEXTAUTH_URL` |
 | Versions | `VLLM_VERSION` · `LITELLM_IMAGE_TAG` · `LANGFUSE_VERSION` · `GRAFANA_IMAGE_TAG` · … |
 | Hugging Face | `HF_TOKEN` · `HF_CACHE_DIR` |
@@ -642,6 +650,7 @@ All settings live in `.env` (template: `.env.example`).
 | Public URL times out | open the port in the **cloud** firewall; check `*_BIND_ADDRESS` |
 | Langfuse login bounces to `localhost` | set `NEXTAUTH_URL=http://<server-ip>:3000`, recreate Langfuse |
 | `.env` deleted | a new one is generated, the Postgres password re-synced and the old team keys retired (they stop working) |
+| `no GGUF build found` (CPU) | the model has no GGUF on the Hub: the recommended preset is served; pick a repo with a GGUF build |
 | `stale file handle` after `git pull` | `docker compose … up -d --force-recreate <service>` |
 
 ---
