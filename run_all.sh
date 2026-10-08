@@ -554,8 +554,10 @@ else
     preflight ports PORT_EXPORTS
     preflight fit FIT_EXPORTS
     FIT_DONE=true
+    GPU_TOO_BUSY=0
     case "$FIT_EXPORTS" in *GPU_MEMORY_UTILIZATION*) GPU_SHARED=true ;; esac
-    if [ "${GPU_TOO_BUSY:-0}" = "1" ]; then
+    case "$FIT_EXPORTS" in *GPU_TOO_BUSY=1*) GPU_TOO_BUSY=1 ;; esac
+    if [ "$GPU_TOO_BUSY" = "1" ]; then
         # Other processes hold nearly all GPU memory: no preset fits. Run on CPU this time;
         # the next run sees the platform change and moves back to the GPU.
         fixed "GPU memory is almost fully used by other processes: the engine runs on CPU this run"
@@ -563,7 +565,6 @@ else
         RECOMMENDED_PRESET="$CPU_PRESET"
         configure_model "$CPU_PRESET" || die "Could not configure preset ${CPU_PRESET}."
         preflight fit FIT_EXPORTS
-        GPU_TOO_BUSY=0
         load_env
     fi
     load_env
