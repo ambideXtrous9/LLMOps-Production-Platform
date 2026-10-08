@@ -1,0 +1,87 @@
+# ==============================================================================
+# Enterprise Model Registry & Version Catalog (Plane 9: Model Lifecycle)
+# ==============================================================================
+# Enforces:
+#  - Cryptographically pinned Hugging Face revisions (Commit SHAs)
+#  - Quantization precision matrix (FP16, AWQ, FP8)
+#  - Hardware tier mapping and VRAM budget allocation
+#  - Pre-deployment evaluation thresholds (MMLU / Golden Set accuracy, TTFT SLO)
+# ==============================================================================
+
+version: "2.0"
+registry_metadata:
+  organization: "Enterprise LLMOps Platform"
+  default_engine: "vllm"
+
+models:
+  # ----------------------------------------------------------------------------
+  # Model 1: SmolLM2-360M-Instruct (Edge & Dev Tier)
+  # ----------------------------------------------------------------------------
+  - id: "smollm2-360m-instruct"
+    alias: "smollm2"
+    source:
+      repository: "HuggingFaceTB/SmolLM2-360M-Instruct"
+      pinned_revision: "29f3458ffad848ee12f9be76e330a5ca6d7bca88" # Pinned Git commit SHA
+      tokenizer: "HuggingFaceTB/SmolLM2-360M-Instruct"
+    architecture:
+      family: "llama"
+      parameter_count: "360M"
+      max_context_length: 2048
+    serving:
+      precision: "fp16"
+      quantization: "none"
+      gpu_target_profile: "dev-edge-4gb"
+      min_vram_gb: 2.0
+      tensor_parallel: 1
+    eval_thresholds:
+      min_golden_accuracy: 0.85
+      max_ttft_p95_seconds: 1.2
+      min_generation_tps: 30.0
+
+  # ----------------------------------------------------------------------------
+  # Model 2: Llama-3.1-8B-Instruct (Datacenter Tier)
+  # ----------------------------------------------------------------------------
+  - id: "llama-3.1-8b-instruct"
+    alias: "llama3-8b"
+    source:
+      repository: "meta-llama/Llama-3.1-8B-Instruct"
+      pinned_revision: "0e9e39f249a16976918f6564b8830bc894c89659"
+      tokenizer: "meta-llama/Llama-3.1-8B-Instruct"
+    architecture:
+      family: "llama"
+      parameter_count: "8B"
+      max_context_length: 8192
+    serving:
+      precision: "fp8"
+      quantization: "fp8"
+      gpu_target_profile: "prod-datacenter-gpu"
+      min_vram_gb: 16.0
+      tensor_parallel: 1
+    eval_thresholds:
+      min_golden_accuracy: 0.92
+      max_ttft_p95_seconds: 1.5
+      min_generation_tps: 45.0
+
+  # ----------------------------------------------------------------------------
+  # Model 3: Qwen2.5-Coder-7B-Instruct (Code Intelligence Tier)
+  # ----------------------------------------------------------------------------
+  - id: "qwen2.5-coder-7b"
+    alias: "coder-7b"
+    source:
+      repository: "Qwen/Qwen2.5-Coder-7B-Instruct"
+      pinned_revision: "c2807f43f11d13b41e30a514d59a7f34c25a07c1"
+      tokenizer: "Qwen/Qwen2.5-Coder-7B-Instruct"
+    architecture:
+      family: "qwen2"
+      parameter_count: "7B"
+      max_context_length: 16384
+    serving:
+      precision: "awq"
+      quantization: "awq"
+      gpu_target_profile: "prod-datacenter-gpu"
+      min_vram_gb: 12.0
+      tensor_parallel: 1
+    eval_thresholds:
+      min_golden_accuracy: 0.90
+      max_ttft_p95_seconds: 1.8
+      min_generation_tps: 40.0

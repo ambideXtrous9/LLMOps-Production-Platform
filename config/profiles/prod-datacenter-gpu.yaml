@@ -1,0 +1,33 @@
+# ==============================================================================
+# Hardware Serving Profile: Production Datacenter Tier (NVIDIA L4 / A10 / A100 / H100)
+# ==============================================================================
+# Target Hardware: Dedicated Enterprise GPUs (24GB - 80GB VRAM)
+# Models: Llama-3.1-8B-Instruct, Mistral-7B, Qwen2.5, DeepSeek-R1-Distill
+# ==============================================================================
+
+engine: vllm
+profile_name: prod-datacenter-gpu
+target_hardware:
+  gpu_family: "NVIDIA L4 / A10 / L40S / A100 / H100"
+  vram_total_mib: 24576                   # Base 24GB+ (e.g. L4/A10G)
+  compute_capability: "8.9+"              # Ada Lovelace / Hopper
+  supported_precision: ["bfloat16", "fp8", "awq", "gptq"]
+
+serving_parameters:
+  model: "meta-llama/Llama-3.1-8B-Instruct"
+  quantization: "fp8"                     # or "awq" for 4-bit weights
+  dtype: "bfloat16"                       # Native Ampere/Ada/Hopper execution
+  gpu_memory_utilization: 0.90            # 90% dedicated to PagedAttention KV cache & weights
+  max_model_len: 8192                     # Production enterprise context length
+  enforce_eager: false                    # Full CUDA Graph capture enabled for microsecond latency
+  enable_prefix_caching: true             # Maximum KV-cache prefix reuse
+  enable_chunked_prefill: true            # Interleaves prompt prefill and token decode for flat TTFT
+  tensor_parallel_size: 1                 # Scale to 2, 4, 8 via LeaderWorkerSet for 70B+ models
+  pipeline_parallel_size: 1
+  max_num_seqs: 256
+  max_num_batched_tokens: 8192
+
+telemetry:
+  otlp_traces_endpoint: "http://tempo:4317"
+  metrics_interval: 15s
+  dcgm_profiling_supported: true          # Full enterprise DCGM profiling (SM occupancy, memory bandwidth)

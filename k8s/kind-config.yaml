@@ -4,7 +4,7 @@ name: llmops
 nodes:
   - role: control-plane
     extraMounts:
-      - hostPath: /home/sushovan/.cache/huggingface
+      - hostPath: /tmp/llmops-cache
         containerPath: /root/.cache/huggingface
     extraPortMappings:
       - containerPort: 30080

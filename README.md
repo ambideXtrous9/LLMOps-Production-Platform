@@ -1,427 +1,278 @@
-# Production LLMOps Platform: Self-Hosted LLM Serving, Telemetry & Autoscaling
+# Enterprise LLMOps Production Platform (Maturity Level 4/5)
 
-An enterprise-grade, **100% self-hosted, air-gapped LLMOps platform** engineered for real-time Large Language Model inference, fine-grained telemetry, and event-driven autoscaling.
-
----
-
-## 1. Executive Summary & Design Principles
-
-This platform deploys a production-grade inference, observability, and scaling stack on local infrastructure with zero cloud-vendor lock-in. Powered by **vLLM**, **LiteLLM Gateway**, **NVIDIA DCGM Exporter**, **Node Exporter**, **Prometheus**, **Grafana Loki**, **Promtail**, **Langfuse**, and **Grafana 11**, it guarantees data sovereignty, microsecond-level telemetry, and horizontal elasticity.
-
-```
-                    ┌─────────────────────────────────────────┐
-                    │       ENTERPRISE USER / API CLIENT      │
-                    └────────────────────┬────────────────────┘
-                                         │ HTTP / REST (:4000)
-                                         ▼
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│ 1. AI GATEWAY LAYER (LiteLLM Proxy)                                                    │
-│    • Unified OpenAI-compatible endpoint        • Bearer Token Authentication           │
-│    • Rate Limiting & Quota Management          • Dual Egress: Prometheus + Langfuse    │
-└──────────────────┬───────────────────────────────────────────────────┬─────────────────┘
-                   │ Forward (:8000/v1)                                │ Async Trace
-                   ▼                                                   ▼
-┌──────────────────────────────────────────────┐     ┌───────────────────────────────────┐
-│ 2. INFERENCE ENGINE (vLLM)                   │     │ 6. APP OBSERVABILITY (Langfuse)   │
-│    • Model: SmolLM2-360M-Instruct (FP16)     │     │    • Prompt & Completion Tracking │
-│    • Continuous Batching & PagedAttention    │     │    • Per-Request Token Usage      │
-│    • Optimized for 4GB VRAM (GTX 1650)       │     │    • Postgres Persistence Engine  │
-└──────┬──────────────────────┬────────────────┘     └───────────────────────────────────┘
-       │                      │
-       │ stdout / stderr      │ Scrape (:8000/metrics)
-       ▼                      ▼
-┌──────────────────┐   ┌─────────────────────────────────────────────────────────────────┐
-│ 5. LOGGING LAYER │   │ 3. METRICS SCRAPER (Prometheus Server :9090)                    │
-│    (Promtail)    │   │    • Scrapes vLLM (:8000), LiteLLM (:4000), DCGM (:9400), Node  │
-│        │         │   │    • Calculates Golden Signals: RPS, TTFT, P95 Latency, TPS     │
-│        ▼         │   └──────┬───────────────────────▲────────────────────────▲─────────┘
-│   Loki Engine    │          │                       │ Scrape (:9400)         │ Scrape (:9100)
-│   (:3100)        │          │                       │                        │
-│        │         │          │              ┌────────┴───────────────────┐ ┌──┴────────────┐
-│        │         │          │              │ 4. HARDWARE AGENT (DCGM)   │ │ HOST HARDWARE │
-│        │         │          │              │    • GPU Compute Util %    │ │ Node Exporter │
-│        │         │          │              │    • VRAM Used/Free MiB    │ │ CPU/RAM/Disk  │
-│        │         │          │              │    • Temperatures & Power  │ │ Network I/O   │
-│        │         │          │              └────────────────────────────┘ └───────────────┘
-│        ▼         ▼          ▼
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│ 7. PRODUCTION VISUALIZATION (Grafana Dashboard :3001)                                 │
-│    • Row 1: 🚀 API Gateway Signals (RPS, Error %, Active Req, Latency Distribution)    │
-│    • Row 2: 🧠 LLM Inference Signals (TTFT, Gen Latency, Tokens/s, Queue Backlog)      │
-│    • Row 3: 🖥️ NVIDIA GPU Hardware (Compute Util, VRAM Alloc, Bandwidth, Thermals)     │
-│    • Row 4: 💻 System & Host Resources (Host CPU %, RAM %, Disk %, Network I/O Bps)   │
-│    • Row 5: 🛡️ Reliability & Faults (Failed Requests, Timeouts, OOMs, Restarts)        │
-│    • Row 6: 📜 Real-Time Logs (Centralized Loki LogQL Stream for vLLM & LiteLLM)      │
-└─────────────────────────────────────────────┬──────────────────────────────────────────┘
-                                              │ Queue Backlog Trigger
-                                              ▼ (vllm:num_requests_waiting > 5)
-                               ┌──────────────────────────────┐
-                               │ 8. AUTOSCALER (KEDA / HPA)   │
-                               │    • Scales Pods: 1 ──> N    │
-                               └──────────────────────────────┘
-```
-
-### Core Architectural Pillars
-1. **100% Data Sovereignty & Air-Gap Readiness:** Zero telemetry, prompts, or weights leave your infrastructure. All inference, tracing, metric scraping, and log aggregation execute locally.
-2. **Sub-500M Edge Viability:** Tuned for `HuggingFaceTB/SmolLM2-360M-Instruct` (~691 MB FP16 weights), achieving ultra-fast generation on consumer hardware (NVIDIA GeForce GTX 1650 4GB).
-3. **Unified Gateway Abstraction:** Upstream microservices consume standard OpenAI SDK endpoints via LiteLLM (`:4000`), abstracting backend model routing, virtual key authentication, and rate-limiting.
-4. **Queue-Depth Driven Autoscaling:** Eliminates misleading CPU/Memory metrics. Autoscaling triggers dynamically on **inference queue backlog** (`vllm:num_requests_waiting > 5`), avoiding tail latency degradation.
-5. **Ultra-Clean, Flat Structure:** Zero configuration sprawl; all container configurations reside in a flat, 1-level `config/` directory.
+An enterprise-grade, **air-gapped, self-hosted LLMOps production platform** engineered for real-time Large Language Model serving, KV-cache-aware routing, distributed OpenTelemetry tracing, SLO burn-rate alerting, event-driven autoscaling, and end-to-end model lifecycle governance.
 
 ---
 
-## 2. End-to-End System Architecture
+## 1. Executive Summary & Architectural Maturity
 
-```text
-                             [ 👤 Client / Microservice / Web App ]
-                                                │
-                                                │ 1. POST /v1/chat/completions
-                                                │    (Bearer sk-litellm-master-key-1234)
+Following an in-depth LLMOps Maturity Review, the platform has been hardened from an observability-only proof-of-concept (Level 2) into a production-grade inference and platform ecosystem (Level 4/5).
+
+### Key Architectural Correctives & Upgrades:
+1. **Decoupled Control Plane (Grafana Removed from Control Loop):** Grafana is strictly a telemetry viewer. KEDA polls **Prometheus directly** for scaling decisions.
+2. **Dual-Trigger Saturation Scaler:** Autoscaling scales on **normalized per-replica queue backlog** (`sum(waiting) / count(replicas)`) combined with **KV-cache memory saturation** (`gpu_cache_usage_factor > 80%`), guarded by a 300-second stabilization window to prevent cold-start flapping.
+3. **KV-Cache-Aware Intelligent Router:** Solves prefix cache fragmentation across multi-replica inference pods by routing prompts with shared system contexts to the same replica.
+4. **Security Hardening & Virtual Keys:** The LiteLLM master key is isolated strictly to administrator use. Upstream applications authenticate via **per-team virtual keys** backed by PostgreSQL with enforced monthly spend budgets and RPM/TPM rate limits.
+5. **Guardrails & PII Redaction:** Integrated moderation, prompt-injection heuristic filters, and automated regex/Presidio PII redaction before traces land in storage.
+6. **Unified Telemetry Shipper (Grafana Alloy):** Replaced deprecated Promtail with Grafana Alloy, eliminating root Docker socket exposure and unifying logs, metrics, and OTel traces.
+7. **End-to-End Distributed Tracing (Tempo + W3C Context):** LiteLLM propagates W3C `traceparent` headers to vLLM, exporting spans to Grafana Tempo for sub-second distributed trace inspection.
+8. **SLO Burn-Rate Alerting (Alertmanager):** Multi-window burn-rate alerts on P95 TTFT (<=1.5s), gateway 5xx error rate (<=0.5%), and GPU thermals (>82°C).
+9. **Plane 9: Comprehensive Model Lifecycle & CI/CD Eval Gate:** Pinned Hugging Face revisions, automated CI evaluation gates (`scripts/eval_gate.py`), Argo Rollouts canary promotions, and online LLM-as-judge scoring.
+10. **Multi-Tier Hardware Profiles:** Formal separation between 4GB Dev/Edge consumer GPUs (`dev-edge-4gb.yaml`) and Enterprise Datacenter GPUs (`prod-datacenter-gpu.yaml`).
+
+---
+
+## 2. Hardened 9-Plane Target Architecture
+
+```
+                    ┌────────────────────────────────────────────────────────┐
+                    │       ENTERPRISE USER / API CLIENT / MICROSERVICE      │
+                    └───────────────────────────┬────────────────────────────┘
+                                                │ HTTP / POST /v1/chat/completions (stream: true)
+                                                │ Bearer sk-team-engineering-... (Virtual Key)
                                                 ▼
-┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ 1. INGRESS & ROUTING PLANE                                                                      │
-│                                                                                                 │
-│   ┌─────────────────────────────────────────────────────────────────────────────────────────┐   │
-│   │ LiteLLM AI Gateway (:4000)                                                              │   │
-│   │  • OpenAI-Compatible Proxy                  • Virtual Key Auth & Rate Limiting          │   │
-│   │  • Model Route: smollm2 ──> HuggingFaceTB/SmolLM2-360M-Instruct                         │   │
-│   └──────────────────────┬──────────────────────────────────────────┬───────────────────────┘   │
-└──────────────────────────┼──────────────────────────────────────────┼───────────────────────────┘
-                           │ 2. Forward Prompt                        │ Async Trace
-                           │    (http://vllm:8000/v1)                 │ Payloads
-                           ▼                                          ▼
-┌────────────────────────────────────────────────────────┐ ┌──────────────────────────────────────┐
-│ 2. GPU INFERENCE PLANE                                 │ │ 6. APPLICATION OBSERVABILITY         │
-│                                                        │ │                                      │
-│   ┌────────────────────────────────────────────────┐   │ │   ┌──────────────────────────────┐   │
-│   │ vLLM Inference Engine (:8000)                  │   │ │   │ Langfuse Server (:3000)      │   │
-│   │  • SmolLM2-360M-Instruct (FP16 Weights)        │   │ │   │  • Prompt & Completion Log   │   │
-│   │  • Continuous Batching & Request Queuing       │   │ │   │  • Generation Latency        │   │
-│   │  • Flags: --dtype half --gpu-mem 0.60          │   │ │   │  • Token Usage & Cost Audit  │   │
-│   └──────────────────────┬─────────────────────────┘   │ │   └──────────────┬───────────────┘   │
-│                          │                             │ │                  │                   │
-│                          │ PagedAttention KV Cache     │ │                  ▼                   │
-│                          ▼                             │ │   ┌──────────────────────────────┐   │
-│   ┌────────────────────────────────────────────────┐   │ │   │ Postgres Database (:5432)    │   │
-│   │ NVIDIA GPU Hardware (GTX 1650 4GB VRAM)        │   │ │   │  • Relational Metadata Store │   │
-│   │  • Compute Capability: Turing SM 7.5           │   │ │   └──────────────────────────────┘   │
-│   │  • Dedicated VRAM Pool: ~1,952 MiB (60%)       │   │ └──────────────────────────────────────┘
-│   │  • Free System Buffer: ~2,008 MiB Headroom     │   │
-│   └────────────────────────────────────────────────┘   │
-└──────────────────────────┬─────────────────────────────┘
-                           │
-             ┌─────────────┴─────────────────────────────┐
-             │ stdout / stderr                           │ Engine Metrics
-             │ Docker Socket                             │ /metrics (:8000)
-             ▼                                           ▼
-┌──────────────────────────────────────┐   ┌──────────────────────────────────────────────────────┐
-│ 5. LOGGING PLANE                     │   │ 3. METRICS SCRAPER PLANE                             │
-│                                      │   │                                                      │
-│   ┌──────────────────────────────┐   │   │   ┌──────────────────────────────────────────────┐   │
-│   │ Promtail Shipper Agent       │   │   │   │ Prometheus Server (:9090)                    │   │
-│   │  • Mounts /var/run/docker.sock│   │   │   │  • Scrape Interval: 5s                       │   │
-│   │  • Container Name Tagging    │   │   │   │  • Targets: vLLM, LiteLLM, DCGM, Node        │   │
-│   └──────────────┬───────────────┘   │   │   └──────────────▲───────────────▲───────────────┘   │
-│                  │                   │   └──────────────┼───────────────┼───────────────────────┘
-│                  │ Ingest Logs       │                  │ Scrape        │ Scrape
-│                  ▼                   │                  │ Metrics       │ Hardware
-│   ┌──────────────────────────────┐   │                  │ (:9100)       │ (:9400)
-│   │ Grafana Loki Engine (:3100)  │   │                  │               │
-│   │  • Indexed Log Storage       │   │   ┌──────────────┴──────┐ ┌──────┴───────────────────────┐
-│   │  • LogQL Filtering Engine    │   │   │ 4. HOST SYSTEM      │ │ 4. NVIDIA HARDWARE AGENT     │
-│   └──────────────┬───────────────┘   │   │ Node Exporter       │ │ DCGM Exporter (:9400)        │
-│ └──────────────────┼───────────────────┘   │  • CPU % / RAM %    │ │  • GPU Compute Util %        │
-│                    │                       │  • Disk % / Network │ │  • VRAM Allocation (MiB)     │
-│                    │ LogQL Stream          └─────────────────────┘ │  • Temp (°C) & Power (W)     │
-│                    │                                               └──────────────────────────────┘
-│                    ▼                                                              │
-┌─────────────────────────────────────────────────────────────────────────────────┼───────────────┐
-│ 7. PRODUCTION VISUALIZATION & MONITORING PLANE (Grafana Dashboard :3001)        │ PromQL        │
-│                                                                                 ▼               │
-│   ┌─────────────────────────────────────────────────────────────────────────────────────────┐   │
-│   │ 🚀 Row 1: API Gateway Signals (RPS | Error Rate | Active Req | P50/P95/P99 Latency)     │   │
-│   │ 🧠 Row 2: LLM Inference Signals (TTFT | Gen Latency | TPS | Queue Depth | Tokens)       │   │
-│   │ 🖥️ Row 3: NVIDIA GPU Hardware (Compute Util % | VRAM % | Used MiB | Temp | Power Draw)  │   │
-│   │ 💻 Row 4: Host System Resources (CPU Util % | RAM Util % | Disk % | Network I/O Bps)    │   │
-│   │ 🛡️ Row 5: Reliability & Faults (Total Errors | Timeouts | OOMs | Container Restarts)    │   │
-│   │ 📜 Row 6: Real-Time Logs (Error Stream | vLLM Engine Stream | LiteLLM Gateway Stream)   │   │
-│   └─────────────────────────────────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────┬───────────────────────────────────────┘
-                                                          │ Queue Backlog Alert
-                                                          │ (vllm:num_requests_waiting > 5)
-                                                          ▼
-                                           ┌──────────────────────────────┐
-                                           │ 8. AUTOSCALING CONTROLLER    │
-                                           │ KEDA ScaledObject Operator   │
-                                           │  • Scale Target: vLLM Pods   │
-                                           │  • Replica Scale: 1 ──> N    │
-                                           └──────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ 1. INGRESS & ROUTING PLANE                                                                             │
+│    LiteLLM AI Gateway (:4000, 2+ Replicas)                                                             │
+│    • Per-Team Virtual Keys         • Spend Limits & Budgets       • Moderation & PII Redaction         │
+│    • Redis Rate-Limit Sync         • Redis Response Cache         • W3C traceparent Propagation        │
+│                                                                                                        │
+│    KV-Cache-Aware Intelligent Router (:8001)                                                           │
+│    • Prefix Hash Affinity          • Cache Hit Optimization       • Least-Busy Healthy Fallback        │
+└──────────────────┬───────────────────────────────────────────────────┬─────────────────────────────────┘
+                   │ Forward via Router (:8000/v1)                     │ Async Traces (OTLP / Langfuse)
+                   ▼                                                   ▼
+┌──────────────────────────────────────────────────┐ ┌──────────────────────────────────────────────────┐
+│ 2. GPU INFERENCE PLANE (vLLM Engine)             │ │ 6. APPLICATION OBSERVABILITY (Langfuse v3)       │
+│    • Continuous Batching & PagedAttention        │ │    • ClickHouse Columnar Analytics Engine         │
+│    • Automatic Prefix Caching Enabled            │ │    • MinIO / S3 Raw Trace Blob Storage            │
+│    • Native OTLP Distributed Trace Export        │ │    • PII Redaction & 14-Day Retention Policy      │
+│    • Pluggable Engines (SGLang, TRT-LLM, GGUF)   │ │    • Online Evaluation & Feedback Scores          │
+└──────────┬───────────────────────────┬───────────┘ └──────────────────────────────────────────────────┘
+           │                           │
+           │ Logs & OTLP Traces        │ /metrics (:8000)
+           ▼                           ▼
+┌──────────────────────────────────────────────────┐ ┌──────────────────────────────────────────────────┐
+│ 5. LOGS & TRACES PLANE                           │ │ 3. METRICS & ALERTING PLANE                      │
+│    Grafana Alloy Unified Agent (:12345)          │ │    Prometheus Scraper (:9090)                    │
+│    • Replaces Promtail (End-of-Life)             │ │    • 15s Global Scrape Interval                  │
+│    • Non-root log parsing & label extraction     │ │    • Golden Signal Recording Rules (TTFT, TPS)   │
+│    • Ships OTLP traces to Tempo                  │ │                                                  │
+│                                                  │ │    Alertmanager Engine (:9093)                   │
+│    Grafana Loki Engine (:3100)                   │ │    • Multi-Window SLO Burn-Rate Alerts           │
+│    • Sub-second LogQL query storage              │ │    • Saturation & Hardware Thermal Alerts        │
+│                                                  │ └───────────────────────────┬──────────────────────┘
+│    Grafana Tempo Engine (:3200)                  │                             │
+│    • Distributed trace storage & span graphs     │                             │ PromQL Saturation Polling
+└──────────────────────────┬───────────────────────┘                             ▼
+                           │ LogQL / TraceQL / PromQL         ┌─────────────────────────────────────────┐
+                           ▼                                  │ 8. AUTOSCALING CONTROLLER (KEDA)        │
+┌────────────────────────────────────────────────────────┐    │    • Direct Prometheus Scaler (No UI)   │
+│ 7. PRODUCTION VISUALIZATION (Grafana 11 :3001)         │    │    • Normalized Queue / Replica > 4     │
+│    • Dashboards ONLY (Zero Control-Loop Role)          │    │    • KV-Cache Saturation > 80%          │
+│    • SLO Burn-Down, Error Budget & Latency Drift       │    │    • 300s Scale-Down Stabilization      │
+│    • Team Spend Tracking & Virtual Key Quota           │    │    • Karpenter GPU Node Pool Follows    │
+│    • Tempo Trace Drilldown Links from Loki Logs        │    └─────────────────────────────────────────┘
+└────────────────────────────────────────────────────────┘
+                           ▲
+                           │ Models & Artifacts
+┌──────────────────────────┴─────────────────────────────────────────────────────────────────────────────┐
+│ 9. MODEL LIFECYCLE & GOVERNANCE PLANE (New!)                                                           │
+│    • Model Registry: Pinned Hugging Face revisions & precision matrix (models/catalog.yaml)           │
+│    • CI/CD Evaluation Gate: Pre-promotion verification against golden dataset (scripts/eval_gate.py) │
+│    • Canary Deployments: Argo Rollouts with automated metric analysis (k8s/argo-rollouts-vllm.yaml)   │
+│    • Online Evaluation: Automated LLM-as-judge quality scoring (scripts/online_eval_judge.py)         │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 3. Request Lifecycle & Telemetry Sequence
+## 3. End-to-End Request & Control Lifecycle
 
 ```text
- Client App           LiteLLM (:4000)        vLLM Engine (:8000)       Prometheus (:9090)     Loki (:3100)       Grafana (:3001)
-     │                      │                        │                         │                  │                 │
- 1   │── POST /v1/chat ────>│                        │                         │                  │                 │
-     │   (Prompt Payload)   │                        │                         │                  │                 │
-     │                      │                        │                         │                  │                 │
- 2   │                      │── Validate Key & Route>│                         │                  │                 │
-     │                      │   (Forward to Engine)  │                         │                  │                 │
-     │                      │                        │                         │                  │                 │
- 3   │                      │                        │── Schedule Continuous ─┐│                  │                 │
-     │                      │                        │   Batch & KV-Cache     ││                  │                 │
-     │                      │                        │<── Generate Tokens ────┘│                  │                 │
-     │                      │                        │                         │                  │                 │
- 4   │                      │<── Stream Tokens / 200 │                         │                  │                 │
-     │                      │    (Prompt+Gen Usage)  │                         │                  │                 │
-     │                      │                        │                         │                  │                 │
- 5   │<── Return JSON ──────│                        │                         │                  │                 │
-     │   Completion         │                        │                         │                  │                 │
-     │                      │                        │                         │                  │                 │
-     │                      │                        │                         │                  │                 │
-     │── [ ASYNCHRONOUS TELEMETRY DISPATCH & SCRAPING ] ────────────────────────────────────────────────────────────│
-     │                      │                        │                         │                  │                 │
- 6   │                      │── Async Trace Ingest ───────────────────────────>│ (Langfuse UI)    │                 │
- 7   │                      │                        │── Access Logs ────────────────────────────>│                 │
- 8   │                      │                        │<── Scrape Metrics (TTFT, TPS, Queue) ──────│                 │
- 9   │                      │<── Scrape Metrics (RPS, Gateway Latency) ───────────────────────────│                 │
- 10  │                      │                        │                         │                  │<── Poll LogQL ──│
- 11  │                      │                        │                         │<── Poll PromQL Metrics ────────────│
-     │                      │                        │                         │    (Golden Signals & DCGM)         │
+ Client App           LiteLLM (:4000)      KV Router (:8001)     vLLM Engine (:8000)     Prometheus (:9090)    KEDA Scaler      Alloy / Tempo
+     │                      │                      │                     │                       │                  │                 │
+ 1   │── POST /v1/chat ────>│                      │                     │                       │                  │                 │
+     │   (Virtual Key, SSE) │                      │                     │                       │                  │                 │
+ 2   │                      │── Validate Auth,     │                     │                       │                  │                 │
+     │                      │   Budget & Guardrails│                     │                       │                  │                 │
+ 3   │                      │── Forward with ─────>│                     │                       │                  │                 │
+     │                      │   traceparent        │                     │                       │                  │                 │
+ 4   │                      │                      │── Hash Prefix & ───>│                       │                  │                 │
+     │                      │                      │   Route Affinity    │                       │                  │                 │
+ 5   │                      │                      │                     │── Continuous Batch &  │                  │                 │
+     │                      │                      │                     │   Prefix KV-Cache     │                  │                 │
+ 6   │                      │<── Stream Tokens ────│<── Stream Tokens ───│                       │                  │                 │
+ 7   │<── Stream SSE ───────│                      │                     │                       │                  │                 │
+     │    (Client sees TTFT)│                      │                     │                       │                  │                 │
+     │                      │                      │                     │                       │                  │                 │
+     │── [ ASYNCHRONOUS TELEMETRY & DIRECT CONTROL-LOOP ] ────────────────────────────────────────────────────────────────────────────│
+ 8   │                      │── Export OTel Spans ─────────────────────────────────────────────────────────────────────────>│ (Tempo :3200)
+ 9   │                      │                      │                     │── Export OTLP Spans ────────────────────────────>│ (Alloy :4317)
+ 10  │                      │                      │                     │── Scrape 15s (TTFT, KV-Cache %, Queue) ─────────>│
+ 11  │                      │                      │                     │                       │── Poll Saturation ──────>│
+ 12  │                      │                      │                     │                       │   (Queue/Rep & KV-Cache) │── Scale 1..N
 ```
 
 ---
 
-## 4. Component Deep Dive & Implementation Details
+## 4. Hardware Profiles & Quantization Matrix
 
-### Layer 1: AI Gateway (LiteLLM Proxy)
-* **Container Image:** `ghcr.io/berriai/litellm:main-latest`
-* **Port:** `4000` (Internal & Host)
-* **Authentication:** Virtual Master Key (`Bearer sk-litellm-master-key-1234`).
-* **Routing:** Maps `model: smollm2` to downstream `openai/HuggingFaceTB/SmolLM2-360M-Instruct` at `http://vllm:8000/v1`.
-* **Telemetry Egress:** Success and failure callbacks register Prometheus counters (`litellm_requests_metric_total`, `litellm_proxy_failed_requests_metric_total`) and forward traces asynchronously to Langfuse.
-* **Config:** [`config/litellm.yaml`](file:///home/sushovan/sushovan/STUDY/LLMOps/config/litellm.yaml)
+The platform decouples serving configuration by hardware tier:
 
-### Layer 2: High-Performance GPU Inference Engine (vLLM)
-* **Container Image:** `vllm/vllm-openai:v0.6.6`
-* **Port:** `8000` (Internal & Host)
-* **Model:** `HuggingFaceTB/SmolLM2-360M-Instruct` (~691 MB safetensors).
-* **GTX 1650 (4GB VRAM) Optimization Flags:**
-  * `--dtype half`: Forces pure FP16 execution, circumventing Turing SM 7.5's lack of native `bfloat16` instructions and preventing numerical overflow.
-  * `--gpu-memory-utilization 0.60`: Locks model weights + PagedAttention KV cache to exactly **1,952 MiB**, leaving a permanent 2,048 MiB cushion for OS display servers, CUDA drivers, and DCGM buffers.
-  * `--max-model-len 2048`: Bounds the attention context to eliminate memory fragmentation.
-  * `--enforce-eager`: Disables CUDA Graph capture, freeing an immediate ~800 MB overhead during model warm-up.
-* **Core Serving Mechanics:** Continuous batching schedules incoming requests instantly without idle-wait padding; dynamic PagedAttention allocates KV cache in fixed virtual blocks.
-
-### Layer 3: NVIDIA DCGM Hardware Telemetry Exporter
-* **Container Image:** `nvcr.io/nvidia/k8s/dcgm-exporter:latest`
-* **Port:** `9400`
-* **Privileges:** GPU pass-through (`capabilities: [gpu]`, host IPC).
-* **Metrics Exposed:**
-  * `DCGM_FI_DEV_GPU_UTIL`: Real-time streaming multiprocessor (SM) compute utilization %.
-  * `DCGM_FI_DEV_MEM_COPY_UTIL`: Memory bus copy bandwidth saturation %.
-  * `DCGM_FI_DEV_FB_USED` & `DCGM_FI_DEV_FB_FREE`: Dedicated VRAM allocation in MiB.
-  * `DCGM_FI_DEV_GPU_TEMP`: Core thermals in °C.
-  * `DCGM_FI_DEV_POWER_USAGE`: Real-time GPU electrical draw in Watts.
-
-### Layer 4: Host System Telemetry (Node Exporter)
-* **Container Image:** `prom/node-exporter:v1.8.0`
-* **Port:** `9100`
-* **Host Mounts:** `/proc` and `/sys` mounted read-only, host PID mode.
-* **Metrics Exposed:** Host CPU utilization (`node_cpu_seconds_total`), RAM consumption (`node_memory_MemTotal_bytes`, `node_memory_MemAvailable_bytes`), filesystem capacity (`node_filesystem_size_bytes`), and network bandwidth (`node_network_receive_bytes_total`, `node_network_transmit_bytes_total`).
-
-### Layer 5: Real-Time Metrics Engine (Prometheus)
-* **Container Image:** `prom/prometheus:latest`
-* **Port:** `9090`
-* **Scrape Frequency:** `5s` ultra-fast scrape interval for responsive auto-scaling signals.
-* **Scrape Targets:** `vllm:8000/metrics`, `litellm:4000/metrics/` (authenticated), `dcgm-exporter:9400/metrics`, `node-exporter:9100/metrics`, and `localhost:9090`.
-* **Config:** [`config/prometheus.yaml`](file:///home/sushovan/sushovan/STUDY/LLMOps/config/prometheus.yaml)
-
-### Layer 6: Centralized Logging Pipeline (Grafana Loki & Promtail)
-* **Container Images:** `grafana/loki:3.0.0` (:3100) & `grafana/promtail:3.0.0` (:9080).
-* **Ingestion:** Promtail mounts `/var/run/docker.sock`, attaches to container `stdout`/`stderr` streams, labels logs by container name, and streams chunks to Loki for sub-second query indexing via LogQL.
-* **Configs:** [`config/loki.yaml`](file:///home/sushovan/sushovan/STUDY/LLMOps/config/loki.yaml) & [`config/promtail.yaml`](file:///home/sushovan/sushovan/STUDY/LLMOps/config/promtail.yaml)
-
-### Layer 7: Application Observability (Langfuse v2)
-* **Container Images:** `langfuse/langfuse:2` (:3000) with `postgres:16-alpine` (:5432).
-* **Telemetry:** Stores full prompt payloads, completion streams, token consumption distributions, and per-request latency breakdowns in local PostgreSQL tables.
-
-### Layer 8: Production Visualization (Grafana 11)
-* **Container Image:** `grafana/grafana:latest`
-* **Port:** `3001` (Host) ──> `3000` (Internal)
-* **Credentials:** Default `admin` / `admin`.
-* **Auto-Provisioning:** Datasources (Prometheus + Loki) and dashboard definition automatically mounted via [`config/grafana-datasources.yaml`](file:///home/sushovan/sushovan/STUDY/LLMOps/config/grafana-datasources.yaml) and [`config/grafana-dashboards.yaml`](file:///home/sushovan/sushovan/STUDY/LLMOps/config/grafana-dashboards.yaml).
+| Parameter | Dev / Edge Tier (`dev-edge-4gb.yaml`) | Production Datacenter (`prod-datacenter-gpu.yaml`) |
+| :--- | :--- | :--- |
+| **Target GPU** | NVIDIA GeForce GTX 1650 (4GB VRAM) | NVIDIA L4 / A10G / L40S / A100 / H100 |
+| **Compute Capability** | Turing SM 7.5 | Ada Lovelace / Hopper SM 8.9+ |
+| **Execution Precision** | FP16 (`--dtype half`) | Native BF16 / FP8 / AWQ |
+| **GPU Memory Util** | `0.60` (1,952 MiB pool, 2GB OS headroom) | `0.90` (22GB+ dedicated KV cache pool) |
+| **CUDA Graph Capture** | Disabled (`--enforce-eager` saves 800MB) | Enabled (microsecond kernel dispatch) |
+| **Prefix Caching** | Enabled (`--enable-prefix-caching`) | Enabled (`--enable-prefix-caching`) |
+| **Chunked Prefill** | Off | Enabled (`--enable-chunked-prefill`) |
+| **DCGM Profiling** | Utilization, Temp, Power (Bandwidth N/A) | Full Profiling (Memory Bandwidth, SM Occupancy) |
 
 ---
 
-## 5. Grafana Dashboard Taxonomy (40 Production Panels)
+## 5. Security & Virtual Key Management
 
-The provisioned dashboard ([`config/llmops-dashboard.json`](file:///home/sushovan/sushovan/STUDY/LLMOps/config/llmops-dashboard.json)) is structured into **6 logical rows** designed for zero visual clutter, value-centric clarity, and immediate operational triage:
+### Master Key Rotation
+The master key is strictly administrative and stored in `.env` / Kubernetes Secrets. Rotate it anytime using the automated cryptographic utility:
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ 🚀 ROW 1: API GATEWAY SIGNALS                                                                   │
-│ [ RPS (Req/s) ] [ Error Rate % ] [ Active In-Flight ] [ P95 Latency ] [ Latency Dist P50/95/99 ]│
-├─────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ 🧠 ROW 2: LLM INFERENCE SIGNALS                                                                 │
-│ [ Avg TTFT ] [ Gen Latency ] [ Tokens/s ] [ Queue Depth ] [ Running Concurrency ]               │
-│ [ Total Input Tokens ] [ Total Output Tokens ] [ Token Generation Rate (Timeseries) ]           │
-├─────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ 🖥️ ROW 3: NVIDIA GPU HARDWARE (DCGM)                                                             │
-│ [ Compute Util % ] [ VRAM Util % ] [ VRAM Used MiB ] [ GPU Temp °C ] [ Power Draw W ]           │
-│ [ Memory Bandwidth Saturation (Timeseries) ] [ VRAM & Thermals Correlation (Dual-Axis) ]        │
-├─────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ 💻 ROW 4: SYSTEM & HOST RESOURCES (NODE EXPORTER)                                               │
-│ [ Host CPU % ] [ Host RAM % ] [ Host Disk % ] [ Network I/O Bps ]                               │
-│ [ CPU & RAM Utilization (Timeseries) ] [ Network RX / TX Bandwidth (Timeseries) ]               │
-├─────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ 🛡️ ROW 5: RELIABILITY & FAULTS                                                                  │
-│ [ Total Failed Req ] [ Timeout Failures ] [ Engine OOMs ] [ Container Restarts ]                │
-├─────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ 📜 ROW 6: REAL-TIME LOGS & LOGQL INTELLIGENCE                                                   │
-│ [ Log Volume Stream (Error/Warn/Info) ] [ vLLM Engine Stream ] [ LiteLLM Gateway Stream ]        │
-└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+```bash
+bash scripts/rotate_master_key.sh
 ```
 
+### Issuing Per-Team Virtual Keys
+Client applications and microservices **never** receive the master key. Issue scoped virtual keys with budget caps and rate limits:
 
-## 5. Event-Driven Autoscaling (KEDA Specification)
+```bash
+# Generate key for platform engineering
+python3 scripts/manage_keys.py generate \
+  --team engineering \
+  --alias core-backend-service \
+  --budget 250.0 \
+  --rpm 200 \
+  --tpm 80000 \
+  --models smollm2
 
-In LLM serving workloads, conventional CPU or RAM threshold scaling is ineffective because:
-1. vLLM pins its allocated GPU memory upfront (e.g. 60% VRAM is permanently held for the KV cache).
-2. Host CPU utilization does not reflect inference queuing or token generation throughput.
+# Inspect virtual key metadata and spend
+python3 scripts/manage_keys.py info --key sk-eng-team-a1b2c3d4e5f6g7h8i9j0
 
-Instead, the platform scales using **Queue Depth** (`vllm:num_requests_waiting`):
-
-```yaml
-apiVersion: keda.sh/v1alpha1
-kind: ScaledObject
-metadata:
-  name: vllm-inference-scaler
-  namespace: llmops
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: vllm-inference
-  minReplicaCount: 1
-  maxReplicaCount: 4
-  cooldownPeriod: 60
-  pollingInterval: 5
-  triggers:
-    - type: prometheus
-      metadata:
-        serverAddress: http://prometheus-scraper.llmops.svc.cluster.local:9090
-        metricName: vllm_num_requests_waiting
-        query: sum(vllm:num_requests_waiting)
-        threshold: "5"
+# Calculate aggregate spend across all teams
+python3 scripts/manage_keys.py spend
 ```
-
-* **Scale-Out Trigger:** When `vllm:num_requests_waiting > 5`, KEDA triggers the Kubernetes HPA to provision additional GPU worker pods.
-* **Scale-In Stabilization:** A 60-second cooldown period prevents replica thrashing during transient traffic dips.
 
 ---
 
-## 7. Quickstart Guide
+## 6. Service Port & Endpoint Registry
 
-### 1. Start the Stack
+| Service | Internal Port | Host Port | Accessible Endpoint | Authentication / Role |
+| :--- | :--- | :--- | :--- | :--- |
+| **LiteLLM Gateway** | `4000` | `4000` | `http://localhost:4000` | Bearer Virtual Key (`sk-team-...`) |
+| **KV-Aware Router** | `8000` | `8001` | `http://localhost:8001/health` | Prefix Affinity Routing Layer |
+| **vLLM Engine** | `8000` | `8000` | `http://localhost:8000/health` | Direct GPU Serving Engine |
+| **Prometheus** | `9090` | `9090` | `http://localhost:9090/targets` | Golden Signals & Recording Rules |
+| **Alertmanager** | `9093` | `9093` | `http://localhost:9093` | Multi-Window SLO Burn-Rate Alerts |
+| **Grafana Tempo** | `3200` | `3200` | `http://localhost:3200` | Distributed Trace Storage (OTLP :4317) |
+| **Grafana Alloy** | `12345`| `12345`| `http://localhost:12345` | Unified Log & Trace Agent |
+| **Grafana Loki** | `3100` | `3100` | `http://localhost:3100/ready` | LogQL Log Aggregation |
+| **Grafana 11 UI** | `3000` | `3001` | `http://localhost:3001` | Visualizations & Dashboards (`admin`/`admin`) |
+| **PostgreSQL** | `5432` | `5432` | `postgres:5432` | LiteLLM Virtual Keys & Langfuse DB |
+| **Redis** | `6379` | `6379` | `redis:6379` | Rate-Limit Sync & Exact Response Cache |
+| **Langfuse Server** | `3000` | `3000` | `http://localhost:3000` | Application Tracing & Online Evals |
+| **DCGM Exporter** | `9400` | `9400` | `http://localhost:9400/metrics` | NVIDIA GPU Telemetry |
+| **Node Exporter** | `9100` | `9100` | `http://localhost:9100/metrics` | Host Infrastructure Telemetry |
+
+---
+
+## 7. Quickstart Guide (Local Docker Compose)
+
+### 1. Configure Environment Secrets
+```bash
+cp .env.example .env
+```
+
+### 2. Launch the Hardened Multi-Plane Stack
 ```bash
 docker compose up -d
 ```
 
-### 2. Verify Stack Health & Run E2E Test
+### 3. Bootstrap Seed Virtual Keys
+```bash
+python3 scripts/manage_keys.py seed
+```
+
+### 4. Run 7-Point Health & Telemetry Verification
 ```bash
 python3 scripts/test_stack.py
 ```
-*(Runs a 5-point verification across LiteLLM, vLLM, DCGM, Node Exporter, and Prometheus).*
+*(Validates vLLM, KV Router, Virtual Key SSE Streaming, PII Redaction, Prometheus Recording Rules, Alertmanager, and Alloy/Tempo tracing).*
 
-### 3. Trigger Load Test & Queue Saturation
+### 5. Run Concurrent Streaming Stress Test & KEDA Saturation Trigger
 ```bash
 python3 scripts/load_test.py
 ```
-*(Simulates a concurrent burst of 50 requests to exercise continuous batching and trigger the queue backlog alert).*
+*(Simulates 40 concurrent streaming requests, measuring P50/P90/P95 TTFT, Inter-Token Latency, and verifying KEDA trigger conditions).*
 
-### 4. Direct OpenAI-Compatible Ingestion Example
+### 6. Execute Model Qualification Gate (Plane 9 CI Gate)
 ```bash
-curl -X POST http://localhost:4000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-litellm-master-key-1234" \
-  -d '{
-    "model": "smollm2",
-    "messages": [
-      {"role": "user", "content": "Explain PagedAttention in 2 sentences."}
-    ],
-    "max_tokens": 64
-  }'
+python3 scripts/eval_gate.py --model smollm2 --max-ttft 1.5 --min-tps 25.0 --min-accuracy 0.80
 ```
 
-### 5. Stop the Stack
+---
+
+## 8. Kubernetes & Event-Driven Autoscaling (KEDA)
+
+In Kubernetes production clusters, KEDA scales vLLM inference pods directly off Prometheus metrics:
+
+```yaml
+triggers:
+  # Trigger 1: Normalized Queue Backlog Per Replica (>4 requests/replica)
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus-service.llmops.svc.cluster.local:9090
+      metricName: vllm_queue_backlog_per_replica
+      query: >-
+        sum(vllm:num_requests_waiting)
+        /
+        clamp_min(count(count by (instance) (vllm:num_requests_running)), 1)
+      threshold: '4'
+
+  # Trigger 2: KV-Cache Memory Saturation (>80%)
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus-service.llmops.svc.cluster.local:9090
+      metricName: vllm_kv_cache_saturation_percent
+      query: >-
+        avg(vllm:gpu_cache_usage_factor) * 100
+      threshold: '80'
+```
+
+### Scale-Down Stabilization
+Model weights take seconds to minutes to load into GPU VRAM. The KEDA configuration enforces a **300-second stabilization window** (`cooldownPeriod: 300`), eliminating pod thrashing during transient traffic fluctuations.
+
+### Deploying to Kubernetes:
 ```bash
-docker compose down
+bash scripts/deploy_k8s_keda.sh
 ```
 
 ---
 
-## 8. Verification & Benchmarking Results
+## 9. Verification & Operational Runbooks
 
-Executing the automated load simulator ([`scripts/load_test.py`](file:///home/sushovan/sushovan/STUDY/LLMOps/scripts/load_test.py)) with **50 concurrent requests** against the local stack yields the following verified production metrics:
+### Runbook 1: Investigating TTFT SLO Degradation
+1. Check Alertmanager (:9093) for `LLMHighTTFTSLOBurnRateFast` alerts.
+2. In Grafana (:3001), open Row 1 (SLO Burn-Down) to check if TTFT P95 exceeds 1.5s.
+3. Check KV Router Prefix Hit Rate: if hit rate drops below 50%, requests are encountering cold KV caches.
+4. Drill down from Loki logs to **Tempo traces** using the trace link to identify whether latency occurred in queue scheduling or token generation.
 
-| Metric | Measured Value | Operational Assessment |
-| :--- | :--- | :--- |
-| **Total Concurrency** | 50 concurrent requests | Continuous batching saturated |
-| **Success Rate** | 100% (50/50 requests) | Zero failed requests, zero HTTP drops |
-| **Total Output Tokens** | 3,870 tokens | ~221 tokens/sec cluster generation |
-| **P95 Latency** | 2.25s – 17.47s | Queue backlog absorbs traffic surge |
-| **Max Queue Depth** | `vllm:num_requests_waiting = 16` | Successfully breached KEDA trigger (>5) |
-| **GPU VRAM Stable** | 1,952 MiB / 4,096 MiB | 0 OOM errors, 2.1 GB VRAM buffer preserved |
-| **GPU Compute Util** | 98% – 100% during spike | Optimal hardware saturation |
-| **Host System Util** | 14% CPU, 41% RAM | Efficient system overhead |
-| **Loki Log Ingest** | 100% container logs captured | Structured real-time queryability |
+### Runbook 2: Investigating KV-Cache Saturation
+1. Check `job:vllm_kv_cache_usage_percent` in Prometheus.
+2. If KV cache exceeds 80%, verify that KEDA has triggered pod scale-out.
+3. If node pool capacity is reached, verify Karpenter `gpu-inference-nodepool` is provisioning new GPU instances.
 
----
-
-## 9. Service Port & Endpoint Registry
-
-| Service | Internal Port | Host Port | Accessible Endpoint | Default Credentials |
-| :--- | :--- | :--- | :--- | :--- |
-| **LiteLLM Gateway** | `4000` | `4000` | `http://localhost:4000` | `Bearer sk-litellm-master-key-1234` |
-| **vLLM Engine** | `8000` | `8000` | `http://localhost:8000/health` | Unauthenticated |
-| **Grafana Dashboard** | `3000` | `3001` | `http://localhost:3001` | `admin` / `admin` |
-| **Prometheus Server** | `9090` | `9090` | `http://localhost:9090/targets` | Unauthenticated |
-| **NVIDIA DCGM Exporter**| `9400` | `9400` | `http://localhost:9400/metrics` | Unauthenticated |
-| **Node Exporter** | `9100` | `9100` | `http://localhost:9100/metrics` | Unauthenticated |
-| **Grafana Loki** | `3100` | `3100` | `http://localhost:3100/ready` | Unauthenticated |
-| **Langfuse Server** | `3000` | `3000` | `http://localhost:3000` | Self-hosted Web UI |
-| **PostgreSQL** | `5432` | `5432` | `postgres:5432` | `postgres` / `postgres` |
-
----
-
-## 10. Repository Structure
-
-```text
-LLMOps/
-├── docker-compose.yml           # Unified multi-service deployment specification (all 9 containers)
-├── README.md                    # Consolidated production architecture, quickstart & registry
-│
-├── config/                      # Flat configuration directory (1-level deep)
-│   ├── litellm.yaml             # LiteLLM routing, virtual master key & Prometheus callbacks
-│   ├── prometheus.yaml          # Scrapes vLLM (:8000), LiteLLM (:4000), DCGM (:9400), Node (:9100)
-│   ├── loki.yaml                # Grafana Loki storage & indexing configuration
-│   ├── promtail.yaml            # Promtail Docker socket log scraper config
-│   ├── grafana-datasources.yaml # Automated datasource provisioning (Prometheus + Loki)
-│   ├── grafana-dashboards.yaml  # Automated dashboard provider definition
-│   └── llmops-dashboard.json    # 40-panel production dashboard with exact 6-tier taxonomy
-│
-├── k8s/                         # Production Kubernetes & KEDA manifests
-│   ├── keda-scaledobject.yaml   # Queue-depth ScaledObject autoscaler specification
-│   ├── vllm-deployment.yaml     # Kubernetes vLLM GPU deployment with resource limits
-│   ├── litellm-deployment.yaml  # Kubernetes LiteLLM proxy deployment & service
-│   ├── prometheus-k8s.yaml      # Kubernetes Prometheus scraper configuration
-│   └── kind-config.yaml         # Local KinD cluster configuration with GPU enablement
-│
-└── scripts/                     # Operational verification & testing tooling (stdlib-based)
-    ├── test_stack.py            # 5-point end-to-end integration healthcheck
-    └── load_test.py             # 50-request concurrent spike & queue simulator
-```
+### Runbook 3: Model Canary Rollout & Rollback
+1. Register candidate model revision in `models/catalog.yaml`.
+2. Run CI evaluation gate: `python3 scripts/eval_gate.py`.
+3. Apply canary rollout: `kubectl apply -f k8s/argo-rollouts-vllm.yaml`.
+4. Argo Rollouts routes 10% traffic, evaluating Prometheus TTFT and error rates for 5 minutes before auto-promoting.

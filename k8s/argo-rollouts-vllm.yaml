@@ -1,0 +1,87 @@
+# ==============================================================================
+# Argo Rollouts Model Canary Specification (Plane 9: Model Lifecycle)
+# ==============================================================================
+# Automated canary deployment for model weight updates or engine configuration changes.
+# Steps:
+#  1. Routes 10% of traffic to candidate model
+#  2. Analyzes Prometheus metrics for P95 TTFT and Error Rate
+#  3. Promotes to 50% -> 100% or aborts and rolls back immediately if SLO degrades.
+# ==============================================================================
+
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: vllm-model-rollout
+  namespace: llmops
+spec:
+  replicas: 4
+  strategy:
+    canary:
+      canaryService: vllm-canary-service
+      stableService: vllm-stable-service
+      trafficRouting:
+        nginx:
+          stableIngress: vllm-ingress
+      steps:
+        - setWeight: 10
+        - pause: { duration: 5m }
+        - analysis:
+            templates:
+              - templateName: llm-canary-slo-analysis
+        - setWeight: 50
+        - pause: { duration: 10m }
+        - analysis:
+            templates:
+              - templateName: llm-canary-slo-analysis
+  selector:
+    matchLabels:
+      app: vllm
+  template:
+    metadata:
+      labels:
+        app: vllm
+    spec:
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:v0.6.6
+          args:
+            - --model
+            - HuggingFaceTB/SmolLM2-360M-Instruct
+            - --dtype
+            - half
+            - --gpu-memory-utilization
+            - "0.85"
+            - --enable-prefix-caching
+            - --otlp-traces-endpoint
+            - http://tempo.llmops.svc.cluster.local:4317
+          ports:
+            - containerPort: 8000
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: llm-canary-slo-analysis
+  namespace: llmops
+spec:
+  metrics:
+    # 1. P95 TTFT must stay under 1.5s
+    - name: canary-ttft-p95
+      interval: 30s
+      count: 5
+      successCondition: result[0] <= 1.5
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: http://prometheus-service.llmops.svc.cluster.local:9090
+          query: job:vllm_time_to_first_token_seconds_p95
+
+    # 2. Error rate must stay under 0.5%
+    - name: canary-error-rate
+      interval: 30s
+      count: 5
+      successCondition: result[0] <= 0.5
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: http://prometheus-service.llmops.svc.cluster.local:9090
+          query: job:litellm_error_rate_percent

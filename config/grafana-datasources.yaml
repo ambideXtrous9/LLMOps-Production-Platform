@@ -1,16 +1,72 @@
 apiVersion: 1
 
 datasources:
+  # ----------------------------------------------------------------------------
+  # 1. Prometheus Metrics Engine (Plane 3)
+  # ----------------------------------------------------------------------------
   - name: Prometheus
     type: prometheus
     access: proxy
     url: http://prometheus:9090
     isDefault: true
     editable: true
+    jsonData:
+      httpMethod: POST
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: tempo
 
+  # ----------------------------------------------------------------------------
+  # 2. Loki Centralized Logs (Plane 5)
+  # ----------------------------------------------------------------------------
   - name: Loki
     type: loki
     access: proxy
     url: http://loki:3100
     isDefault: false
     editable: true
+    jsonData:
+      maxLines: 2000
+      derivedFields:
+        # Deep-link log traces directly to Tempo traces
+        - datasourceUid: tempo
+          matcherRegex: "(?i)(?:trace_id|traceparent)[=:\"]+([a-f0-9]{16,32})"
+          name: TraceID
+          url: "$${__value.raw}"
+
+  # ----------------------------------------------------------------------------
+  # 3. Tempo Distributed Tracing (Plane 5)
+  # ----------------------------------------------------------------------------
+  - name: Tempo
+    type: tempo
+    uid: tempo
+    access: proxy
+    url: http://tempo:3200
+    isDefault: false
+    editable: true
+    jsonData:
+      httpMethod: GET
+      tracesToLogsV2:
+        datasourceUid: Loki
+        spanStartTimeShift: '-5m'
+        spanEndTimeShift: '5m'
+        filterByTraceId: true
+        filterBySpanId: false
+      serviceMap:
+        datasourceUid: Prometheus
+      search:
+        hide: false
+      nodeGraph:
+        enabled: true
+
+  # ----------------------------------------------------------------------------
+  # 4. Alertmanager (Plane 3)
+  # ----------------------------------------------------------------------------
+  - name: Alertmanager
+    type: alertmanager
+    access: proxy
+    url: http://alertmanager:9093
+    isDefault: false
+    editable: true
+    jsonData:
+      implementation: prometheus

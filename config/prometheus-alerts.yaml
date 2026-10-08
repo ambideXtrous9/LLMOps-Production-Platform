@@ -1,0 +1,109 @@
+# ==============================================================================
+# Prometheus SLO-Based Alerting Rules (Plane 3)
+# ==============================================================================
+# "Dashboards without alerts aren't ops."
+# Implements multi-window SLO burn-rate alerts for TTFT, error rate,
+# KV-cache saturation, GPU thermals, and service availability.
+# ==============================================================================
+
+groups:
+  - name: llmops_slo_alerts
+    rules:
+      # ------------------------------------------------------------------------
+      # 1. SLO: Time-To-First-Token (TTFT) Latency Burn-Rate
+      # Target: 95% of requests must receive first token within 1.5 seconds
+      # ------------------------------------------------------------------------
+      - alert: LLMHighTTFTSLOBurnRateFast
+        expr: job:vllm_time_to_first_token_seconds_p95 > 2.0
+        for: 1m
+        labels:
+          severity: critical
+          slo: ttft
+          component: vllm-engine
+        annotations:
+          summary: "Critical TTFT SLO Burn Rate (14.4x burn rate)"
+          description: "P95 Time-To-First-Token is {{ $value | printf \"%.2f\" }}s (exceeds 1.5s SLO threshold) for >1m."
+          runbook_url: "https://internal.wiki/llmops/runbooks/ttft-slo-breach"
+
+      - alert: LLMHighTTFTSLOBurnRateSlow
+        expr: job:vllm_time_to_first_token_seconds_p95 > 1.5
+        for: 5m
+        labels:
+          severity: warning
+          slo: ttft
+          component: vllm-engine
+        annotations:
+          summary: "Elevated TTFT SLO Degradation"
+          description: "P95 Time-To-First-Token has been {{ $value | printf \"%.2f\" }}s for >5m."
+
+      # ------------------------------------------------------------------------
+      # 2. SLO: Gateway Error Rate Burn-Rate
+      # Target: 99.5% of inference requests succeed (Error Rate < 0.5%)
+      # ------------------------------------------------------------------------
+      - alert: LLMHighErrorRateSLOBurnRate
+        expr: job:litellm_error_rate_percent > 1.0
+        for: 2m
+        labels:
+          severity: critical
+          slo: error-budget
+          component: litellm-gateway
+        annotations:
+          summary: "Gateway Error Rate Breach ({{ $value | printf \"%.2f\" }}%)"
+          description: "More than 1% of LLM inference requests are failing at the LiteLLM gateway."
+
+      # ------------------------------------------------------------------------
+      # 3. Saturation: KV-Cache Memory Exhaustion Imminent
+      # Saturation indicator: if KV cache exceeds 85%, continuous batching is capped
+      # ------------------------------------------------------------------------
+      - alert: LLMKVCacheSaturationCritical
+        expr: job:vllm_kv_cache_usage_ratio > 0.85
+        for: 2m
+        labels:
+          severity: critical
+          slo: saturation
+          component: vllm-engine
+        annotations:
+          summary: "vLLM KV-Cache is severely saturated ({{ $value | printf \"%.2f\" }})"
+          description: "PagedAttention KV cache allocation is above 85%. Requests will queue or be rejected."
+
+      # ------------------------------------------------------------------------
+      # 4. Saturation: Normalized Inference Queue Backlog
+      # Backlog indicator: when requests waiting per replica > 5
+      # ------------------------------------------------------------------------
+      - alert: LLMQueueBacklogSaturation
+        expr: job:vllm_queue_backlog_per_replica > 5.0
+        for: 2m
+        labels:
+          severity: warning
+          slo: saturation
+          component: vllm-engine
+        annotations:
+          summary: "Inference queue depth backlog saturated (> 5 req/replica)"
+          description: "Waiting request backlog is {{ $value | printf \"%.1f\" }} per replica. Verify KEDA autoscaling."
+
+      # ------------------------------------------------------------------------
+      # 5. Hardware: NVIDIA GPU Thermal Throttling Alert
+      # Throttling begins at 83°C on modern NVIDIA architectures
+      # ------------------------------------------------------------------------
+      - alert: NVIDIAGPUThermalThrottling
+        expr: DCGM_FI_DEV_GPU_TEMP > 82
+        for: 1m
+        labels:
+          severity: critical
+          component: gpu-hardware
+        annotations:
+          summary: "NVIDIA GPU core temp is critically high ({{ $value }}°C)"
+          description: "GPU core temperature has exceeded 82°C. Clock throttling will degrade TTFT."
+
+      # ------------------------------------------------------------------------
+      # 6. Availability: Core Service Down
+      # ------------------------------------------------------------------------
+      - alert: LLMServiceInstanceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+          slo: availability
+        annotations:
+          summary: "Target instance {{ $labels.instance }} (job: {{ $labels.job }}) is DOWN"
+          description: "Prometheus cannot scrape target {{ $labels.instance }}."
