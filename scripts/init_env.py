@@ -9,6 +9,7 @@ never changed). Used by run_all.sh and scripts/configure_model.py.
 Usage: python3 scripts/init_env.py   (prints "created", "updated" or "exists")
 """
 
+import argparse
 import os
 import secrets
 import shutil
@@ -72,6 +73,7 @@ def ensure_env() -> bool:
 
 
 if __name__ == "__main__":
+    argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter).parse_args()
     if not os.path.exists(ENV_PATH):
         ensure_env()
         print("created")

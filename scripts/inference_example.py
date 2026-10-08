@@ -11,6 +11,7 @@ Demonstrates how to invoke models via the hardened AI Gateway (:4000):
 =============================================================================
 """
 
+import argparse
 import os
 import sys
 import time
@@ -146,4 +147,5 @@ def main():
 
 
 if __name__ == "__main__":
+    argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter).parse_args()
     main()

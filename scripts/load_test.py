@@ -17,6 +17,7 @@ Features:
 Env: CONCURRENCY (default 32), REQUESTS (default = CONCURRENCY), MAX_TOKENS (default 256)
 """
 
+import argparse
 import concurrent.futures
 import multiprocessing
 import os
@@ -160,4 +161,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter).parse_args()
     sys.exit(main())
