@@ -67,5 +67,8 @@ general_settings:
 
   # Relational Database for per-team virtual keys, spend budgets, & audit log
   database_url: os.environ/DATABASE_URL
+  # Connections per worker process: LITELLM_NUM_WORKERS x 5 in total, so a shared or
+  # managed Postgres (often max_connections 100) is never exhausted
+  database_connection_pool_limit: 5
   store_model_in_db: true
   store_prompts_in_spend_logs: false  # PII protection: don't store raw prompts in DB logs

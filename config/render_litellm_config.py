@@ -61,8 +61,10 @@ def engine_routes(served: str) -> list:
     if max_len.isdigit():  # "auto" / "128k": let the engine enforce the limit
         info["max_input_tokens"] = int(max_len)
 
+    # the router asks gateways for a bearer key when ROUTER_API_KEY is set
+    router_key = "os.environ/ROUTER_API_KEY" if os.getenv("ROUTER_API_KEY") else "none"
     routes = [
-        {"model_name": served, "litellm_params": {**params, "api_base": "os.environ/KV_ROUTER_URL"}, "model_info": dict(info)},
+        {"model_name": served, "litellm_params": {**params, "api_base": "os.environ/KV_ROUTER_URL", "api_key": router_key}, "model_info": dict(info)},
         {"model_name": f"{served}-direct", "litellm_params": {**params, "api_base": "os.environ/VLLM_DIRECT_URL"}, "model_info": dict(info)},
     ]
     if env_bool("MODEL_SUPPORTS_REASONING"):
@@ -71,7 +73,7 @@ def engine_routes(served: str) -> list:
         routes.append(
             {
                 "model_name": f"{served}-thinking",
-                "litellm_params": {**params, "api_base": "os.environ/KV_ROUTER_URL", "extra_body": thinking_body},
+                "litellm_params": {**params, "api_base": "os.environ/KV_ROUTER_URL", "api_key": router_key, "extra_body": thinking_body},
                 "model_info": dict(info),
             }
         )

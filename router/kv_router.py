@@ -20,6 +20,7 @@ Features:
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -41,6 +42,9 @@ HEALTH_CHECK_INTERVAL = int(os.getenv("HEALTH_CHECK_INTERVAL", "5"))
 # Max seconds between upstream bytes. Deliberately not a total-request timeout:
 # long (thinking-mode) generations legitimately stream for many minutes.
 DEFAULT_TIMEOUT = int(os.getenv("ROUTER_TIMEOUT", "600"))
+# When set (an external gateway reaches the router over the network), every proxied request
+# must carry "Authorization: Bearer <ROUTER_API_KEY>"; /health and /metrics stay open.
+ROUTER_API_KEY = os.getenv("ROUTER_API_KEY", "").strip()
 HOP_BY_HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade", "content-length", "host",
@@ -176,6 +180,8 @@ def trace_id_from(headers) -> str:
 
 async def handle_proxy(request: web.Request) -> web.StreamResponse:
     """Proxies OpenAI requests with KV-cache prefix awareness and streaming SSE support."""
+    if ROUTER_API_KEY and not hmac.compare_digest(request.headers.get("Authorization", ""), f"Bearer {ROUTER_API_KEY}"):
+        return web.json_response({"error": "missing or invalid router key"}, status=401)
     METRICS["requests_total"] += 1
     path = request.match_info.get("tail", "")
     full_path = f"/{path}" if path else request.path

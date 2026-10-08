@@ -15,6 +15,9 @@ set -eo pipefail
 #                                          (context length, dtype, retry, smaller model)
 #   - platform changed since last run   -> model re-sized for the new hardware
 #   - .env regenerated, old database    -> Postgres password re-synced
+#   - your own Postgres / Redis / ClickHouse / S3 / Langfuse / LiteLLM in .env (EXTERNAL_*)
+#                                       -> used when reachable with read + write access,
+#                                          self-hosted otherwise (scripts/external_services.py)
 #
 # Same architecture on every platform; only the inference engine changes (chosen
 # automatically from the detected hardware):
@@ -41,6 +44,7 @@ NC='\033[0m'
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
+mkdir -p reports  # run logs and this run's service plan (gitignored)
 ORIG_ARGS=("$@")
 
 # Parse CLI flags
@@ -94,6 +98,8 @@ FIT_DONE=false
 GPU_SHARED=false    # other processes hold GPU memory right now (fallbacks are retried next run)
 MODEL_CHANGED=false
 ENGINE_STALLED=0
+EXT_EXPORTS=""      # this run's service plan (scripts/external_services.py resolve)
+SELFHOST=(postgres redis clickhouse minio langfuse langfuse-worker litellm)  # bundled services to run
 
 die()   { echo -e "${RED}❌ $*${NC}"; exit 1; }
 fixed() { echo -e "  ${YELLOW}↻${NC} $*"; REMEDIATIONS+=("$*"); }
@@ -188,19 +194,26 @@ load_env() {
     set +a
     if [ -n "$PORT_EXPORTS" ]; then eval "$PORT_EXPORTS"; fi
     if [ -n "$FIT_EXPORTS" ]; then eval "$FIT_EXPORTS"; fi
+    if [ -n "$EXT_EXPORTS" ]; then eval "$EXT_EXPORTS"; fi
+    if [ -n "${SELFHOST_SERVICES+x}" ]; then read -r -a SELFHOST <<< "$SELFHOST_SERVICES"; fi
     export LLMOPS_PLATFORM="$TARGET_BACKEND"
     # Apple Silicon: scripts reach the native engine directly
     if [ "$TARGET_BACKEND" = "metal" ]; then export VLLM_PORT="${METAL_ENGINE_PORT:-8000}"; fi
     export GATEWAY_MODEL="${SERVED_MODEL_NAME:-qwen3.5-9b}"
+    # checks reach the router where it listens (ROUTER_BIND_ADDRESS: an external gateway's view)
+    ROUTER_HOST="localhost"
+    case "${ROUTER_BIND_ADDRESS:-}" in ""|0.0.0.0|127.0.0.1|localhost) ;; *) ROUTER_HOST="$ROUTER_BIND_ADDRESS" ;; esac
+    export KV_ROUTER_URL="http://${ROUTER_HOST}:${ROUTER_PORT:-8001}"
 }
 
-# preflight <ports|fit> <var>: runs scripts/preflight.py, shows its notes, records its
-# automatic fixes and stores its export lines in <var> (applied by load_env)
-preflight() {
-    local out err line
+# run_helper <var> <command...>: runs a scripts/ helper, shows its notes, records its
+# automatic fixes ("↻" lines) and stores its export lines in <var> (applied by load_env)
+run_helper() {
+    local var="$1" out err line
+    shift
     out="$(mktemp)"; err="$(mktemp)"
-    if ! python3 scripts/preflight.py "$1" --platform "$TARGET_BACKEND" >"$out" 2>"$err"; then
-        cat "$err"; rm -f "$out" "$err"; die "scripts/preflight.py $1 failed"
+    if ! "$@" >"$out" 2>"$err"; then
+        cat "$err"; rm -f "$out" "$err"; die "$* failed"
     fi
     while IFS= read -r line; do
         case "$line" in
@@ -208,8 +221,38 @@ preflight() {
             *) echo "$line" ;;
         esac
     done < "$err"
-    printf -v "$2" '%s' "$(cat "$out")"
+    printf -v "$var" '%s' "$(cat "$out")"
     rm -f "$out" "$err"
+}
+
+# preflight <ports|fit> <var>: host ports / sizing for this machine (scripts/preflight.py)
+preflight() { run_helper "$2" python3 scripts/preflight.py "$1" --platform "$TARGET_BACKEND"; }
+
+# selfhosted <service>: true when this run runs the bundled container for it
+selfhosted() { case " ${SELFHOST[*]} " in *" $1 "*) return 0 ;; esac; return 1; }
+
+# The external gateway cannot serve this model (e.g. it cannot reach the router): serve it
+# through the bundled gateway instead, with the bundled Postgres / Redis where needed.
+selfhost_gateway() {
+    local data=() s
+    fixed "External LiteLLM cannot serve this model (see above): self-hosting the gateway instead"
+    python3 scripts/external_services.py gateway-unregister >/dev/null 2>&1 || true
+    EXT_EXPORTS="$(printf '%s\n' "$EXT_EXPORTS" | grep -vE '^export (LITELLM_URL|LITELLM_MASTER_KEY|GATEWAY_MODE|SELFHOST_SERVICES)=' || true)"
+    for s in postgres redis; do
+        if ! selfhosted "$s"; then data+=("$s"); SELFHOST+=("$s"); fi
+    done
+    SELFHOST+=(litellm)
+    EXT_EXPORTS="${EXT_EXPORTS}"$'\n'"export GATEWAY_MODE=selfhosted"$'\n'"export SELFHOST_SERVICES='${SELFHOST[*]}'"
+    unset LITELLM_URL
+    load_env
+    ( umask 077; printf '%s\n' "$EXT_EXPORTS" > reports/services.env )
+    if [ ${#data[@]} -gt 0 ]; then
+        docker compose "${COMPOSE_FILES[@]}" up -d --wait --wait-timeout 180 "${data[@]}"
+        if [ "${data[0]}" = "postgres" ]; then sync_postgres; fi
+    fi
+    docker compose "${COMPOSE_FILES[@]}" up -d --no-deps litellm >/dev/null
+    ensure_ready "LiteLLM AI Gateway (:${LITELLM_PORT:-4000})" litellm 600 curl -sf "http://localhost:${LITELLM_PORT:-4000}/health/liveliness" \
+        || die "LiteLLM failed to start."
 }
 
 # configure_model <preset|hf-repo>: writes the model block, then reloads env (+ sizing)
@@ -549,6 +592,9 @@ if [ "$DOWN" = true ]; then
     echo -e "${YELLOW}🛑 Stopping all LLMOps services (volumes are kept)...${NC}"
     docker compose -f docker-compose.yml down --remove-orphans
     stop_metal_engine
+    if [ -f .env ] && [ -n "$(env_get EXTERNAL_LITELLM_URL)" ]; then  # routes this stack added to your gateway
+        python3 scripts/external_services.py gateway-unregister || true
+    fi
     echo -e "${GREEN}✓ All services stopped.${NC}"
     exit 0
 fi
@@ -645,12 +691,14 @@ echo -e "  ${GREEN}✓${NC} Environment secrets loaded from .env (model: ${MODEL
 mkdir -p "${HF_CACHE_DIR:-$HOME/.cache/huggingface}/gguf"  # gguf/: llama.cpp weights (CPU)
 
 if [ "$TEST_ONLY" = true ]; then
+    # verify the services the running stack booted with (external or bundled)
+    if [ -f reports/services.env ]; then EXT_EXPORTS="$(cat reports/services.env)"; load_env; fi
     echo -e "\n${YELLOW}ℹ --test flag provided. Skipping container boot and running verification...${NC}"
 else
     # ------------------------------------------------------------------------------
     # STEP 3: Clean Teardown, Host Ports & Hardware Fit
     # ------------------------------------------------------------------------------
-    echo -e "\n${BLUE}${BOLD}[3/10] Stopping stale containers (data volumes are kept), checking host ports & sizing...${NC}"
+    echo -e "\n${BLUE}${BOLD}[3/10] Stopping stale containers (data volumes are kept), checking host ports, sizing & services...${NC}"
     docker compose "${COMPOSE_FILES[@]}" down --remove-orphans >/dev/null 2>&1 || true
     stop_metal_engine
     echo -e "  ${GREEN}✓${NC} Clean state verified."
@@ -672,14 +720,21 @@ else
     fi
     load_env
     echo -e "  ${GREEN}✓${NC} Host ports free; engine and gateway sized for this machine."
+    # Your own Postgres / Redis / ClickHouse / S3 / Langfuse / LiteLLM (EXTERNAL_* in .env):
+    # used when reachable with read + write access, the bundled containers otherwise
+    run_helper EXT_EXPORTS python3 scripts/external_services.py resolve --platform "$TARGET_BACKEND"
+    load_env
+    ( umask 077; printf '%s\n' "$EXT_EXPORTS" > reports/services.env )
+    echo -e "  ${GREEN}✓${NC} Bundled services this run: ${SELFHOST[*]:-none}"
+    CORE_SERVICES=(vllm kv-router prometheus alertmanager alloy tempo loki dcgm-exporter node-exporter grafana)
 
     # ------------------------------------------------------------------------------
     # STEP 4: Pull & Build Images
     # ------------------------------------------------------------------------------
     echo -e "\n${BLUE}${BOLD}[4/10] Pulling pinned images & building local microservices...${NC}"
-    if ! retry 3 docker compose "${COMPOSE_FILES[@]}" pull --quiet --ignore-buildable; then
+    if ! retry 3 docker compose "${COMPOSE_FILES[@]}" pull --quiet --ignore-buildable "${CORE_SERVICES[@]}" "${SELFHOST[@]}"; then
         # Registry unreachable (offline host, rate limit): carry on with cached images.
-        MISSING_IMAGES="$(docker compose "${COMPOSE_FILES[@]}" config --format json 2>/dev/null | python3 -c '
+        MISSING_IMAGES="$(docker compose "${COMPOSE_FILES[@]}" config --format json "${CORE_SERVICES[@]}" "${SELFHOST[@]}" 2>/dev/null | python3 -c '
 import json, subprocess, sys
 services = json.load(sys.stdin)["services"].values()
 images = sorted({s["image"] for s in services if "image" in s and "build" not in s})
@@ -696,10 +751,16 @@ print(" ".join(i for i in images if subprocess.run(["docker", "image", "inspect"
     # ------------------------------------------------------------------------------
     # STEP 5: Start Distributed State (Postgres & Redis)
     # ------------------------------------------------------------------------------
-    echo -e "\n${BLUE}${BOLD}[5/10] Starting Persistence & Cache (PostgreSQL & Redis)...${NC}"
-    docker compose "${COMPOSE_FILES[@]}" up -d --wait --wait-timeout 180 postgres redis
-    echo -e "  ${GREEN}✓${NC} PostgreSQL & Redis healthy."
-    sync_postgres
+    DATA_SERVICES=()
+    for s in postgres redis clickhouse minio; do
+        if selfhosted "$s"; then DATA_SERVICES+=("$s"); fi
+    done
+    echo -e "\n${BLUE}${BOLD}[5/10] Starting Persistence & Cache (bundled: ${DATA_SERVICES[*]:-none, all external})...${NC}"
+    if [ ${#DATA_SERVICES[@]} -gt 0 ]; then
+        docker compose "${COMPOSE_FILES[@]}" up -d --wait --wait-timeout 180 "${DATA_SERVICES[@]}"
+        echo -e "  ${GREEN}✓${NC} ${DATA_SERVICES[*]} healthy."
+    fi
+    if selfhosted postgres; then sync_postgres; fi
 
     # ------------------------------------------------------------------------------
     # STEP 6: Start the Inference Engine (loads in the background)
@@ -714,8 +775,12 @@ print(" ".join(i for i in images if subprocess.run(["docker", "image", "inspect"
     # STEP 7: Start Gateway & Observability Planes while the engine loads
     # ------------------------------------------------------------------------------
     echo -e "\n${BLUE}${BOLD}[7/10] Starting AI Gateway & Observability Planes (Router, LiteLLM, Prometheus, Alloy, Tempo, Loki, Grafana, Langfuse)...${NC}"
-    docker compose "${COMPOSE_FILES[@]}" up -d kv-router litellm prometheus alertmanager alloy tempo loki \
-        dcgm-exporter node-exporter grafana langfuse langfuse-worker clickhouse minio
+    APP_SERVICES=(kv-router prometheus alertmanager alloy tempo loki dcgm-exporter node-exporter grafana)
+    for s in litellm langfuse langfuse-worker; do
+        if selfhosted "$s"; then APP_SERVICES+=("$s"); fi
+    done
+    # --no-deps: the data services above are bundled or external as decided in step 3
+    docker compose "${COMPOSE_FILES[@]}" up -d --no-deps "${APP_SERVICES[@]}"
 
     # ------------------------------------------------------------------------------
     # STEP 8: Readiness Gates (the engine recovers from boot failures on its own)
@@ -726,16 +791,24 @@ print(" ".join(i for i in images if subprocess.run(["docker", "image", "inspect"
     ensure_ready "Tempo (:${TEMPO_PORT:-3200})" tempo 180 curl -sf "http://localhost:${TEMPO_PORT:-3200}/ready" || die "Tempo failed to start."
     ensure_ready "Loki (:${LOKI_PORT:-3100})" loki 180 curl -sf "http://localhost:${LOKI_PORT:-3100}/ready" || die "Loki failed to start."
     ensure_ready "Grafana (:${GRAFANA_PORT:-3001})" grafana 180 curl -sf "http://localhost:${GRAFANA_PORT:-3001}/api/health" || die "Grafana failed to start."
-    ensure_ready "Langfuse (:${LANGFUSE_PORT:-3000})" langfuse 600 curl -sf "http://localhost:${LANGFUSE_PORT:-3000}/api/public/health" || die "Langfuse failed to start."
-    ensure_ready "LiteLLM AI Gateway (:${LITELLM_PORT:-4000})" litellm 600 curl -sf "http://localhost:${LITELLM_PORT:-4000}/health/liveliness" || die "LiteLLM failed to start."
-    boot_engine || die "The inference engine could not be started (log lines above)."
-    if [ "$MODEL_CHANGED" = true ]; then
-        echo -e "  Re-rendering gateway routes for '${SERVED_MODEL_NAME}'..."
-        docker compose "${COMPOSE_FILES[@]}" up -d --force-recreate litellm >/dev/null
+    if selfhosted langfuse; then
+        ensure_ready "Langfuse (:${LANGFUSE_PORT:-3000})" langfuse 600 curl -sf "http://localhost:${LANGFUSE_PORT:-3000}/api/public/health" || die "Langfuse failed to start."
+    fi
+    if selfhosted litellm; then
         ensure_ready "LiteLLM AI Gateway (:${LITELLM_PORT:-4000})" litellm 600 curl -sf "http://localhost:${LITELLM_PORT:-4000}/health/liveliness" || die "LiteLLM failed to start."
     fi
+    boot_engine || die "The inference engine could not be started (log lines above)."
+    if [ "$MODEL_CHANGED" = true ] && selfhosted litellm; then
+        echo -e "  Re-rendering gateway routes for '${SERVED_MODEL_NAME}'..."
+        docker compose "${COMPOSE_FILES[@]}" up -d --no-deps --force-recreate litellm >/dev/null
+        ensure_ready "LiteLLM AI Gateway (:${LITELLM_PORT:-4000})" litellm 600 curl -sf "http://localhost:${LITELLM_PORT:-4000}/health/liveliness" || die "LiteLLM failed to start."
+    fi
+    if [ "${GATEWAY_MODE:-selfhosted}" = "external" ]; then
+        echo -e "  Registering '${SERVED_MODEL_NAME}' on your LiteLLM (${LITELLM_URL})..."
+        if ! python3 scripts/external_services.py gateway-register; then selfhost_gateway; fi
+    fi
     ensure_ready "KV-Aware Router backend health (:${ROUTER_PORT:-8001})" kv-router 120 \
-        sh -c "curl -sf http://localhost:${ROUTER_PORT:-8001}/health | grep -q '\"status\": \"ok\"'" || die "KV router has no healthy backend."
+        sh -c "curl -sf ${KV_ROUTER_URL}/health | grep -q '\"status\": \"ok\"'" || die "KV router has no healthy backend."
 
     # The first request after boot pays one-time kernel JIT / graph warm-up (seconds on
     # GPU, ~1 min on CPU). Absorb it here so users and latency gates see steady state.
@@ -815,6 +888,13 @@ if [ ${#REMEDIATIONS[@]} -gt 0 ]; then
     for item in "${REMEDIATIONS[@]}"; do echo -e "  • ${YELLOW}↻${NC} ${item}"; done
     echo ""
 fi
+echo -e "  ${BOLD}Services:${NC}"
+echo -e "  • ${PURPLE}Bundled (self-hosted) ${NC}: ${SELFHOST[*]:-none}"
+if [ -n "${EXTERNAL_SERVICES:-}" ]; then
+    EXT_LIST="${EXTERNAL_SERVICES//; /\\n                            }"
+    echo -e "  • ${PURPLE}External (yours)      ${NC}: ${EXT_LIST}"
+fi
+echo ""
 if [ ${#ADVISORIES[@]} -gt 0 ]; then
     echo -e "  ${BOLD}Advisories:${NC}"
     for item in "${ADVISORIES[@]}"; do echo -e "  • ${YELLOW}⚠${NC} ${item}"; done
@@ -823,17 +903,19 @@ fi
 echo -e "  ${BOLD}Hardware Diagnostic Summary:${NC}"
 echo -e "  • ${PURPLE}Detected Architecture${NC} : $HARDWARE_SUMMARY"
 echo -e "  • ${PURPLE}Active Backend Profile${NC}: config/profiles/$HARDWARE_PROFILE"
-THINKING_ALIAS=""
-if [ "${MODEL_SUPPORTS_REASONING:-false}" = "true" ]; then THINKING_ALIAS=", ${GATEWAY_MODEL}-thinking"; fi
+ALIASES="${GATEWAY_MODEL}"
+# the -direct fallback bypasses the router, which only the bundled gateway can do
+if selfhosted litellm; then ALIASES="${ALIASES}, ${GATEWAY_MODEL}-direct"; fi
+if [ "${MODEL_SUPPORTS_REASONING:-false}" = "true" ]; then ALIASES="${ALIASES}, ${GATEWAY_MODEL}-thinking"; fi
 echo -e "  • ${PURPLE}Platform              ${NC}: ${TARGET_BACKEND} (${COMPOSE_OVERLAY})"
-echo -e "  • ${PURPLE}Served Model          ${NC}: ${MODEL_NAME:-?} (gateway aliases: ${GATEWAY_MODEL}, ${GATEWAY_MODEL}-direct${THINKING_ALIAS})"
+echo -e "  • ${PURPLE}Served Model          ${NC}: ${MODEL_NAME:-?} (gateway aliases: ${ALIASES})"
 case "$TARGET_BACKEND" in
     cuda|rocm) SIZING="vLLM, context ${MAX_MODEL_LEN:-auto}, engine memory fraction ${GPU_MEMORY_UTILIZATION:-0.90}" ;;
     cpu)       SIZING="llama.cpp ${GGUF_FILE:-?}, ${LLAMACPP_CTX:-16384}-token context shared by ${LLAMACPP_PARALLEL:-4} slots" ;;
     metal)     SIZING="vllm-metal, context ${MAX_MODEL_LEN:-auto}" ;;
     *)         SIZING="mock engine" ;;
 esac
-SIZING="${SIZING}, gateway workers ${LITELLM_NUM_WORKERS:-4}"
+if selfhosted litellm; then SIZING="${SIZING}, gateway workers ${LITELLM_NUM_WORKERS:-4}"; fi
 echo -e "  • ${PURPLE}Sizing                ${NC}: ${SIZING}"
 echo -e "  • ${PURPLE}Switch Model          ${NC}: ./run_all.sh --model <preset | any/hf-repo>"
 echo ""
@@ -841,16 +923,31 @@ echo ""
 UI_HOST="localhost"; if [ "${UI_BIND_ADDRESS:-127.0.0.1}" != "127.0.0.1" ]; then UI_HOST="${PUBLIC_HOST:-<server-ip>}"; fi
 GW_HOST="localhost"; if [ "${GATEWAY_BIND_ADDRESS:-127.0.0.1}" != "127.0.0.1" ]; then GW_HOST="${PUBLIC_HOST:-<server-ip>}"; fi
 echo -e "  ${BOLD}Interactive Service Endpoints:${NC}"
-echo -e "  • ${CYAN}LiteLLM AI Gateway${NC}    : http://${GW_HOST}:${LITELLM_PORT:-4000}/v1  (Bearer \$TEAM_ENGINEERING_KEY from .env)"
-echo -e "  • ${CYAN}LiteLLM Admin UI${NC}      : http://${GW_HOST}:${LITELLM_PORT:-4000}/ui  (admin / LITELLM_MASTER_KEY)"
+GATEWAY_BASE="http://${GW_HOST}:${LITELLM_PORT:-4000}"
+if [ "${GATEWAY_MODE:-selfhosted}" = "external" ]; then GATEWAY_BASE="${LITELLM_URL}"; fi
+LANGFUSE_BASE="http://${UI_HOST}:${LANGFUSE_PORT:-3000}"
+if [ "${LANGFUSE_MODE:-selfhosted}" = "external" ]; then LANGFUSE_BASE="${LANGFUSE_URL}"; fi
+echo -e "  • ${CYAN}LiteLLM AI Gateway${NC}    : ${GATEWAY_BASE}/v1  (Bearer \$TEAM_ENGINEERING_KEY from .env)"
+echo -e "  • ${CYAN}LiteLLM Admin UI${NC}      : ${GATEWAY_BASE}/ui"
 echo -e "  • ${CYAN}Grafana Dashboard${NC}     : http://${UI_HOST}:${GRAFANA_PORT:-3001}  (User: ${GF_SECURITY_ADMIN_USER:-admin} / Pass: GF_SECURITY_ADMIN_PASSWORD in .env)"
-echo -e "  • ${CYAN}Langfuse (LLM traces)${NC} : http://${UI_HOST}:${LANGFUSE_PORT:-3000}  (User: ${LANGFUSE_ADMIN_EMAIL:-admin@llmops.local} / Pass: LANGFUSE_ADMIN_PASSWORD in .env)"
-echo -e "  • ${CYAN}Internal only${NC}         : vLLM :${VLLM_PORT:-8000}, router :${ROUTER_PORT:-8001}, Prometheus :${PROMETHEUS_PORT:-9090}, Alertmanager :${ALERTMANAGER_PORT:-9093},"
+echo -e "  • ${CYAN}Langfuse (LLM traces)${NC} : ${LANGFUSE_BASE}"
+INTERNAL="vLLM :${VLLM_PORT:-8000}, router :${ROUTER_PORT:-8001}, "
+case "${ROUTER_BIND_ADDRESS:-}" in
+    ""|127.0.0.1|localhost) ;;
+    *)  # published for an external gateway, behind ROUTER_API_KEY
+        echo -e "  • ${CYAN}KV router (upstream)${NC}  : http://${ROUTER_BIND_ADDRESS}:${ROUTER_PORT:-8001}/v1  (Bearer ROUTER_API_KEY in .env)"
+        INTERNAL="vLLM :${VLLM_PORT:-8000}, " ;;
+esac
+echo -e "  • ${CYAN}Internal only${NC}         : ${INTERNAL}Prometheus :${PROMETHEUS_PORT:-9090}, Alertmanager :${ALERTMANAGER_PORT:-9093},"
 echo -e "                            Tempo :${TEMPO_PORT:-3200}, Loki :${LOKI_PORT:-3100}, Alloy :${ALLOY_PORT:-12345} (bound to ${BIND_ADDRESS:-127.0.0.1}; browse them via Grafana)"
 if [ -n "${SSH_CONNECTION:-}" ]; then
+    TUNNEL=""  # the UIs this host serves
+    if selfhosted litellm; then TUNNEL+="-L ${LITELLM_PORT:-4000}:localhost:${LITELLM_PORT:-4000} "; fi
+    TUNNEL+="-L ${GRAFANA_PORT:-3001}:localhost:${GRAFANA_PORT:-3001} -L ${PROMETHEUS_PORT:-9090}:localhost:${PROMETHEUS_PORT:-9090} "
+    if selfhosted langfuse; then TUNNEL+="-L ${LANGFUSE_PORT:-3000}:localhost:${LANGFUSE_PORT:-3000} "; fi
     echo ""
     echo -e "  ${BOLD}Remote host detected - open the UIs from your laptop through an SSH tunnel:${NC}"
-    echo -e "  ${YELLOW}ssh -N -L ${LITELLM_PORT:-4000}:localhost:${LITELLM_PORT:-4000} -L ${GRAFANA_PORT:-3001}:localhost:${GRAFANA_PORT:-3001} -L ${PROMETHEUS_PORT:-9090}:localhost:${PROMETHEUS_PORT:-9090} -L ${LANGFUSE_PORT:-3000}:localhost:${LANGFUSE_PORT:-3000} $(whoami)@$(echo "$SSH_CONNECTION" | awk '{print $3}')${NC}"
+    echo -e "  ${YELLOW}ssh -N ${TUNNEL}$(whoami)@${PUBLIC_HOST:-$(echo "$SSH_CONNECTION" | awk '{print $3}')}${NC}"
 fi
 echo ""
 echo -e "  ${BOLD}Operational Commands:${NC}"
@@ -859,7 +956,7 @@ echo -e "  • Re-run Health Checks    : ${YELLOW}python3 scripts/test_stack.py$
 echo -e "  • Run Streaming Load Test : ${YELLOW}python3 scripts/load_test.py${NC}"
 echo -e "  • Run CI Model Eval Gate  : ${YELLOW}python3 scripts/eval_gate.py${NC}"
 echo -e "  • Try the Gateway         : ${YELLOW}python3 scripts/inference_example.py${NC}"
-echo -e "  • Rotate Master Admin Key : ${YELLOW}bash scripts/rotate_master_key.sh${NC}"
+if selfhosted litellm; then echo -e "  • Rotate Master Admin Key : ${YELLOW}bash scripts/rotate_master_key.sh${NC}"; fi
 echo -e "  • Stop Platform Cleanly   : ${YELLOW}./run_all.sh --down${NC}"
 echo -e "${GREEN}${BOLD}==============================================================================${NC}"
 

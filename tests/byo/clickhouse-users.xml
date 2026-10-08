@@ -1,0 +1,18 @@
+<clickhouse>
+    <users>
+        <byo_rw>
+            <password>byo-rw-pass</password>
+            <networks><ip>::/0</ip></networks>
+            <profile>default</profile>
+            <quota>default</quota>
+            <grants><query>GRANT ALL ON llmops_ext.*</query><query>GRANT SELECT ON system.parts</query><query>GRANT SELECT ON system.mutations</query><query>GRANT SELECT ON system.tables</query><query>GRANT SELECT ON system.query_log</query><query>GRANT SELECT ON system.processes</query><query>GRANT SELECT ON system.replicas</query></grants>
+        </byo_rw>
+        <byo_ro>
+            <password>byo-ro-pass</password>
+            <networks><ip>::/0</ip></networks>
+            <profile>readonly</profile>
+            <quota>default</quota>
+            <grants><query>GRANT SELECT ON llmops_ext.*</query></grants>
+        </byo_ro>
+    </users>
+</clickhouse>

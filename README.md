@@ -188,6 +188,7 @@ Client App       LiteLLM (:4000)     KV Router (:8001)     Engine (:8000)      P
 │ Platform overlay      gpu · rocm: vLLM   cpu: llama.cpp   metal: vllm-metal   mock                    │
 │ run_all.sh at boot    preflight.py: free ports · GPU memory / llama.cpp context · gateway workers     │
 │ On a failed boot      engine_doctor.py: context · fp16 · retry · smaller preset · CPU (saved in .env) │
+│ Your own services     external_services.py: EXTERNAL_* used if read + write checks pass, else bundled │
 └───────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -211,12 +212,13 @@ Client App       LiteLLM (:4000)     KV Router (:8001)     Engine (:8000)      P
 │ Gateway + UI   :4000   GATEWAY_BIND_ADDRESS      │ │ engine :8000 · KV router :8001                   │
 │ Grafana        :3001   UI_BIND_ADDRESS           │ │ Prometheus :9090 · Alertmanager :9093            │
 │ Langfuse       :3000   UI_BIND_ADDRESS           │ │ Loki :3100 · Tempo :3200 · Alloy :12345          │
-│                                                  │ │ OTLP :4317/:4318 · DCGM :9400 · node :9100       │
+│ KV router      :8001   ROUTER_BIND_ADDRESS + key │ │ OTLP :4317/:4318 · DCGM :9400 · node :9100       │
 │                                                  │ │ Postgres :5432 · Redis :6379                     │
 └──────────────────────────────────────────────────┘ └──────────────────────────────────────────────────┘
 
 ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ DOCKER NETWORK ONLY:  LiteLLM metrics :9095 · ClickHouse · MinIO (never published)                    │
+│ YOUR OWN SERVICES (EXTERNAL_*):  reached from containers, used after read + write checks              │
 └───────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -306,7 +308,28 @@ git clone <repo> && cd LLMOps
 - **Sizing** — the engine takes the GPU with the most free memory and sizes itself to it; gateway workers follow CPU threads; CPU KV cache follows RAM.
 - **Engine recovery** — a failed boot gets context `auto`, fp16, a retry, a smaller preset, and finally the CPU; a model dropped because the GPU was shared is retried next run.
 - **Database & keys** — the Postgres password is re-synced with `.env`; team keys left by a lost `.env` are retired and the seed keys re-issued.
+- **Your services** — Postgres, Redis, ClickHouse, S3, Langfuse or LiteLLM given in `.env` are used when reachable with read + write access; otherwise the bundled container runs ([3.7](#37-bring-your-own-services)).
 - **Timing** — cold start ≈ 3.5 min (9B on A100, includes 19 GB download); warm restart ≈ 80 s.
+
+### 3.7 Bring Your Own Services
+
+Already run some of these? Put their credentials in `.env` (`EXTERNAL_*`, documented in `.env.example`). Each run checks them before pulling anything; a service is used only when every check passes, otherwise its bundled container runs and the report says why.
+
+| Service | Used for | Checked (read + write) | Not usable → |
+| :--- | :--- | :--- | :--- |
+| Postgres | gateway keys / spend · Langfuse metadata (own database) | connect · probe table create / insert / select / drop · `langfuse` database · free connections | bundled `postgres` |
+| Redis | gateway cache + rate limits · Langfuse queue | `SET` `GET` `DEL` `INCRBY` `HSET` `ZADD` `LPUSH` · Lua `EVAL` | bundled `redis` |
+| ClickHouse | Langfuse traces | probe table create / insert / drop · `system.parts` / `mutations` / `tables` · native port | bundled `clickhouse` |
+| S3 storage | Langfuse event / media payloads | probe object `PUT` / `GET` / `DELETE` | bundled `minio` |
+| Langfuse | LLM traces, judge scores | health · project read · OpenTelemetry span write | bundled Langfuse + ClickHouse + MinIO |
+| LiteLLM | the gateway | admin read · add / delete model + key · then a request through it reaches this model | bundled `litellm` |
+
+- **Only what is needed runs** — your Langfuse makes ClickHouse and MinIO unnecessary; your LiteLLM makes the gateway's Postgres and Redis unnecessary.
+- **Re-checked every run** — grant the missing access and the next run switches over; the report lists bundled vs yours.
+- **Your gateway** — needs an admin key and `STORE_MODEL_IN_DB=True`; it must reach this host's router (`EXTERNAL_LITELLM_UPSTREAM_URL`, `ROUTER_BIND_ADDRESS`), which then requires a bearer key (`ROUTER_API_KEY`, generated). Its own policies (PII masking, callbacks, metrics) stay yours; `--down` removes the routes this host added.
+- **Services on this host** — `localhost` is reached via `host.docker.internal`; one listening on loopback only cannot be reached by containers and is replaced.
+- **Bounded connections** — gateway workers × 5 + Langfuse 2 × 10, checked against the server's free slots.
+- **Test fixture** — `tests/byo/fixture.sh up` runs stand-in managed services with read-write and read-only users.
 
 ---
 
@@ -555,6 +578,16 @@ client.chat.completions.create(model="qwen3.5-9b", messages=[{"role": "user", "c
 | `.env` lost, old databases | new secrets, DB re-synced, stale keys retired | 13/13 · eval 100 % |
 | Original `.env` restored | DB re-synced, original keys re-issued | 13/13 · eval 100 % · 74 tok/s |
 
+### 10.4 Bring Your Own Services (A100 host, stand-ins from `tests/byo/`, 2026-10-08)
+
+| Yours (`EXTERNAL_*`) | Bundled this run | Result |
+| :--- | :--- | :--- |
+| Postgres · Redis · ClickHouse · S3, read-write users | Langfuse · LiteLLM | 13/13 · eval 8/8 · traces in your ClickHouse, keys + spend in your Postgres |
+| Same, read-only users · wrong Langfuse key · non-admin LiteLLM key | all seven, each with its reason | 13/13 · eval 8/8 |
+| Langfuse + LiteLLM (admin) | none: engine, router, observability | routes added to your LiteLLM · 13/13 · 32/32 streams through it · `--down` removed them |
+| Langfuse + Postgres + Redis | LiteLLM | 13/13 · eval 8/8 · judge scores in your Langfuse |
+| Endpoints that hang, reset, send garbage or answer every URL | the affected service | never fatal: bundled, reason reported |
+
 ---
 
 ## 11. Kubernetes
@@ -603,6 +636,7 @@ All settings live in `.env` (template: `.env.example`).
 | Boot patience | `VLLM_READY_TIMEOUT` (seconds without engine progress) |
 | Host ports | `VLLM_PORT` · `ROUTER_PORT` · `LITELLM_PORT` · `LANGFUSE_PORT` · `GRAFANA_PORT` · `PROMETHEUS_PORT` · `ALERTMANAGER_PORT` · `LOKI_PORT` · `TEMPO_PORT` · `ALLOY_PORT` · `OTLP_GRPC_PORT` · `OTLP_HTTP_PORT` · `POSTGRES_PORT` · `REDIS_PORT` · `DCGM_PORT` · `NODE_EXPORTER_PORT` |
 | Kept by `run_all.sh` | `MODEL_PLATFORM` · `MODEL_FALLBACK_FROM` |
+| Your own services | `EXTERNAL_POSTGRES_URL` · `EXTERNAL_LANGFUSE_POSTGRES_URL` · `EXTERNAL_REDIS_URL` · `EXTERNAL_CLICKHOUSE_*` · `EXTERNAL_S3_*` · `EXTERNAL_LANGFUSE_*` · `EXTERNAL_LITELLM_*` · `ROUTER_BIND_ADDRESS` · `ROUTER_API_KEY` |
 | Engine flags | `VLLM_MODEL_ARGS` (configurator-owned) · `VLLM_EXTRA_ARGS` (yours) |
 | Capabilities | `MODEL_SUPPORTS_REASONING` · `_TOOLS` · `_VISION` · `MODEL_REASONING_BY_DEFAULT` · `MODEL_THINKING_EXTRA_BODY` |
 | Quality gates | `EVAL_MIN_ACCURACY` · `EVAL_MAX_TTFT` · `EVAL_MIN_TPS` · `EVAL_ENFORCE` |
@@ -651,6 +685,9 @@ All settings live in `.env` (template: `.env.example`).
 | Langfuse login bounces to `localhost` | set `NEXTAUTH_URL=http://<server-ip>:3000`, recreate Langfuse |
 | `.env` deleted | a new one is generated, the Postgres password re-synced and the old team keys retired (they stop working) |
 | `no GGUF build found` (CPU) | the model has no GGUF on the Hub: the recommended preset is served; pick a repo with a GGUF build |
+| `external service write access denied` | grant the privilege named in the report (e.g. `CREATE` on the schema) — the bundled service runs meanwhile |
+| `only N free connections` (Postgres) | raise `max_connections` or lower `LITELLM_NUM_WORKERS` — the bundled Postgres runs meanwhile |
+| `External LiteLLM cannot serve this model` | that proxy cannot reach `EXTERNAL_LITELLM_UPSTREAM_URL`: check `ROUTER_BIND_ADDRESS` and the firewall between them |
 | `stale file handle` after `git pull` | `docker compose … up -d --force-recreate <service>` |
 
 ---
@@ -684,6 +721,7 @@ LLMOps/
 │   ├── base/                      # kustomize base
 │   ├── overlays/                  # cuda · cuda-runtimeclass · rocm · cpu
 │   └── extras/                    # Argo Rollouts · Karpenter · Gateway API · Alloy · kind
+├── tests/byo/                     # stand-in managed services for the external checks
 └── scripts/
     ├── bootstrap_host.sh          # GPU host setup
     ├── configure_model.py         # presets / auto-profile
@@ -691,6 +729,7 @@ LLMOps/
     ├── detect_hardware.py         # platform detection
     ├── preflight.py               # host ports · sizing for this machine
     ├── engine_doctor.py           # engine boot failure -> fix
+    ├── external_services.py       # your own services: check, use or self-host
     ├── deploy_k8s.sh              # Kubernetes deploy
     ├── llmops_client.py           # shared client
     ├── test_stack.py · load_test.py · eval_gate.py · online_eval_judge.py

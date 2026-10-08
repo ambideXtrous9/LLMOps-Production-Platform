@@ -56,6 +56,14 @@ SERVED_MODEL = os.getenv("SERVED_MODEL_NAME", GATEWAY_MODEL)
 # Telemetry that depends on the hardware model: reported, never fatal.
 OPTIONAL_TARGETS = {"dcgm": "GPU telemetry unavailable (DCGM supports datacenter GPUs; GeForce / laptop GPUs lack it)"}
 
+# Bring-your-own services (scripts/external_services.py): an external gateway or Langfuse
+# belongs to its owner - its own policies (PII masking, callbacks, metrics) are not ours
+# to assert; the checks verify this stack's planes and that the gateway serves our model.
+EXTERNAL_GATEWAY = os.getenv("GATEWAY_MODE") == "external"
+if EXTERNAL_GATEWAY:
+    OPTIONAL_TARGETS["litellm"] = "the gateway is external (its metrics belong to its owner)"
+ROUTER_KEY = os.getenv("ROUTER_API_KEY", "")
+
 TRACE_ID = os.urandom(16).hex()
 TRACEPARENT = f"00-{TRACE_ID}-{os.urandom(8).hex()}-01"
 SUITE_START = time.time()
@@ -115,6 +123,15 @@ def test_streaming_inference() -> bool:
     ok(f"Answer: \"{res.content.strip()[:110]}\"")
     if res.reasoning and SUPPORTS_REASONING and not REASONING_BY_DEFAULT:
         return fail("default alias leaked reasoning tokens (reasoning should be opt-in via the -thinking alias)")
+    if EXTERNAL_GATEWAY:
+        # an external gateway may not forward the caller's traceparent: send the trace id to
+        # the router directly so the log / trace checks verify this stack's own planes
+        direct = chat([{"role": "user", "content": "Say OK."}], model=SERVED_MODEL, max_tokens=8,
+                      url=f"{KV_ROUTER_URL}/v1/chat/completions", api_key=ROUTER_KEY or "none",
+                      headers={"traceparent": TRACEPARENT})
+        if not direct.ok:
+            return fail(f"router rejected a direct request (HTTP {direct.status}): {direct.error[:120]}")
+        ok("router answered a direct request carrying the trace id (external gateway)")
     return True
 
 
@@ -181,6 +198,9 @@ def test_auth_rejects_invalid_key() -> bool:
 
 
 def test_guardrails_pii() -> bool:
+    if EXTERNAL_GATEWAY:
+        ok("skipped: PII masking is the external gateway owner's policy")
+        return True
     email, card = "john.doe@example.com", "4532-1234-5678-9012"
     res = chat(
         [{"role": "user", "content": f"Repeat the following text exactly, character for character: My email is {email} and my card is {card}."}],
@@ -199,12 +219,14 @@ def test_guardrails_pii() -> bool:
 
 
 def test_prometheus_signals() -> bool:
-    # A freshly (re)started Prometheus reports "unknown" until each target's first scrape.
-    for _ in range(12):
+    # A freshly (re)started Prometheus reports "unknown" until each target's first scrape, and a
+    # target last scraped while its service was still booting stays "down" until the next (15s).
+    for _ in range(15):
         status, body = http_json(f"{PROMETHEUS_URL}/api/v1/targets")
         if status != 200:
             return fail(f"Prometheus unreachable: {str(body)[:120]}")
-        if all(t.get("health") != "unknown" for t in body["data"]["activeTargets"]):
+        if all(t.get("health") == "up" or (t["labels"].get("job") in OPTIONAL_TARGETS and t.get("health") != "unknown")
+               for t in body["data"]["activeTargets"]):
             break
         time.sleep(3)
     passed = True
@@ -222,7 +244,8 @@ def test_prometheus_signals() -> bool:
         ok("recording rules & SLO alert groups loaded")
     else:
         passed = fail(f"rule groups missing (loaded: {groups})")
-    for metric in ("vllm:num_requests_running", "vllm:kv_cache_usage_perc", "litellm_requests_metric_total"):
+    metrics = ("vllm:num_requests_running", "vllm:kv_cache_usage_perc") + (() if EXTERNAL_GATEWAY else ("litellm_requests_metric_total",))
+    for metric in metrics:
         # Counters appear only after the first request has been scraped (15s interval).
         for _ in range(12):
             status, res = http_json(f"{PROMETHEUS_URL}/api/v1/query?query={urllib.parse.quote(metric)}")
@@ -253,7 +276,10 @@ def test_traces() -> bool:
     # the streaming check must hold both gateway and engine spans once flushed.
     # vLLM on cuda / rocm exports OTLP spans; llama.cpp (cpu), mock and native metal do not.
     engine_exports_spans = os.getenv("LLMOPS_PLATFORM", "") in ("cuda", "rocm")
-    wanted = {"litellm-gateway", "vllm-engine"} if engine_exports_spans else {"litellm-gateway"}
+    wanted = ({"vllm-engine"} if engine_exports_spans else set()) | (set() if EXTERNAL_GATEWAY else {"litellm-gateway"})
+    if not wanted:
+        ok("skipped: no OTLP-exporting component of this stack serves the request (external gateway, CPU / Metal engine)")
+        return True
     services: List[str] = []
     for _ in range(15):  # gateway and engine flush their span batches independently
         status, trace = http_json(f"{TEMPO_URL}/api/traces/{TRACE_ID}")
@@ -299,6 +325,9 @@ def test_logs() -> bool:
 
 
 def test_langfuse() -> bool:
+    if EXTERNAL_GATEWAY:
+        ok("skipped: LLM traces come from the external gateway's own callbacks")
+        return True
     status, _ = http_json(f"{LANGFUSE_URL}/api/public/health")
     if status != 200:
         return fail(f"Langfuse unhealthy ({status})")

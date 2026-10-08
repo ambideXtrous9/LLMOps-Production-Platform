@@ -1,0 +1,106 @@
+# ==============================================================================
+# Test fixture: "your own" managed services for the bring-your-own-services tests
+# ==============================================================================
+# Stands in for a managed Postgres / Redis / ClickHouse / S3 / Langfuse / LiteLLM so
+# scripts/external_services.py can be tested on one machine. Every store has a
+# read-write user (byo_rw / byo-rw-pass) and a read-only one (byo_ro / byo-ro-pass);
+# the admin is byo_admin / byo-admin-pass. Publish on an address the stack's containers
+# can reach (BYO_BIND, e.g. the host's private IP):
+#   BYO_BIND=10.0.0.5 bash tests/byo/fixture.sh up      # prints the EXTERNAL_* settings
+#   bash tests/byo/fixture.sh down
+# ==============================================================================
+name: llmops-byo
+
+x-langfuse-env: &langfuse-env
+  DATABASE_URL: postgresql://byo_admin:byo-admin-pass@pg:5432/langfuse_ext?connection_limit=10
+  NEXTAUTH_URL: http://${BYO_BIND:-127.0.0.1}:13000
+  NEXTAUTH_SECRET: byo-nextauth-secret
+  SALT: byo-salt
+  ENCRYPTION_KEY: "1111111111111111111111111111111111111111111111111111111111111111"
+  TELEMETRY_ENABLED: "false"
+  CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+  CLICKHOUSE_URL: http://clickhouse:8123
+  CLICKHOUSE_USER: byo_admin
+  CLICKHOUSE_PASSWORD: byo-admin-pass
+  CLICKHOUSE_DB: langfuse_ext
+  CLICKHOUSE_CLUSTER_ENABLED: "false"
+  REDIS_CONNECTION_STRING: redis://default:byo-admin-pass@redis:6379
+  LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse-ext
+  LANGFUSE_S3_EVENT_UPLOAD_REGION: us-east-1
+  LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: byo_admin
+  LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: byo-admin-pass
+  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+  LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse-ext
+  LANGFUSE_S3_MEDIA_UPLOAD_REGION: us-east-1
+  LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: byo_admin
+  LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: byo-admin-pass
+  LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+  LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+
+services:
+  pg:
+    image: postgres:16-alpine
+    command: ["postgres", "-c", "max_connections=300"]  # managed databases are sized like this
+    environment: {POSTGRES_USER: byo_admin, POSTGRES_PASSWORD: byo-admin-pass, POSTGRES_DB: byo}
+    volumes: ["./postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro"]
+    ports: ["${BYO_BIND:-127.0.0.1}:15432:5432"]
+    healthcheck: {test: ["CMD-SHELL", "pg_isready -U byo_admin -d byo"], interval: 3s, retries: 30}
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--aclfile", "/etc/redis/users.acl"]
+    volumes: ["./redis-users.acl:/etc/redis/users.acl:ro"]
+    ports: ["${BYO_BIND:-127.0.0.1}:16379:6379"]
+    healthcheck: {test: ["CMD", "redis-cli", "--user", "default", "--pass", "byo-admin-pass", "ping"], interval: 3s, retries: 30}
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.12
+    environment: {CLICKHOUSE_USER: byo_admin, CLICKHOUSE_PASSWORD: byo-admin-pass, CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"}
+    volumes:
+      - ./clickhouse-users.xml:/etc/clickhouse-server/users.d/byo.xml:ro
+      - ./clickhouse-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports: ["${BYO_BIND:-127.0.0.1}:18123:8123", "${BYO_BIND:-127.0.0.1}:19000:9000"]
+    ulimits: {nofile: {soft: 262144, hard: 262144}}
+    healthcheck: {test: ["CMD-SHELL", "wget -q --spider http://localhost:8123/ping"], interval: 3s, retries: 40}
+
+  minio:
+    image: cgr.dev/chainguard/minio@sha256:59667194421209c2c1eacbe761e24787e047985c5dfa96b15da9b59fe9b55cd0
+    entrypoint: sh
+    command: -c 'mkdir -p /data/llmops-ext /data/langfuse-ext && minio server --address ":9000" /data'
+    environment: {MINIO_ROOT_USER: byo_admin, MINIO_ROOT_PASSWORD: byo-admin-pass}
+    ports: ["${BYO_BIND:-127.0.0.1}:19900:9000"]
+    healthcheck: {test: ["CMD", "mc", "ready", "local"], interval: 3s, retries: 30}
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:4.54.0
+    environment: *langfuse-env
+    depends_on: {pg: {condition: service_healthy}, redis: {condition: service_healthy},
+                 clickhouse: {condition: service_healthy}, minio: {condition: service_healthy}}
+
+  langfuse:
+    image: langfuse/langfuse:4.54.0
+    environment:
+      <<: *langfuse-env
+      LANGFUSE_INIT_ORG_ID: byo-org
+      LANGFUSE_INIT_ORG_NAME: BYO Org
+      LANGFUSE_INIT_PROJECT_ID: byo-project
+      LANGFUSE_INIT_PROJECT_NAME: BYO Project
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: pk-lf-byo
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: sk-lf-byo
+      LANGFUSE_INIT_USER_EMAIL: byo@example.com
+      LANGFUSE_INIT_USER_NAME: byo
+      LANGFUSE_INIT_USER_PASSWORD: byo-admin-pass
+    ports: ["${BYO_BIND:-127.0.0.1}:13000:3000"]
+    depends_on: {pg: {condition: service_healthy}, redis: {condition: service_healthy},
+                 clickhouse: {condition: service_healthy}, minio: {condition: service_healthy}}
+
+  litellm:
+    image: ghcr.io/berriai/litellm:v1.104.1
+    command: ["--port", "4000"]
+    environment:
+      LITELLM_MASTER_KEY: sk-byo-admin
+      DATABASE_URL: postgresql://byo_admin:byo-admin-pass@pg:5432/litellm_ext
+      STORE_MODEL_IN_DB: "True"
+    ports: ["${BYO_BIND:-127.0.0.1}:14000:4000"]
+    depends_on: {pg: {condition: service_healthy}}

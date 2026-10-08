@@ -38,7 +38,7 @@ from init_env import ENV_PATH, set_env_values  # noqa: E402
 # (variable, default, bind-address variable) for every port the stack publishes on the host
 PORTS: List[Tuple[str, int, str]] = [
     ("VLLM_PORT", 8000, "BIND_ADDRESS"),
-    ("ROUTER_PORT", 8001, "BIND_ADDRESS"),
+    ("ROUTER_PORT", 8001, "ROUTER_BIND_ADDRESS"),  # falls back to BIND_ADDRESS
     ("LITELLM_PORT", 4000, "GATEWAY_BIND_ADDRESS"),
     ("LANGFUSE_PORT", 3000, "UI_BIND_ADDRESS"),
     ("GRAFANA_PORT", 3001, "UI_BIND_ADDRESS"),
@@ -120,7 +120,7 @@ def cmd_ports(platform_name: str) -> int:
     for var, default, bind_var in ports:
         raw = (cfg.get(var) or "").strip()
         port = int(raw) if raw.isdigit() and 0 < int(raw) < 65536 else default
-        host = (exports.get(bind_var) or cfg.get(bind_var) or "127.0.0.1").strip()
+        host = (exports.get(bind_var) or cfg.get(bind_var) or cfg.get("BIND_ADDRESS") or "127.0.0.1").strip()
         state = "free" if port in own else port_state(host, port)
         if state == "badaddr":
             note(f"  ↻ {bind_var}={host} is not an address of this machine: publishing on 127.0.0.1 this run")
