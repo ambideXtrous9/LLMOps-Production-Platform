@@ -6,6 +6,7 @@ datasources:
   # ----------------------------------------------------------------------------
   - name: Prometheus
     type: prometheus
+    uid: Prometheus
     access: proxy
     url: http://prometheus:9090
     isDefault: true
@@ -21,6 +22,7 @@ datasources:
   # ----------------------------------------------------------------------------
   - name: Loki
     type: loki
+    uid: Loki
     access: proxy
     url: http://loki:3100
     isDefault: false
@@ -30,7 +32,7 @@ datasources:
       derivedFields:
         # Deep-link log traces directly to Tempo traces
         - datasourceUid: tempo
-          matcherRegex: "(?i)(?:trace_id|traceparent)[=:\"]+([a-f0-9]{16,32})"
+          matcherRegex: '(?:trace_id[=:\s"]+|traceparent[=:\s"]+00-)([a-fA-F0-9]{16,32})'
           name: TraceID
           url: "$${__value.raw}"
 
@@ -64,6 +66,7 @@ datasources:
   # ----------------------------------------------------------------------------
   - name: Alertmanager
     type: alertmanager
+    uid: Alertmanager
     access: proxy
     url: http://alertmanager:9093
     isDefault: false
