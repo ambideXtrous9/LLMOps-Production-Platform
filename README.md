@@ -116,22 +116,35 @@ Following an in-depth LLMOps Maturity Review, the platform has been hardened fro
 
 ---
 
-## 4. Hardware Profiles & Quantization Matrix
+## 4. Hardware Detection & Serving Profiles (vLLM-Metal & CUDA)
 
-The platform formally decouples serving configurations by hardware tier in `config/profiles/`:
+The platform features an automated hardware detection engine ([`scripts/detect_hardware.py`](file:///Users/sushovansaha/Desktop/Project/Personal/LLMOps-Production-Platform/scripts/detect_hardware.py)) that inspects host capabilities (Apple Silicon M-Series, NVIDIA CUDA, or generic CPU) before selecting the optimal serving architecture.
 
-| Parameter | Dev / Edge Tier (`dev-edge-4gb.yaml`) | Production Datacenter (`prod-datacenter-gpu.yaml`) | Edge CPU Fallback (`edge-cpu-llamacpp.yaml`) |
+```bash
+# Run standalone hardware diagnostic
+python3 scripts/detect_hardware.py
+```
+
+### How vLLM-Metal Works on Apple Silicon
+On macOS (Darwin arm64), the platform integrates the [`vllm-metal`](https://github.com/vllm-project/vllm-metal) architecture:
+* **Unified Memory Architecture:** Utilizes the Mac's shared memory pool for **zero-copy tensor operations**, eliminating PCIe bus transfer bottlenecks between CPU and GPU.
+* **Backend Stack:** Keeps vLLM's core engine, scheduler, and continuous batching intact on top, while Apple's **MLX framework** and **Metal GPU shaders** handle the underlying hardware compute.
+* **Model Support:** Directly serves quantized `.safetensors` models from the `mlx-community` repository on Hugging Face (such as SmolLM2, Llama-3.2, and Qwen).
+
+### Hardware Profiles & Quantization Matrix (`config/profiles/`):
+
+| Parameter | Apple Silicon Metal Tier (`apple-silicon-metal.yaml`) | Production Datacenter (`prod-datacenter-gpu.yaml`) | Dev / Edge Tier (`dev-edge-4gb.yaml`) |
 | :--- | :--- | :--- | :--- |
-| **Target Hardware** | NVIDIA GeForce GTX 1650 (4GB VRAM) | NVIDIA L4 / A10G / L40S / A100 / H100 | x86_64 / ARM64 CPU (4 Threads) |
-| **Compute Capability**| Turing SM 7.5 | Ada Lovelace / Hopper SM 8.9+ | CPU / NEON / AVX2 |
-| **Execution Precision**| FP16 (`--dtype half`) | Native BF16 / FP8 / AWQ | 4-bit GGUF (`Q4_K_M`) |
-| **GPU Memory Util** | `0.60` (1,952 MiB pool, 2GB OS buffer)| `0.90` (22GB+ dedicated KV cache pool)| N/A (2GB Host RAM bounded) |
-| **CUDA Graph Capture**| Disabled (`--enforce-eager` saves 800MB)| Enabled (microsecond kernel dispatch)| N/A |
-| **Prefix Caching** | Enabled (`--enable-prefix-caching`) | Enabled (`--enable-prefix-caching`) | Continuous batching cache |
-| **Chunked Prefill** | Disabled | Enabled (`--enable-chunked-prefill`) | Disabled |
-| **DCGM Profiling** | Core Util, VRAM, Temp, Power (Bandwidth N/A)| Full Profiling (Memory Bandwidth, SM %)| N/A |
+| **Target Hardware** | Apple Silicon M1 / M2 / M3 / M4 (Unified Memory) | NVIDIA L4 / A10G / L40S / A100 / H100 | NVIDIA GeForce GTX 1650 (4GB VRAM) |
+| **Compute Backend** | Apple MLX + Metal Shaders (`vllm-metal`) | Native CUDA + TensorRT-LLM | Native CUDA (`vllm`) |
+| **Memory Strategy** | Unified Memory Zero-Copy (16GB+ shared pool) | Dedicated VRAM (22GB+ dedicated KV cache) | Dedicated VRAM (`0.60` pool ~1,952 MiB) |
+| **Execution Precision**| 4-bit / 8-bit MLX (`mlx-community`) | Native BF16 / FP8 / AWQ | FP16 (`--dtype half`) |
+| **PagedAttention** | Native Metal Paged Varlen Kernels | PagedAttention v2 / FlashAttention-2 | PagedAttention (CUDA graph disabled) |
+| **Target Model** | `mlx-community/SmolLM2-360M-Instruct-4bit` | `meta-llama/Llama-3.1-8B-Instruct` | `HuggingFaceTB/SmolLM2-360M-Instruct` |
+| **Hardware Telemetry**| powermetrics / sysctl (Unified RAM & SoC Power) | Full DCGM (SM Occupancy, Bandwidth, Thermals)| DCGM (Util, FB_USED, Temp, Power) |
 
 ---
+
 
 ## 5. Security & Virtual Key Management
 

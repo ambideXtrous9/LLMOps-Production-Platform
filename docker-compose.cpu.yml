@@ -1,0 +1,28 @@
+# ==============================================================================
+# Development / Non-GPU Environment Compose Overlay
+# ==============================================================================
+# Automatically used on macOS (Apple Silicon) or Linux dev boxes without NVIDIA drivers.
+# Emulates the vLLM engine and DCGM hardware metrics with realistic PagedAttention
+# telemetry, streaming SSE, and prompt evaluation support.
+# ==============================================================================
+
+services:
+  vllm:
+    image: llmops-mock-vllm:latest
+    build:
+      context: ./engine
+      dockerfile: Dockerfile
+    command: []
+    deploy:
+      resources:
+        reservations: {}
+
+  dcgm-exporter:
+    image: llmops-mock-dcgm:latest
+    build:
+      context: ./engine
+      dockerfile: Dockerfile.dcgm
+    deploy:
+      resources:
+        reservations: {}
+    cap_add: []
