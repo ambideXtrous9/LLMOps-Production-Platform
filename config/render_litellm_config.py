@@ -14,7 +14,8 @@ requires editing the gateway config:
                                 MODEL_THINKING_EXTRA_BODY (e.g. enable_thinking)
 
 Routes already listed under model_list in config/litellm.yaml (external providers,
-extra engines) are kept as-is.
+extra engines) are kept as-is. The langfuse_otel callback is dropped when no Langfuse
+endpoint is configured (LANGFUSE_HOST unset), e.g. clusters without Plane 6.
 
 Usage: render_litellm_config.py <policy.yaml> <output.yaml>
 """
@@ -86,6 +87,10 @@ def main(src: str, dst: str) -> None:
     generated = {r["model_name"] for r in routes}
     extras = [m for m in cfg.get("model_list") or [] if m.get("model_name") not in generated]
     cfg["model_list"] = routes + extras
+
+    settings = cfg.setdefault("litellm_settings", {})
+    if not os.environ.get("LANGFUSE_HOST", "").strip():
+        settings["callbacks"] = [c for c in settings.get("callbacks") or [] if c != "langfuse_otel"]
 
     router = cfg.setdefault("router_settings", {})
     fallbacks = [f for f in router.get("fallbacks") or [] if served not in f]

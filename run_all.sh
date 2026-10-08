@@ -186,7 +186,7 @@ else
 fi
 if [ -n "$MODEL_ARG" ]; then
     echo -e "  • Configuring served model: ${BOLD}${MODEL_ARG}${NC}"
-    python3 scripts/configure_model.py "$MODEL_ARG" | sed 's/^/    /'
+    python3 scripts/configure_model.py "$MODEL_ARG" --platform "$TARGET_BACKEND" | sed 's/^/    /'
 fi
 set -a
 # shellcheck disable=SC1091

@@ -249,6 +249,8 @@ def main() -> int:
     parser.add_argument("--served-name", help="override the served / gateway model name")
     parser.add_argument("--max-model-len", help="override context length (default: auto = largest that fits)")
     parser.add_argument("--gpu-memory-utilization", help="override engine memory fraction")
+    parser.add_argument("--platform", choices=["cuda", "rocm", "cpu", "metal", "mock"],
+                        help="target platform: sets latency/throughput gates for auto-profiled models")
     parser.add_argument("--dry-run", action="store_true", help="print the model block without writing .env")
     args = parser.parse_args()
 
@@ -269,6 +271,9 @@ def main() -> int:
         print(f"✗ '{args.model}' is neither a preset ({', '.join(presets)}) nor a Hugging Face repo id (org/name).")
         return 1
 
+    if facts and args.platform in ("cpu", "metal"):
+        # CPU / unified-memory decode is bandwidth bound: gate on quality, relax speed SLOs.
+        block.update({"EVAL_MAX_TTFT": "3.0", "EVAL_MIN_TPS": "8"})
     if args.served_name:
         block["SERVED_MODEL_NAME"] = args.served_name
     if args.max_model_len:

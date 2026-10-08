@@ -3,8 +3,8 @@
 # ==============================================================================
 # Real inference on CPU with vLLM's CPU backend (vllm/vllm-openai-cpu), so the full
 # architecture - router, gateway, guardrails, telemetry, eval gates - runs unchanged
-# on machines without an accelerator. Use a small model (e.g. `./run_all.sh --model
-# qwen3-0.6b`): CPU decode is memory-bandwidth bound.
+# on machines without an accelerator. Use a small model (default preset qwen3-4b:
+# ~10 tok/s/stream on 30 EPYC cores): CPU decode is memory-bandwidth bound.
 #
 # No GPU: the hardware exporter stub reports the platform without GPU samples.
 # ==============================================================================

@@ -31,9 +31,9 @@ load_env()
 
 def build_command(args: argparse.Namespace) -> list:
     cmd = [
-        "vllm", "serve", os.getenv("MODEL_NAME", "Qwen/Qwen3-0.6B"),
+        "vllm", "serve", os.getenv("MODEL_NAME", "Qwen/Qwen3-4B"),
         "--revision", os.getenv("MODEL_REVISION", "main"),
-        "--served-model-name", os.getenv("SERVED_MODEL_NAME", "qwen3-0.6b"),
+        "--served-model-name", os.getenv("SERVED_MODEL_NAME", "qwen3-4b"),
         "--max-model-len", os.getenv("MAX_MODEL_LEN", "auto"),
         "--host", args.host,
         "--port", str(args.port),

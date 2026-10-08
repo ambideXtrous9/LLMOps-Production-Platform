@@ -31,3 +31,4 @@ htmlcov/
 
 # Local run reports (run_all / benchmark logs)
 reports/
+k8s/base/generated/

@@ -6,23 +6,27 @@ Production End-to-End Health & Operational Verification Suite.
 Every check asserts real behaviour (no "always pass" probes) and the script exits
 non-zero when any check fails, so it can gate deployments and CI:
 
-  1. vLLM engine health + served model registration          (Plane 2)
-  2. KV-cache-aware router health, backends & metrics          (Plane 1/2)
-  3. Gateway SSE streaming through a team virtual key + TTFT   (Plane 1)
-  4. Thinking alias returns reasoning separately (reasoning models only)
-  5. Vision request through gateway + router (vision models only)
-  6. Auth: invalid virtual keys are rejected                   (Plane 1)
-  7. Guardrail: PII is masked before it reaches the model      (Plane 1)
-  8. Prometheus targets, recording rules & engine metrics      (Plane 3/4)
-  9. Alertmanager readiness                                    (Plane 3)
- 10. Alloy / Tempo / Loki + W3C trace-id round trip into Tempo  (Plane 5)
- 11. Langfuse: gateway requests land as LLM traces             (Plane 6)
- 12. Grafana health & provisioned datasources                  (Plane 7)
+  engine       vLLM engine health + served model registration          (Plane 2)
+  router       KV-cache-aware router health, backends & metrics          (Plane 1/2)
+  gateway      Gateway SSE streaming through a team virtual key + TTFT   (Plane 1)
+  thinking     Thinking alias returns reasoning separately (reasoning models)
+  vision       Image request through gateway + router (vision models)
+  auth         Invalid virtual keys are rejected                         (Plane 1)
+  guardrail    PII is masked before it reaches the model                 (Plane 1)
+  prometheus   Targets, recording rules & engine metrics                 (Plane 3/4)
+  alertmanager Readiness                                                 (Plane 3)
+  traces       W3C trace id spans gateway + engine in Tempo              (Plane 5)
+  logs         Container logs flow through Alloy into Loki               (Plane 5)
+  langfuse     Gateway requests land in Langfuse as LLM traces           (Plane 6)
+  grafana      Health & provisioned datasources                          (Plane 7)
 
+Skip checks with --skip, e.g. --skip logs,langfuse,grafana on Kubernetes where
+those are cluster-wide services.
 Capability-specific checks follow the model block in .env (MODEL_SUPPORTS_*), so
 the same suite validates any served Hugging Face model.
 """
 
+import argparse
 import base64
 import json
 import os
@@ -225,17 +229,13 @@ def test_alertmanager() -> bool:
     return True
 
 
-def test_telemetry_alloy_tempo_loki() -> bool:
-    passed = True
-    for name, url in (("Alloy", f"{ALLOY_URL}/-/ready"), ("Tempo", f"{TEMPO_URL}/ready"), ("Loki", f"{LOKI_URL}/ready")):
-        status, _ = http_json(url)
-        if status == 200:
-            ok(f"{name} ONLINE")
-        else:
-            passed = fail(f"{name} not ready ({status})")
-
-    # The gateway continues the caller's W3C trace, so the trace id we injected in
-    # check 3 must show up in Tempo once spans are flushed (OTLP batch + Alloy batch).
+def test_traces() -> bool:
+    status, _ = http_json(f"{TEMPO_URL}/ready")
+    if status != 200:
+        return fail(f"Tempo not ready ({status})")
+    ok("Tempo ONLINE")
+    # The gateway forwards the caller's W3C traceparent, so the trace id injected in
+    # the streaming check must hold both gateway and engine spans once flushed.
     # Engines on cuda / rocm / cpu export OTLP spans; mock and native metal may not.
     engine_exports_spans = os.getenv("LLMOPS_PLATFORM", "") in ("cuda", "rocm", "cpu")
     wanted = {"litellm-gateway", "vllm-engine"} if engine_exports_spans else {"litellm-gateway"}
@@ -254,12 +254,21 @@ def test_telemetry_alloy_tempo_loki() -> bool:
         time.sleep(2)
     found = sorted(set(services))
     if not services:
-        passed = fail(f"trace {TRACE_ID[:12]}... never reached Tempo (OTLP export broken)")
-    elif engine_exports_spans and "vllm-engine" not in found:
-        passed = fail(f"trace {TRACE_ID[:12]}... has {found} but no vllm-engine spans (traceparent not propagated)")
-    else:
-        ok(f"trace {TRACE_ID[:12]}... found in Tempo spanning {found}")
+        return fail(f"trace {TRACE_ID[:12]}... never reached Tempo (OTLP export broken)")
+    if not wanted <= set(services):
+        return fail(f"trace {TRACE_ID[:12]}... has {found}, missing {sorted(wanted - set(services))} (traceparent not propagated)")
+    ok(f"trace {TRACE_ID[:12]}... found in Tempo spanning {found}")
+    return True
 
+
+def test_logs() -> bool:
+    passed = True
+    for name, url in (("Alloy", f"{ALLOY_URL}/-/ready"), ("Loki", f"{LOKI_URL}/ready")):
+        status, _ = http_json(url)
+        if status == 200:
+            ok(f"{name} ONLINE")
+        else:
+            passed = fail(f"{name} not ready ({status})")
     query = urllib.parse.urlencode({"query": '{container="vllm-inference"}', "limit": 5, "since": "30m"})
     status, logs = http_json(f"{LOKI_URL}/loki/api/v1/query_range?{query}")
     streams = logs.get("data", {}).get("result", []) if isinstance(logs, dict) else []
@@ -314,29 +323,36 @@ def test_grafana() -> bool:
     return True
 
 
-CHECKS: List[Tuple[str, Callable[[], bool]]] = [
-    ("Plane 2: vLLM Inference Engine", test_vllm_engine),
-    ("Plane 1/2: KV-Cache-Aware Router", test_kv_router),
-    ("Plane 1: Gateway SSE Streaming via Virtual Key", test_streaming_inference),
-    ("Plane 1/2: Thinking (Reasoning) Alias", test_thinking_alias),
-    ("Plane 1/2: Vision Request via Gateway & Router", test_vision),
-    ("Plane 1: Virtual Key Authentication", test_auth_rejects_invalid_key),
-    ("Plane 1: PII Masking Guardrail", test_guardrails_pii),
-    ("Plane 3/4: Prometheus Targets, Rules & Metrics", test_prometheus_signals),
-    ("Plane 3: Alertmanager", test_alertmanager),
-    ("Plane 5: Alloy, Tempo & Loki Telemetry", test_telemetry_alloy_tempo_loki),
-    ("Plane 6: Langfuse LLM Tracing", test_langfuse),
-    ("Plane 7: Grafana", test_grafana),
+CHECKS: List[Tuple[str, str, Callable[[], bool]]] = [
+    ("engine", "Plane 2: vLLM Inference Engine", test_vllm_engine),
+    ("router", "Plane 1/2: KV-Cache-Aware Router", test_kv_router),
+    ("gateway", "Plane 1: Gateway SSE Streaming via Virtual Key", test_streaming_inference),
+    ("thinking", "Plane 1/2: Thinking (Reasoning) Alias", test_thinking_alias),
+    ("vision", "Plane 1/2: Vision Request via Gateway & Router", test_vision),
+    ("auth", "Plane 1: Virtual Key Authentication", test_auth_rejects_invalid_key),
+    ("guardrail", "Plane 1: PII Masking Guardrail", test_guardrails_pii),
+    ("prometheus", "Plane 3/4: Prometheus Targets, Rules & Metrics", test_prometheus_signals),
+    ("alertmanager", "Plane 3: Alertmanager", test_alertmanager),
+    ("traces", "Plane 5: Distributed Traces (Tempo)", test_traces),
+    ("logs", "Plane 5: Logs (Alloy -> Loki)", test_logs),
+    ("langfuse", "Plane 6: Langfuse LLM Tracing", test_langfuse),
+    ("grafana", "Plane 7: Grafana", test_grafana),
 ]
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="End-to-end LLMOps stack verification")
+    parser.add_argument("--skip", default="", help=f"comma-separated checks to skip: {', '.join(k for k, _, _ in CHECKS)}")
+    args = parser.parse_args()
+    skip = {k.strip() for k in args.skip.split(",") if k.strip()}
+    selected = [(title, check) for key, title, check in CHECKS if key not in skip]
+
     if MASTER_KEY == VIRTUAL_KEY:
         print("✗ TEAM_ENGINEERING_KEY equals the master key - client traffic must use a virtual key")
         return 1
     results = []
-    for i, (title, check) in enumerate(CHECKS, 1):
-        print(f"\n[{i}/{len(CHECKS)}] {title}")
+    for i, (title, check) in enumerate(selected, 1):
+        print(f"\n[{i}/{len(selected)}] {title}")
         try:
             results.append((title, check()))
         except Exception as e:  # a crashing check is a failing check

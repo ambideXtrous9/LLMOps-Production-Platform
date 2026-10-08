@@ -47,8 +47,8 @@ def preset_for_accelerator(mem_mb: int) -> str:
     """Largest verified preset that fits the accelerator memory."""
     if mem_mb >= 24 * 1024:
         return "qwen3.5-9b"
-    if mem_mb > 6 * 1024:
-        return "qwen3-0.6b"
+    if mem_mb >= 10 * 1024:
+        return "qwen3-4b"
     return "smollm2-360m"
 
 
@@ -62,7 +62,7 @@ def detect_apple_silicon() -> Dict[str, Any]:
         "supported": True,
         "summary": f"{chip} ({total_ram_gb} GB Unified Memory)",
         "profile": "apple-silicon-metal.yaml",
-        "preset": "qwen3-0.6b",
+        "preset": "qwen3-4b",
     }
 
 
@@ -116,7 +116,7 @@ def analyze_hardware() -> Dict[str, Any]:
     if backend == "cpu":
         cores = os.cpu_count() or 0
         res = {"summary": f"Generic CPU ({platform.machine()}, {cores} threads)", "profile": "edge-cpu-llamacpp.yaml",
-               "preset": "qwen3-0.6b"}
+               "preset": "qwen3-4b"}
         unusable = [n for n, r in found.items() if r.get("supported") and not r.get("docker_runtime", True)]
         notes = (f"{', '.join(unusable)} accelerator found but not usable from Docker; run scripts/bootstrap_host.sh. "
                  if unusable else "") + "Real inference on CPU with vLLM's CPU backend."
