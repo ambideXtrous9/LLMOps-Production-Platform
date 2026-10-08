@@ -93,7 +93,7 @@ case "$TARGET_BACKEND" in
         echo -e "  • ${BOLD}Backend Stack:${NC} vLLM-Metal (Apple MLX + PagedAttention Scheduler)"
         echo -e "  • ${BOLD}Serving Profile:${NC} config/profiles/apple-silicon-metal.yaml"
         echo -e "  • ${BOLD}Target Model:${NC} $RECOMMENDED_MODEL"
-        COMPOSE_FILES=("-f" "docker-compose.yml" "-f" "docker-compose.cpu.yml")
+        COMPOSE_FILES=("-f" "docker-compose.yml")
         ;;
     cuda)
         echo -e "  ${GREEN}${BOLD}🚀 NVIDIA CUDA Hardware Acceleration Detected!${NC}"
@@ -102,14 +102,14 @@ case "$TARGET_BACKEND" in
         echo -e "  • ${BOLD}Backend Stack:${NC} vLLM Native CUDA Engine & NVIDIA DCGM Exporter"
         echo -e "  • ${BOLD}Serving Profile:${NC} config/profiles/$HARDWARE_PROFILE"
         echo -e "  • ${BOLD}Target Model:${NC} $RECOMMENDED_MODEL"
-        COMPOSE_FILES=("-f" "docker-compose.yml")
+        COMPOSE_FILES=("-f" "docker-compose.yml" "-f" "docker-compose.gpu.yml")
         ;;
     *)
         echo -e "  ${YELLOW}${BOLD}💻 Generic CPU Architecture Detected!${NC}"
         echo -e "  • ${BOLD}Hardware:${NC} $HARDWARE_SUMMARY"
         echo -e "  • ${BOLD}Serving Profile:${NC} config/profiles/edge-cpu-llamacpp.yaml"
         echo -e "  • ${BOLD}Execution Mode:${NC} Architecture Emulation & Dev Tier"
-        COMPOSE_FILES=("-f" "docker-compose.yml" "-f" "docker-compose.cpu.yml")
+        COMPOSE_FILES=("-f" "docker-compose.yml")
         ;;
 esac
 
@@ -122,6 +122,9 @@ if [ ! -f ".env" ]; then
     echo -e "  ${YELLOW}• .env not found. Creating from .env.example...${NC}"
     cp .env.example .env
 fi
+set -a
+[ -f "$ROOT_DIR/.env" ] && source "$ROOT_DIR/.env"
+set +a
 echo -e "  ${GREEN}✓${NC} Environment secrets loaded from .env"
 
 # Ensure host cache directory exists
@@ -147,10 +150,7 @@ if [ "$SKIP_CONTAINER_BOOT" = false ]; then
     # STEP 4: Build Microservice Images
     # ------------------------------------------------------------------------------
     echo -e "\n${BLUE}${BOLD}[4/10] Building Local Microservices (KV Router & Engine)...${NC}"
-    docker compose "${COMPOSE_FILES[@]}" build --quiet kv-router
-    if [ "$TARGET_BACKEND" != "cuda" ]; then
-        docker compose "${COMPOSE_FILES[@]}" build --quiet vllm dcgm-exporter
-    fi
+    docker compose "${COMPOSE_FILES[@]}" build --quiet kv-router vllm dcgm-exporter
     echo -e "  ${GREEN}✓${NC} Microservice container images built successfully."
 
     # ------------------------------------------------------------------------------
@@ -206,7 +206,7 @@ if [ "$SKIP_CONTAINER_BOOT" = false ]; then
 
     echo -n "  Waiting for LiteLLM AI Gateway (:4000)..."
     GATEWAY_WAIT=0
-    while [ $GATEWAY_WAIT -lt 30 ]; do
+    while [ $GATEWAY_WAIT -lt 50 ]; do
         if curl -sf http://localhost:4000/health/services >/dev/null 2>&1 || curl -sf http://localhost:4000/health >/dev/null 2>&1; then
             echo -e " ${GREEN}ONLINE!${NC}"
             break
@@ -222,16 +222,19 @@ if [ "$SKIP_CONTAINER_BOOT" = false ]; then
     echo -e "\n${BLUE}${BOLD}[7/10] Starting Observability Plane (Prometheus, Alloy, Tempo, Loki, Grafana)...${NC}"
     docker compose "${COMPOSE_FILES[@]}" up -d prometheus alertmanager alloy tempo loki dcgm-exporter node-exporter grafana langfuse
 
-    echo -n "  Waiting for Prometheus (:9090) & Alertmanager (:9093)..."
+    echo -n "  Waiting for Prometheus (:9090), Alertmanager (:9093), Tempo (:3200), & Loki (:3100)..."
     PROM_WAIT=0
-    while [ $PROM_WAIT -lt 20 ]; do
-        if curl -sf http://localhost:9090/-/ready >/dev/null 2>&1 && curl -sf http://localhost:9093/-/ready >/dev/null 2>&1; then
+    while [ $PROM_WAIT -lt 40 ]; do
+        if curl -sf http://localhost:9090/-/ready >/dev/null 2>&1 && \
+           curl -sf http://localhost:9093/-/ready >/dev/null 2>&1 && \
+           curl -sf http://localhost:3200/ready >/dev/null 2>&1 && \
+           curl -sf http://localhost:3100/ready >/dev/null 2>&1; then
             echo -e " ${GREEN}ONLINE!${NC}"
             break
         fi
         echo -n "."
-        sleep 1
-        PROM_WAIT=$((PROM_WAIT + 1))
+        sleep 2
+        PROM_WAIT=$((PROM_WAIT + 2))
     done
 fi
 

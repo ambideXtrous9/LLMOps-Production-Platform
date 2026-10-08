@@ -3,40 +3,26 @@ services:
   # 1. INFERENCE ENGINE (Plane 2: GPU Inference Plane)
   # ============================================================================
   vllm:
-    image: vllm/vllm-openai:v0.6.6
+    build:
+      context: ./engine
+      dockerfile: Dockerfile
+    image: llmops-vllm-engine:latest
     container_name: vllm-inference
     ipc: host
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
     ports:
       - "${VLLM_PORT:-8000}:8000"
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
     environment:
       - HF_HUB_ENABLE_HF_TRANSFER=0
-      - OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4317
-    command: >
-      --model ${MODEL_NAME:-HuggingFaceTB/SmolLM2-360M-Instruct}
-      --dtype half
-      --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION:-0.60}
-      --max-model-len ${MAX_MODEL_LEN:-2048}
-      --enforce-eager
-      --enable-prefix-caching
-      --otlp-traces-endpoint http://alloy:4317
-      --host 0.0.0.0
-      --port 8000
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4318
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
-      interval: 10s
-      timeout: 5s
+      interval: 5s
+      timeout: 3s
       retries: 10
-      start_period: 30s
+      start_period: 5s
     networks:
       - llmops-net
 
@@ -78,7 +64,7 @@ services:
       - KV_ROUTER_URL=http://kv-router:8000/v1
       - VLLM_DIRECT_URL=http://vllm:8000/v1
       - EDGE_FALLBACK_URL=http://vllm:8000/v1
-      - OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4317
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4318
     command: >
       --config /app/config.yaml
       --port 4000
@@ -254,17 +240,11 @@ services:
   # 12. HARDWARE TELEMETRY AGENT (Plane 4: NVIDIA DCGM Exporter)
   # ============================================================================
   dcgm-exporter:
-    image: nvcr.io/nvidia/k8s/dcgm-exporter:latest
+    build:
+      context: ./engine
+      dockerfile: Dockerfile.dcgm
+    image: llmops-dcgm-exporter:latest
     container_name: dcgm-hardware-exporter
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    cap_add:
-      - SYS_ADMIN
     ports:
       - "9400:9400"
     restart: unless-stopped

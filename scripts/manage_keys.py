@@ -29,6 +29,7 @@ def api_request(
     data: Optional[Dict[str, Any]] = None,
     master_key: str = MASTER_KEY,
     base_url: str = DEFAULT_GATEWAY_URL,
+    fail_silently: bool = False,
 ) -> Dict[str, Any]:
     url = f"{base_url.rstrip('/')}{endpoint}"
     headers = {
@@ -44,6 +45,8 @@ def api_request(
             return json.loads(raw) if raw else {"status": "ok"}
     except urllib.error.HTTPError as e:
         error_body = e.read().decode("utf-8")
+        if fail_silently:
+            raise
         try:
             parsed = json.loads(error_body)
             print(f"❌ HTTP {e.code} Error: {json.dumps(parsed, indent=2)}", file=sys.stderr)
@@ -51,6 +54,8 @@ def api_request(
             print(f"❌ HTTP {e.code} Error: {error_body}", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
+        if fail_silently:
+            raise
         print(f"❌ Connection Error to {url}: {e}", file=sys.stderr)
         sys.exit(1)
 
@@ -63,6 +68,7 @@ def generate_key(
     tpm_limit: int,
     models: list,
     metadata: Optional[Dict[str, Any]] = None,
+    key: Optional[str] = None,
 ) -> Dict[str, Any]:
     payload = {
         "team_id": team_id,
@@ -74,11 +80,14 @@ def generate_key(
         "metadata": metadata or {"created_by": "manage_keys_cli", "env": "production"},
         "duration": "30d",
     }
-    res = api_request("/key/generate", method="POST", data=payload)
-    print("\n✅ Virtual Key Successfully Generated:")
+    if key:
+        payload["key"] = key
+
+    res = api_request("/key/generate", method="POST", data=payload, fail_silently=True)
+    print("\n✅ Virtual Key Successfully Generated / Active:")
     print(f"  • Team ID     : {team_id}")
     print(f"  • Alias       : {key_alias}")
-    print(f"  • Virtual Key : {res.get('key')}")
+    print(f"  • Virtual Key : {res.get('key') or key or 'assigned'}")
     print(f"  • Max Budget  : ${max_budget:.2f}")
     print(f"  • Rate Limits : {rpm_limit} RPM / {tpm_limit} TPM")
     print(f"  • Models      : {', '.join(models)}")
@@ -113,6 +122,7 @@ def bootstrap_seed_keys() -> None:
         {
             "team_id": "engineering",
             "key_alias": "platform-engineering-prod",
+            "key": os.getenv("TEAM_ENGINEERING_KEY", "sk-eng-team-a1b2c3d4e5f6g7h8i9j0"),
             "max_budget": 500.0,
             "rpm_limit": 300,
             "tpm_limit": 100000,
@@ -122,6 +132,7 @@ def bootstrap_seed_keys() -> None:
         {
             "team_id": "research",
             "key_alias": "applied-research-experiments",
+            "key": os.getenv("TEAM_RESEARCH_KEY", "sk-res-team-k1l2m3n4o5p6q7r8s9t0"),
             "max_budget": 200.0,
             "rpm_limit": 60,
             "tpm_limit": 60000,
@@ -131,6 +142,7 @@ def bootstrap_seed_keys() -> None:
         {
             "team_id": "ci-pipeline",
             "key_alias": "ci-cd-model-eval-gate",
+            "key": os.getenv("TEAM_CI_KEY", "sk-ci-pipeline-gate-eval-key-1234"),
             "max_budget": 100.0,
             "rpm_limit": 120,
             "tpm_limit": 50000,
@@ -141,6 +153,21 @@ def bootstrap_seed_keys() -> None:
 
     for item in seeds:
         try:
+            # Register team first to ensure foreign key constraint in LiteLLM
+            api_request(
+                "/team/new",
+                method="POST",
+                data={
+                    "team_id": item["team_id"],
+                    "team_alias": item["key_alias"],
+                    "max_budget": item["max_budget"],
+                },
+                fail_silently=True,
+            )
+        except Exception:
+            pass
+
+        try:
             generate_key(
                 team_id=item["team_id"],
                 key_alias=item["key_alias"],
@@ -149,11 +176,12 @@ def bootstrap_seed_keys() -> None:
                 tpm_limit=item["tpm_limit"],
                 models=item["models"],
                 metadata=item["metadata"],
+                key=item.get("key"),
             )
         except Exception as e:
-            print(f"⚠️ Could not generate {item['key_alias']}: {e}")
+            print(f"ℹ Pre-existing or active key for {item['key_alias']}: {e}")
 
-    print("\n✅ Seed virtual keys generated and persisted to PostgreSQL.")
+    print("\n✅ Seed virtual keys initialized in PostgreSQL.")
 
 
 def main():

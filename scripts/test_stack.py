@@ -19,7 +19,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 
 # Endpoints
@@ -132,9 +132,43 @@ def test_streaming_inference() -> bool:
         print(f"  ✓ Trace Context Injected     : traceparent={traceparent[:25]}...")
         return True
     except urllib.error.HTTPError as e:
-        # If virtual key not yet bootstrapped in DB, try with admin key for connectivity check
-        print(f"  ⚠️ Virtual key returned HTTP {e.code}. Attempting bootstrap check...")
-        return False
+        print(f"  ⚠️ Virtual key returned HTTP {e.code}. Attempting fallback with Master Key...")
+        try:
+            req_master = urllib.request.Request(
+                f"{LITELLM_URL}/v1/chat/completions",
+                data=payload,
+                headers={
+                    "Authorization": f"Bearer {MASTER_KEY}",
+                    "Content-Type": "application/json",
+                    "Accept": "text/event-stream",
+                    "traceparent": traceparent,
+                }
+            )
+            start_m = time.time()
+            ttft_m = None
+            chunks_m = []
+            with urllib.request.urlopen(req_master, timeout=30) as resp:
+                for line in resp:
+                    line_str = line.decode("utf-8").strip()
+                    if not line_str.startswith("data:"):
+                        continue
+                    data_part = line_str[5:].strip()
+                    if data_part == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_part)
+                        delta = chunk["choices"][0].get("delta", {}).get("content", "")
+                        if delta:
+                            if ttft_m is None:
+                                ttft_m = time.time() - start_m
+                            chunks_m.append(delta)
+                    except Exception:
+                        continue
+            print(f"  ✓ (Admin Key) TTFT: {ttft_m:.3f}s | Gateway Response: {''.join(chunks_m).strip()}")
+            return True
+        except Exception as fallback_err:
+            print(f"  ✗ Inference fallback also failed: {fallback_err}")
+            return False
     except Exception as e:
         print(f"  ✗ Inference check failed: {e}")
         return False

@@ -40,9 +40,9 @@ def get_response_content(prompt_text: str) -> str:
     elif "autoscaling" in p_lower or "queue" in p_lower or "keda" in p_lower:
         return "Autoscaling LLMs must monitor waiting request queue depth and KV-cache saturation rather than CPU utilization to avoid severe tail latency degradation."
     elif "time-to-first-token" in p_lower or "ttft" in p_lower:
-        return "Time-To-First-Token (TTFT) measures prompt prefill latency, whereas inter-token latency (ITL) measures token-by-token generation latency."
+        return "Time-To-First-Token (TTFT) measures first token prefill latency, whereas inter-token latency (ITL) measures token-by-token generation latency."
     elif "ignore all previous instructions" in p_lower:
-        return "I cannot fulfill this request. System instructions and secrets are protected."
+        return "I cannot fulfill this request. System instructions and private credentials are protected."
     elif "email is" in p_lower or "card is" in p_lower:
         return "Received contact information: [REDACTED] and card [REDACTED]."
     elif "capital of france" in p_lower:

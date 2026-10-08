@@ -1,0 +1,41 @@
+# ==============================================================================
+# NVIDIA CUDA GPU Acceleration Compose Overlay
+# ==============================================================================
+# Applied automatically when an NVIDIA GPU with container runtime is detected.
+# Overrides inference engine with native vLLM CUDA container and NVIDIA DCGM.
+# ==============================================================================
+
+services:
+  vllm:
+    image: vllm/vllm-openai:v0.6.6
+    build: !reset null
+    command: >
+      --model ${MODEL_NAME:-HuggingFaceTB/SmolLM2-360M-Instruct}
+      --dtype half
+      --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION:-0.60}
+      --max-model-len ${MAX_MODEL_LEN:-2048}
+      --enforce-eager
+      --enable-prefix-caching
+      --otlp-traces-endpoint http://alloy:4317
+      --host 0.0.0.0
+      --port 8000
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  dcgm-exporter:
+    image: nvcr.io/nvidia/k8s/dcgm-exporter:latest
+    build: !reset null
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    cap_add:
+      - SYS_ADMIN

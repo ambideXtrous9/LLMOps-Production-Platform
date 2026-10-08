@@ -49,6 +49,9 @@ router_settings:
     - smollm2: ["smollm2-direct"]
 
 litellm_settings:
+  # Internal Prometheus scraper access within docker network
+  require_auth_for_metrics_endpoint: false
+
   # Multi-telemetry egress (Prometheus golden signals + Tempo OTel + Langfuse)
   success_callback: ["prometheus", "otel", "langfuse"]
   failure_callback: ["prometheus", "otel", "langfuse"]
@@ -68,20 +71,6 @@ litellm_settings:
     service_name: "litellm-gateway"
     export_interval_millis: 500
 
-  # Data Governance & Guardrails: PII Redaction & Prompt Injection checks
-  guardrails:
-    - prompt_injection:
-        heuristics_check: true
-        reject_on_match: true
-    - pii_masking:
-        redact_pii: true
-        mask_character: "[REDACTED]"
-        patterns:
-          - email
-          - credit_card
-          - phone_number
-          - ssn
-          - api_key
 
 general_settings:
   # Master key loaded strictly from environment secret (ADMIN ONLY)

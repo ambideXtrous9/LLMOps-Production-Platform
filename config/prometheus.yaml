@@ -33,7 +33,6 @@ scrape_configs:
   # AI Gateway: LiteLLM Proxy Metrics
   - job_name: "litellm"
     metrics_path: /metrics/
-    bearer_token: "sk-admin-master-sec-9a8b7c6d5e4f3a2b1c0d"
     static_configs:
       - targets: ["litellm:4000"]
     relabel_configs:
