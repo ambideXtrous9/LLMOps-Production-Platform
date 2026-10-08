@@ -13,7 +13,8 @@ services:
   vllm:
     image: vllm/vllm-openai-cpu:${VLLM_VERSION:-v0.31.0}
     environment:
-      # GiB of RAM reserved for the KV cache (CPU equivalent of --gpu-memory-utilization)
-      - VLLM_CPU_KVCACHE_SPACE=${VLLM_CPU_KVCACHE_SPACE:-8}
+      # GiB of RAM reserved for the KV cache (CPU equivalent of --gpu-memory-utilization);
+      # run_all.sh sizes it from RAM when .env leaves it empty
+      - VLLM_CPU_KVCACHE_SPACE=${VLLM_CPU_KVCACHE_SPACE:-4}
       # Pin OpenMP threads to physical cores ("auto" lets vLLM pick NUMA-local cores)
       - VLLM_CPU_OMP_THREADS_BIND=${VLLM_CPU_OMP_THREADS_BIND:-auto}

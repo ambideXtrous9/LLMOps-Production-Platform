@@ -39,19 +39,22 @@ from typing import Callable, List, Tuple
 
 from llmops_client import (
     GATEWAY_MODEL, MASTER_KEY, REASONING_BY_DEFAULT, SUPPORTS_REASONING, SUPPORTS_VISION,
-    VIRTUAL_KEY, chat, http_json,
+    VIRTUAL_KEY, chat, http_json, local_url,
 )
 
-VLLM_URL = os.getenv("VLLM_URL", "http://localhost:8000")
-KV_ROUTER_URL = os.getenv("KV_ROUTER_URL", "http://localhost:8001")
-PROMETHEUS_URL = os.getenv("PROMETHEUS_URL", "http://localhost:9090")
-ALERTMANAGER_URL = os.getenv("ALERTMANAGER_URL", "http://localhost:9093")
-TEMPO_URL = os.getenv("TEMPO_URL", "http://localhost:3200")
-ALLOY_URL = os.getenv("ALLOY_URL", "http://localhost:12345")
-LOKI_URL = os.getenv("LOKI_URL", "http://localhost:3100")
-GRAFANA_URL = os.getenv("GRAFANA_URL", "http://localhost:3001")
-LANGFUSE_URL = os.getenv("LANGFUSE_URL", "http://localhost:3000")
+VLLM_URL = os.getenv("VLLM_URL", local_url("VLLM_PORT", 8000))
+KV_ROUTER_URL = os.getenv("KV_ROUTER_URL", local_url("ROUTER_PORT", 8001))
+PROMETHEUS_URL = os.getenv("PROMETHEUS_URL", local_url("PROMETHEUS_PORT", 9090))
+ALERTMANAGER_URL = os.getenv("ALERTMANAGER_URL", local_url("ALERTMANAGER_PORT", 9093))
+TEMPO_URL = os.getenv("TEMPO_URL", local_url("TEMPO_PORT", 3200))
+ALLOY_URL = os.getenv("ALLOY_URL", local_url("ALLOY_PORT", 12345))
+LOKI_URL = os.getenv("LOKI_URL", local_url("LOKI_PORT", 3100))
+GRAFANA_URL = os.getenv("GRAFANA_URL", local_url("GRAFANA_PORT", 3001))
+LANGFUSE_URL = os.getenv("LANGFUSE_URL", local_url("LANGFUSE_PORT", 3000))
 SERVED_MODEL = os.getenv("SERVED_MODEL_NAME", GATEWAY_MODEL)
+
+# Telemetry that depends on the hardware model: reported, never fatal.
+OPTIONAL_TARGETS = {"dcgm": "GPU telemetry unavailable (DCGM supports datacenter GPUs; GeForce / laptop GPUs lack it)"}
 
 TRACE_ID = os.urandom(16).hex()
 TRACEPARENT = f"00-{TRACE_ID}-{os.urandom(8).hex()}-01"
@@ -209,6 +212,8 @@ def test_prometheus_signals() -> bool:
         job, health = target["labels"].get("job", "?"), target.get("health")
         if health == "up":
             ok(f"target '{job}' UP")
+        elif job in OPTIONAL_TARGETS:
+            ok(f"target '{job}' {health.upper()} - {OPTIONAL_TARGETS[job]}")
         else:
             passed = fail(f"target '{job}' {health.upper()}: {target.get('lastError', '')[:100]}")
     status, rules = http_json(f"{PROMETHEUS_URL}/api/v1/rules")
@@ -279,14 +284,18 @@ def test_logs() -> bool:
             ok(f"{name} ONLINE")
         else:
             passed = fail(f"{name} not ready ({status})")
-    query = urllib.parse.urlencode({"query": '{container="vllm-inference"}', "limit": 5, "since": "30m"})
-    status, logs = http_json(f"{LOKI_URL}/loki/api/v1/query_range?{query}")
-    streams = logs.get("data", {}).get("result", []) if isinstance(logs, dict) else []
-    if streams:
-        ok(f"Loki receiving container logs ({sum(len(s.get('values', [])) for s in streams)} recent vllm lines)")
-    else:
-        passed = fail("Loki has no vllm-inference log lines (Alloy docker log shipping broken)")
-    return passed
+    # The router logs every request with the caller's trace id: finding this suite's id
+    # proves container logs reach Loki and can be joined with the Tempo trace (Grafana link).
+    logql = f'{{container="kv-router"}} |= "trace_id={TRACE_ID}"'
+    query = urllib.parse.urlencode({"query": logql, "limit": 5, "since": "30m"})
+    for _ in range(15):  # Alloy ships docker logs every few seconds
+        status, logs = http_json(f"{LOKI_URL}/loki/api/v1/query_range?{query}")
+        streams = logs.get("data", {}).get("result", []) if isinstance(logs, dict) else []
+        if streams:
+            ok(f"router log line for trace {TRACE_ID[:12]}... found in Loki (logs <-> traces correlated)")
+            return passed
+        time.sleep(2)
+    return fail(f"no router log line with trace_id={TRACE_ID[:12]}... in Loki (Alloy log shipping or router trace logging broken)")
 
 
 def test_langfuse() -> bool:

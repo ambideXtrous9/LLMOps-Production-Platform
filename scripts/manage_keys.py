@@ -18,9 +18,9 @@ import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional
 
-from llmops_client import GATEWAY_MODEL, SUPPORTS_REASONING  # also loads the repo .env
+from llmops_client import GATEWAY_MODEL, SUPPORTS_REASONING, local_url  # also loads the repo .env
 
-DEFAULT_GATEWAY_URL = os.getenv("LITELLM_URL", "http://localhost:4000")
+DEFAULT_GATEWAY_URL = os.getenv("LITELLM_URL", local_url("LITELLM_PORT", 4000))
 MASTER_KEY = os.getenv("LITELLM_MASTER_KEY", "sk-admin-master-sec-9a8b7c6d5e4f3a2b1c0d")
 
 

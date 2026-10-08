@@ -40,7 +40,7 @@ def build_command(args: argparse.Namespace) -> list:
     ]
     if args.otlp:
         # Alloy publishes OTLP gRPC on the host loopback (docker-compose.yml)
-        cmd += ["--otlp-traces-endpoint", "http://localhost:4317"]
+        cmd += ["--otlp-traces-endpoint", f"http://localhost:{os.getenv('OTLP_GRPC_PORT') or 4317}"]
     cmd += shlex.split(os.getenv("VLLM_MODEL_ARGS", "")) + shlex.split(os.getenv("VLLM_EXTRA_ARGS", ""))
     return cmd
 

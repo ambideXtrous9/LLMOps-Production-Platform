@@ -24,6 +24,7 @@ import json
 import os
 import platform
 import re
+import shutil
 import subprocess
 from typing import Any, Dict
 
@@ -43,6 +44,27 @@ def run_cmd(cmd: str, timeout: int = 60) -> str:
         return ""
 
 
+def host_ram_gb() -> float:
+    """Total system RAM (unified memory on Apple Silicon)."""
+    if platform.system() == "Darwin":
+        mem = run_cmd("sysctl -n hw.memsize")
+        return int(mem) / 1024 ** 3 if mem.isdigit() else 0.0
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) / 1024 ** 2
+    except OSError:
+        pass
+    return 0.0
+
+
+def preset_for_cpu(ram_gb: float, threads: int) -> str:
+    """CPU decode is memory-bandwidth bound: Qwen3-4B needs a workstation / server class
+    host (it runs ~10 tok/s/stream on 30 EPYC threads); smaller hosts get a tiny model."""
+    return "qwen3-4b" if ram_gb >= 24 and threads >= 16 else "smollm2-360m"
+
+
 def preset_for_accelerator(mem_mb: int) -> str:
     """Largest verified preset that fits the accelerator memory."""
     if mem_mb >= 24 * 1024:
@@ -56,13 +78,13 @@ def detect_apple_silicon() -> Dict[str, Any]:
     if platform.system() != "Darwin" or platform.machine() != "arm64":
         return {"supported": False}
     chip = run_cmd("sysctl -n machdep.cpu.brand_string") or "Apple Silicon"
-    mem_bytes = run_cmd("sysctl -n hw.memsize")
-    total_ram_gb = round(int(mem_bytes) / (1024 ** 3), 1) if mem_bytes.isdigit() else 0.0
+    total_ram_gb = round(host_ram_gb(), 1)
     return {
         "supported": True,
         "summary": f"{chip} ({total_ram_gb} GB Unified Memory)",
         "profile": "apple-silicon-metal.yaml",
-        "preset": "qwen3-4b",
+        # weights + KV cache share unified memory with macOS and the rest of the stack
+        "preset": "qwen3-4b" if total_ram_gb >= 16 else "smollm2-360m",
     }
 
 
@@ -70,6 +92,13 @@ def detect_nvidia_gpu() -> Dict[str, Any]:
     smi = run_cmd("nvidia-smi --query-gpu=gpu_name,memory.total,compute_cap --format=csv,noheader,nounits")
     lines = [l.strip() for l in smi.splitlines() if l.strip()]
     if not lines:
+        # Driver installs can break a desktop's display, so they are never automatic:
+        # only report the card (scripts/bootstrap_host.sh installs the driver on servers).
+        if re.search(r"(VGA|3D|Display).*NVIDIA", run_cmd("lspci 2>/dev/null")):
+            err = run_cmd("nvidia-smi 2>&1 | head -1") if shutil.which("nvidia-smi") else ""
+            hint = (f"NVIDIA GPU unusable: '{err}' (a reboot finishes a pending driver update)" if err
+                    else "NVIDIA GPU without a driver (servers: bash scripts/bootstrap_host.sh)")
+            return {"supported": False, "hint": hint}
         return {"supported": False}
     fields = [f.strip() for f in lines[0].split(",")]
     gpu_name = fields[0] if fields else "NVIDIA GPU"
@@ -87,7 +116,9 @@ def detect_nvidia_gpu() -> Dict[str, Any]:
 
 
 def detect_amd_rocm() -> Dict[str, Any]:
-    if not os.path.exists("/dev/kfd"):
+    # /dev/kfd also exists with AMD integrated graphics (laptop APUs), which vLLM's ROCm
+    # build does not run on: require the ROCm tools and a discrete / datacenter GPU.
+    if not os.path.exists("/dev/kfd") or not shutil.which("rocm-smi"):
         return {"supported": False}
     names = run_cmd("rocm-smi --showproductname")
     match = re.search(r"Card (?:Series|SKU):\s*(.+)", names)
@@ -95,6 +126,8 @@ def detect_amd_rocm() -> Dict[str, Any]:
     vram = run_cmd("rocm-smi --showmeminfo vram")
     match = re.search(r"Total Memory \(B\):\s*(\d+)", vram)
     mem_total_mb = int(match.group(1)) // (1024 * 1024) if match else 0
+    if mem_total_mb < 8 * 1024:
+        return {"supported": False, "hint": f"AMD GPU with {mem_total_mb} MiB VRAM (integrated / too small for vLLM ROCm)"}
     docker_ok = run_cmd("docker run --rm --device /dev/kfd --device /dev/dri alpine echo ok", timeout=120) == "ok"
     return {
         "supported": True,
@@ -113,13 +146,17 @@ def analyze_hardware() -> Dict[str, Any]:
         (name for name, res in found.items() if res.get("supported") and res.get("docker_runtime", True)),
         "cpu",
     )
+    cores = os.cpu_count() or 0
+    ram_gb = host_ram_gb()
+    cpu_preset = preset_for_cpu(ram_gb, cores)
+    unusable = [n for n, r in found.items() if r.get("supported") and not r.get("docker_runtime", True)]
     if backend == "cpu":
-        cores = os.cpu_count() or 0
-        res = {"summary": f"Generic CPU ({platform.machine()}, {cores} threads)", "profile": "cpu-vllm.yaml",
-               "preset": "qwen3-4b"}
-        unusable = [n for n, r in found.items() if r.get("supported") and not r.get("docker_runtime", True)]
-        notes = (f"{', '.join(unusable)} accelerator found but not usable from Docker; run scripts/bootstrap_host.sh. "
-                 if unusable else "") + "Real inference on CPU with vLLM's CPU backend."
+        res = {"summary": f"Generic CPU ({platform.machine()}, {cores} threads, {ram_gb:.0f} GB RAM)",
+               "profile": "cpu-vllm.yaml", "preset": cpu_preset}
+        hints = [r["hint"] for r in found.values() if r.get("hint")]
+        notes = (f"{', '.join(unusable)} accelerator found but not usable from Docker (NVIDIA container toolkit: "
+                 "bash scripts/bootstrap_host.sh). " if unusable else "") + "".join(h + ". " for h in hints) + \
+                "Real inference on CPU with vLLM's CPU backend."
     else:
         res = found[backend]
         notes = {"metal": "Native vllm-metal engine on macOS, bridged into the compose network.",
@@ -133,6 +170,10 @@ def analyze_hardware() -> Dict[str, Any]:
         "summary": res["summary"],
         "profile": res["profile"],
         "recommended_preset": res["preset"],
+        "cpu_preset": cpu_preset,
+        "unusable_accelerators": unusable,
+        "usable_backends": [n for n, r in found.items() if r.get("supported") and r.get("docker_runtime", True)]
+                           + ["cpu", "mock"],
         "notes": notes,
         "detected": found,
     }
@@ -154,6 +195,9 @@ def main():
         print(f"export HARDWARE_PROFILE=\"{data['profile']}\"")
         print(f"export HARDWARE_SUMMARY=\"{data['summary']}\"")
         print(f"export RECOMMENDED_PRESET=\"{data['recommended_preset']}\"")
+        print(f"export CPU_PRESET=\"{data['cpu_preset']}\"")
+        print(f"export ACCEL_UNUSABLE=\"{','.join(data['unusable_accelerators'])}\"")
+        print(f"export USABLE_BACKENDS=\"{','.join(data['usable_backends'])}\"")
     else:
         print("=" * 68)
         print("  🖥️  LLMOps HARDWARE PLATFORM DIAGNOSTIC & DETECTOR")

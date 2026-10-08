@@ -27,9 +27,9 @@ import time
 import urllib.request
 from typing import Dict, List
 
-from llmops_client import GATEWAY_MODEL, NO_CACHE, VIRTUAL_KEY, ChatResult, chat
+from llmops_client import GATEWAY_MODEL, NO_CACHE, VIRTUAL_KEY, ChatResult, chat, local_url
 
-VLLM_METRICS_URL = os.getenv("VLLM_METRICS_URL", "http://localhost:8000/metrics")
+VLLM_METRICS_URL = os.getenv("VLLM_METRICS_URL", local_url("VLLM_PORT", 8000) + "/metrics")
 CONCURRENT_REQUESTS = int(os.getenv("CONCURRENCY", "32"))
 TOTAL_REQUESTS = int(os.getenv("REQUESTS", str(CONCURRENT_REQUESTS)))
 TOKENS_TO_GENERATE = int(os.getenv("MAX_TOKENS", "256"))

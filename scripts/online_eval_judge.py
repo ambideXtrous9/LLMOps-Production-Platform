@@ -29,10 +29,10 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-from llmops_client import GATEWAY_MODEL, NO_CACHE, chat, http_json
+from llmops_client import GATEWAY_MODEL, NO_CACHE, chat, http_json, local_url
 
 JUDGE_MODEL = os.getenv("JUDGE_MODEL", GATEWAY_MODEL)
-LANGFUSE_URL = os.getenv("LANGFUSE_URL", "http://localhost:3000")
+LANGFUSE_URL = os.getenv("LANGFUSE_URL", local_url("LANGFUSE_PORT", 3000))
 JUDGE_MARKER = "You are an objective LLMOps evaluator."
 
 JUDGE_SYSTEM_PROMPT = JUDGE_MARKER + """ You evaluate the quality of LLM responses based on three criteria:

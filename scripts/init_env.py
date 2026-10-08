@@ -11,6 +11,7 @@ Usage: python3 scripts/init_env.py   (prints "created", "updated" or "exists")
 
 import argparse
 import os
+import re
 import secrets
 import shutil
 import sys
@@ -51,6 +52,32 @@ def add_missing_secrets() -> list:
             f.write("\n# --- Secrets added by scripts/init_env.py for newer stack components ---\n")
             f.writelines(f"{key}={value}\n" for key, value in missing.items())
     return sorted(missing)
+
+
+def quote(value: str) -> str:
+    """Quoting that bash `source`, docker compose and llmops_client.load_env all read back verbatim."""
+    if value == "" or re.fullmatch(r"[A-Za-z0-9_./:@%+,=-]+", value):
+        return value
+    if "'" not in value:
+        return f"'{value}'"  # literal in both bash and compose (JSON keeps its double quotes)
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def set_env_values(values: dict, comment: str) -> None:
+    """Sets KEY=value in .env: existing assignments are rewritten in place, new keys are
+    appended under `comment`. Every other line (and the file mode) is kept."""
+    ensure_env()
+    with open(ENV_PATH, encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    pending = dict(values)
+    for i, line in enumerate(lines):
+        key = line.split("=", 1)[0].strip()
+        if "=" in line and not line.lstrip().startswith("#") and key in pending:
+            lines[i] = f"{key}={quote(pending.pop(key))}"
+    if pending:
+        lines += ["", f"# --- {comment} ---"] + [f"{key}={quote(value)}" for key, value in pending.items()]
+    with open(ENV_PATH, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 def ensure_env() -> bool:

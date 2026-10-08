@@ -27,7 +27,7 @@ import urllib.request
 from typing import Dict, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from init_env import ENV_PATH, ROOT_DIR, ensure_env  # noqa: E402
+from init_env import ENV_PATH, ROOT_DIR, ensure_env, quote  # noqa: E402
 
 PRESET_DIR = os.path.join(ROOT_DIR, "models", "presets")
 HF = "https://huggingface.co"
@@ -37,13 +37,13 @@ MODEL_KEYS = [
     "MODEL_PRESET", "MODEL_NAME", "MODEL_REVISION", "SERVED_MODEL_NAME", "MODEL_DTYPE", "MAX_MODEL_LEN",
     "GPU_MEMORY_UTILIZATION", "VLLM_MODEL_ARGS", "MODEL_SUPPORTS_REASONING", "MODEL_REASONING_BY_DEFAULT",
     "MODEL_SUPPORTS_TOOLS", "MODEL_SUPPORTS_VISION", "MODEL_THINKING_EXTRA_BODY",
-    "EVAL_MIN_ACCURACY", "EVAL_MAX_TTFT", "EVAL_MIN_TPS",
+    "EVAL_MIN_ACCURACY", "EVAL_MAX_TTFT", "EVAL_MIN_TPS", "MODEL_PLATFORM",
 ]
 DEFAULTS = {
     "MODEL_REVISION": "main", "MODEL_DTYPE": "auto", "MAX_MODEL_LEN": "auto", "GPU_MEMORY_UTILIZATION": "0.90",
     "VLLM_MODEL_ARGS": "", "MODEL_SUPPORTS_REASONING": "false", "MODEL_REASONING_BY_DEFAULT": "false",
     "MODEL_SUPPORTS_TOOLS": "false", "MODEL_SUPPORTS_VISION": "false", "MODEL_THINKING_EXTRA_BODY": "",
-    "EVAL_MIN_ACCURACY": "0.75", "EVAL_MAX_TTFT": "1.5", "EVAL_MIN_TPS": "20",
+    "EVAL_MIN_ACCURACY": "0.75", "EVAL_MAX_TTFT": "1.5", "EVAL_MIN_TPS": "20", "MODEL_PLATFORM": "",
 }
 
 
@@ -63,15 +63,6 @@ def parse_env_file(path: str) -> Dict[str, str]:
                 value = value[1:-1]
             values[key.strip()] = value
     return values
-
-
-def quote(value: str) -> str:
-    """Quoting that bash `source`, docker compose and llmops_client.load_env all read back verbatim."""
-    if value == "" or re.fullmatch(r"[A-Za-z0-9_./:@%+,=-]+", value):
-        return value
-    if "'" not in value:
-        return f"'{value}'"  # literal in both bash and compose (JSON keeps its double quotes)
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def write_model_block(block: Dict[str, str]) -> None:
@@ -271,9 +262,14 @@ def main() -> int:
         print(f"✗ '{args.model}' is neither a preset ({', '.join(presets)}) nor a Hugging Face repo id (org/name).")
         return 1
 
-    if facts and args.platform in ("cpu", "metal"):
-        # CPU / unified-memory decode is bandwidth bound: gate on quality, relax speed SLOs.
-        block.update({"EVAL_MAX_TTFT": "3.0", "EVAL_MIN_TPS": "8"})
+    if args.platform in ("cpu", "metal"):
+        # CPU / unified-memory decode speed varies ~10x between machines (cores, memory
+        # bandwidth): the gate checks quality there and only catches pathological speed.
+        block["EVAL_MAX_TTFT"] = str(max(float(block["EVAL_MAX_TTFT"]), 5.0))
+        block["EVAL_MIN_TPS"] = str(min(float(block["EVAL_MIN_TPS"]), 2.0))
+        if block["MODEL_DTYPE"] in ("half", "float16"):
+            block["MODEL_DTYPE"] = "auto"  # fp16 presets target pre-Ampere GPUs; CPUs run the native dtype
+    block["MODEL_PLATFORM"] = args.platform or ""
     if args.served_name:
         block["SERVED_MODEL_NAME"] = args.served_name
     if args.max_model_len:

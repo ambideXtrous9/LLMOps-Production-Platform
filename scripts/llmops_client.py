@@ -45,8 +45,13 @@ def load_env(path: Optional[str] = None) -> None:
 load_env()
 
 
+def local_url(port_var: str, default: int) -> str:
+    """URL of a service published on this host; follows its *_PORT setting (run_all.sh may move ports)."""
+    return f"http://localhost:{os.getenv(port_var) or default}"
+
+
 def gateway_chat_url() -> str:
-    raw = os.getenv("LITELLM_URL", "http://localhost:4000").rstrip("/")
+    raw = os.getenv("LITELLM_URL", local_url("LITELLM_PORT", 4000)).rstrip("/")
     if raw.endswith("/chat/completions"):
         return raw
     return f"{raw}/chat/completions" if raw.endswith("/v1") else f"{raw}/v1/chat/completions"

@@ -86,7 +86,7 @@ services:
       # Max seconds between upstream bytes (long thinking-mode generations stream for minutes).
       - ROUTER_TIMEOUT=${ROUTER_TIMEOUT:-600}
     ports:
-      - "${BIND_ADDRESS:-127.0.0.1}:8001:8000"
+      - "${BIND_ADDRESS:-127.0.0.1}:${ROUTER_PORT:-8001}:8000"
     # The router tracks backend health itself; it must not block on the engine
     # finishing a multi-minute model load.
     depends_on:
@@ -138,7 +138,7 @@ services:
       - -c
       - python3 /app/render_litellm_config.py /app/config.yaml /app/litellm.generated.yaml && exec docker/prod_entrypoint.sh "$$@"
       - litellm-entrypoint
-    command: ["--config", "/app/litellm.generated.yaml", "--port", "4000", "--num_workers", "${LITELLM_NUM_WORKERS:-2}"]
+    command: ["--config", "/app/litellm.generated.yaml", "--port", "4000", "--num_workers", "${LITELLM_NUM_WORKERS:-4}"]
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness', timeout=3)\""]
       interval: 10s
@@ -163,7 +163,7 @@ services:
     image: redis:7-alpine
     container_name: llmops-redis
     ports:
-      - "${BIND_ADDRESS:-127.0.0.1}:6379:6379"
+      - "${BIND_ADDRESS:-127.0.0.1}:${REDIS_PORT:-6379}:6379"
     command: redis-server --requirepass ${REDIS_PASSWORD:-redis_cluster_production_pass_2026}
     healthcheck:
       test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-redis_cluster_production_pass_2026}", "ping"]
@@ -188,7 +188,7 @@ services:
       - postgres_data:/var/lib/postgresql/data
       - ./scripts/init-postgres.sh:/docker-entrypoint-initdb.d/init-databases.sh:ro
     ports:
-      - "${BIND_ADDRESS:-127.0.0.1}:5432:5432"
+      - "${BIND_ADDRESS:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-llmops_admin} -d ${POSTGRES_DB:-litellm_db}"]
       interval: 5s
@@ -369,9 +369,9 @@ services:
     image: grafana/alloy:v1.1.0
     container_name: alloy-telemetry-agent
     ports:
-      - "${BIND_ADDRESS:-127.0.0.1}:12345:12345"
-      - "${BIND_ADDRESS:-127.0.0.1}:4317:4317"
-      - "${BIND_ADDRESS:-127.0.0.1}:4318:4318"
+      - "${BIND_ADDRESS:-127.0.0.1}:${ALLOY_PORT:-12345}:12345"
+      - "${BIND_ADDRESS:-127.0.0.1}:${OTLP_GRPC_PORT:-4317}:4317"
+      - "${BIND_ADDRESS:-127.0.0.1}:${OTLP_HTTP_PORT:-4318}:4318"
     volumes:
       - ./config/alloy.config:/etc/alloy/config.alloy:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -394,7 +394,7 @@ services:
     image: grafana/tempo:2.4.1
     container_name: tempo-tracing-engine
     ports:
-      - "${BIND_ADDRESS:-127.0.0.1}:3200:3200"
+      - "${BIND_ADDRESS:-127.0.0.1}:${TEMPO_PORT:-3200}:3200"
     volumes:
       - ./config/tempo.yaml:/etc/tempo/tempo.yaml:ro
     command:
@@ -434,7 +434,7 @@ services:
       - GPU_TELEMETRY_MODE=none
       - LLMOPS_PLATFORM=${LLMOPS_PLATFORM:-unknown}
     ports:
-      - "${BIND_ADDRESS:-127.0.0.1}:9400:9400"
+      - "${BIND_ADDRESS:-127.0.0.1}:${DCGM_PORT:-9400}:9400"
     restart: unless-stopped
     networks:
       - llmops-net
@@ -446,7 +446,7 @@ services:
     image: prom/node-exporter:v1.8.0
     container_name: node-exporter
     ports:
-      - "${BIND_ADDRESS:-127.0.0.1}:9100:9100"
+      - "${BIND_ADDRESS:-127.0.0.1}:${NODE_EXPORTER_PORT:-9100}:9100"
     command:
       - '--path.procfs=/host/proc'
       - '--path.sysfs=/host/sys'

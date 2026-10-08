@@ -171,6 +171,10 @@ Client App       LiteLLM (:4000)     KV Router (:8001)      vLLM (:8000)       P
 │ Hugging Face Hub    │─────>│ configure_model.py       │─────>│ .env  MODEL BLOCK                      │
 │ (metadata only)     │      │ preset | auto-profile    │      │ MODEL_NAME · VLLM_MODEL_ARGS · EVAL_*  │
 └─────────────────────┘      └──────────────────────────┘      └───────────────────┬────────────────────┘
+┌─────────────────────┐ preset that fits  ▲                                        │
+│ detect_hardware.py  │───────────────────┘                                        │
+│ VRAM · RAM · cores  │                                                            │
+└─────────────────────┘                                                            │
                                                                                    │
           ┌────────────────────┬────────────────────┬────────────────────┬─────────┴──────────┐
           ▼                    ▼                    ▼                    ▼                    ▼
@@ -179,16 +183,18 @@ Client App       LiteLLM (:4000)     KV Router (:8001)      vLLM (:8000)       P
 │ engine flags     │ │ model aliases    │ │ allowed models   │ │ capability-aware │ │ deploy_k8s.sh    │
 └──────────────────┘ └──────────────────┘ └──────────────────┘ └──────────────────┘ └──────────────────┘
           ▲
-          │ engine image + devices
-┌─────────┴─────────────────────────────┐
-│ Platform overlay                      │
-│ gpu · rocm · cpu · metal · mock       │
-└───────────────────────────────────────┘
+          │ engine image + devices · sizing for this machine
+┌─────────┴─────────────────────────────────────────────────────────────────────────────────────────────┐
+│ Platform overlay      gpu · rocm · cpu · metal · mock                                                 │
+│ run_all.sh at boot    preflight.py: free host ports · GPU memory fraction · gateway workers           │
+│ On a failed boot      engine_doctor.py: context auto · fp16 · retry · smaller preset (saved in .env)  │
+└───────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 - **Model block** — the single place a model is defined; a model swap edits nothing else.
 - **Platform overlay** — swaps only the engine image and device wiring.
 - **Gateway routes** — rendered at start: `<name>`, `<name>-direct`, `<name>-thinking`.
+- **Hardware fit** — `detect_hardware.py` picks the preset that fits; at boot `preflight.py` sizes engine + gateway for the machine and `engine_doctor.py` repairs a failed boot.
 
 ### 2.5 Network Exposure
 
@@ -251,32 +257,36 @@ Client App       LiteLLM (:4000)     KV Router (:8001)      vLLM (:8000)       P
 
 | Platform | Needs |
 | :--- | :--- |
-| NVIDIA GPU host | Ubuntu 22.04/24.04 — `scripts/bootstrap_host.sh` installs driver, Docker, NVIDIA toolkit |
-| CPU host / laptop | Docker with Compose v2.24+ |
-| Apple Silicon | macOS 15+, Docker Desktop, Homebrew |
+| NVIDIA GPU host | Ubuntu 22.04/24.04 with the NVIDIA driver; Docker + NVIDIA toolkit are installed by `run_all.sh` when missing (passwordless sudo) |
+| CPU host / laptop | Docker with Compose v2.24+, Python 3.8+ |
+| Apple Silicon | macOS 15+, Docker Desktop, Homebrew (vllm-metal is installed by `run_all.sh`) |
 
 ### 3.2 Cloud GPU Host
 
 ```bash
 git clone <repo> && cd LLMOps
-bash scripts/bootstrap_host.sh     # driver + Docker + NVIDIA toolkit (idempotent, no reboot)
-./run_all.sh                       # boot, warm up, verify
+./run_all.sh                       # installs what is missing, boots, warms up, verifies
 ```
+
+- **No NVIDIA driver yet** — `bash scripts/bootstrap_host.sh` once (driver installs are never automatic).
 
 ### 3.3 CPU Host
 
 ```bash
-./run_all.sh --cpu                 # real inference on vLLM's CPU backend (preset qwen3-4b)
+./run_all.sh                       # no usable GPU: real inference on vLLM's CPU backend
+./run_all.sh --cpu                 # force CPU on a GPU host
 ```
+
+- **Preset** — `qwen3-4b` with ≥ 16 threads and ≥ 24 GB RAM, else `smollm2-360m`.
 
 ### 3.4 Apple Silicon
 
 ```bash
-brew tap vllm-project/vllm-metal https://github.com/vllm-project/vllm-metal
-brew install vllm-project/vllm-metal/vllm-metal
-python3 scripts/serve_metal.py     # native Metal engine on :8000
-./run_all.sh --metal               # rest of the stack in Docker
+./run_all.sh                       # installs vllm-metal, starts the native engine, rest in Docker
 ```
+
+- **Preset** — `qwen3-4b` with ≥ 16 GB unified memory, else `smollm2-360m`.
+- **No Homebrew / vllm-metal** — the engine runs on CPU in Docker instead.
 
 ### 3.5 No Model (UI / pipeline development)
 
@@ -284,10 +294,15 @@ python3 scripts/serve_metal.py     # native Metal engine on :8000
 ./run_all.sh --mock                # emulated engine with real vLLM metric names
 ```
 
-### 3.6 What First Boot Does
+### 3.6 What Every Run Does
 
-- **Secrets** — `.env` is created with freshly generated keys and passwords.
-- **Model** — the preset matching the detected hardware is selected.
+- **Never prompts** — every decision is automatic and listed under *Fixed automatically* in the final report.
+- **Secrets** — the first run creates `.env` with fresh keys and passwords; later runs only add new ones.
+- **Model** — the first run picks the preset for the hardware; a platform change re-sizes it.
+- **Ports** — a port used by another program moves to the next free one (saved in `.env`).
+- **Sizing** — gateway workers follow CPU threads, engine memory follows free GPU memory, CPU KV cache follows RAM.
+- **Engine recovery** — a failed boot gets context `auto`, fp16, a retry, then a smaller preset; a model dropped because the GPU was shared is retried next run.
+- **Database** — the Postgres password is re-synced with `.env`.
 - **Timing** — cold start ≈ 3.5 min (9B on A100, includes 19 GB download); warm restart ≈ 80 s.
 
 ---
@@ -396,7 +411,9 @@ Reads Hub metadata only — no weights downloaded.
 | Mock | `docker-compose.mock.yml` | emulator | synthetic | emulation only |
 
 - **Auto-detection** — Metal → CUDA → ROCm → CPU (`scripts/detect_hardware.py`).
-- **Override** — `./run_all.sh --platform cuda | rocm | cpu | metal | mock`.
+- **ROCm** — needs `rocm-smi` and ≥ 8 GB VRAM; integrated AMD graphics run on CPU.
+- **GPU Docker cannot use** — NVIDIA toolkit installed automatically (Linux, passwordless sudo, no other containers running), else CPU.
+- **Override** — `./run_all.sh --platform cuda | rocm | cpu | metal | mock`; a platform the machine cannot run falls back to the detected one.
 - **Same engine** — vLLM `v0.31.0` everywhere: identical API, metrics and tests.
 
 ---
@@ -499,7 +516,7 @@ client.chat.completions.create(model="qwen3.5-9b", messages=[{"role": "user", "c
 
 | Gate | Checks |
 | :--- | :--- |
-| `test_stack.py` | 13 checks: engine · router · streaming · thinking · vision · auth · PII · Prometheus · Alertmanager · Tempo trace · Loki logs · Langfuse · Grafana |
+| `test_stack.py` | 13 checks: engine · router · streaming · thinking · vision · auth · PII · Prometheus · Alertmanager · Tempo trace · Loki log for the same trace id · Langfuse · Grafana (GPU telemetry reported, not required) |
 | `load_test.py` | concurrent streaming burst: TTFT / latency percentiles, saturation, KEDA trigger state |
 | `eval_gate.py` | accuracy · injection + PII safety · formatting · arithmetic · tool calling |
 | `online_eval_judge.py` | scores live generations from Langfuse, writes scores back |
@@ -557,7 +574,11 @@ All settings live in `.env` (template: `.env.example`).
 | Group | Keys |
 | :--- | :--- |
 | Model | `MODEL_NAME` · `MODEL_REVISION` · `SERVED_MODEL_NAME` |
-| Engine sizing | `MODEL_DTYPE` · `MAX_MODEL_LEN` · `GPU_MEMORY_UTILIZATION` · `VLLM_CPU_KVCACHE_SPACE` |
+| Engine sizing | `MODEL_DTYPE` · `MAX_MODEL_LEN` · `GPU_MEMORY_UTILIZATION` |
+| Auto when empty | `LITELLM_NUM_WORKERS` · `VLLM_CPU_KVCACHE_SPACE` |
+| Boot patience | `VLLM_READY_TIMEOUT` (seconds without engine progress) |
+| Host ports | `VLLM_PORT` · `ROUTER_PORT` · `LITELLM_PORT` · `LANGFUSE_PORT` · `GRAFANA_PORT` · `PROMETHEUS_PORT` · `ALERTMANAGER_PORT` · `LOKI_PORT` · `TEMPO_PORT` · `ALLOY_PORT` · `OTLP_GRPC_PORT` · `OTLP_HTTP_PORT` · `POSTGRES_PORT` · `REDIS_PORT` · `DCGM_PORT` · `NODE_EXPORTER_PORT` |
+| Kept by `run_all.sh` | `MODEL_PLATFORM` · `MODEL_FALLBACK_FROM` |
 | Engine flags | `VLLM_MODEL_ARGS` (configurator-owned) · `VLLM_EXTRA_ARGS` (yours) |
 | Capabilities | `MODEL_SUPPORTS_REASONING` · `_TOOLS` · `_VISION` · `MODEL_REASONING_BY_DEFAULT` · `MODEL_THINKING_EXTRA_BODY` |
 | Quality gates | `EVAL_MIN_ACCURACY` · `EVAL_MAX_TTFT` · `EVAL_MIN_TPS` |
@@ -575,6 +596,7 @@ All settings live in `.env` (template: `.env.example`).
 - **Queueing?** — `vllm:request_queue_time_seconds` rising → scale out.
 - **Cold prefixes?** — `job:vllm_prefix_cache_hit_percent`, `job:kv_router_affinity_hit_percent`.
 - **Where?** — open the trace in Tempo; compare gateway vs engine span time.
+- **Gateway-bound?** — client TTFT ≫ engine TTFT → gateway CPU saturated: raise `LITELLM_NUM_WORKERS` (2 → 8 took P95 1.8 s → 0.4 s at 64 streams).
 
 ### 13.2 KV-Cache Saturation
 
@@ -594,13 +616,16 @@ All settings live in `.env` (template: `.env.example`).
 | Symptom | Fix |
 | :--- | :--- |
 | `AMD CDI spec not found` | run `bash scripts/bootstrap_host.sh` (registers NVIDIA runtime, restarts Docker) |
-| Engine stuck on `health: starting` | first boot downloads + compiles; wait (progress shown, `VLLM_READY_TIMEOUT`) |
+| Engine stuck on `health: starting` | first boot downloads + compiles; `run_all.sh` waits while it progresses (`VLLM_READY_TIMEOUT` = seconds without progress) |
 | First CPU request ≈ 1 min | one-time JIT; `run_all.sh` warms up automatically |
-| `config.json not readable (gated)` | accept the license on huggingface.co, set `HF_TOKEN` |
-| Engine OOM / max-seq-len error | `MAX_MODEL_LEN=auto`; lower `GPU_MEMORY_UTILIZATION` on shared GPUs |
+| `config.json not readable (gated)` | accept the license on huggingface.co, set `HF_TOKEN` (meanwhile the recommended preset is served) |
+| Engine OOM / max-seq-len error | fixed automatically (context `auto`, then a smaller preset) — see *Fixed automatically* |
+| `Driver/library version mismatch` | NVIDIA driver updated without a reboot: reboot (the stack runs on CPU until then) |
+| A port moved (e.g. Grafana on 3002) | another program held the default: free it, set the `*_PORT` back in `.env` |
+| Client TTFT ≫ engine TTFT | gateway CPU-bound: raise `LITELLM_NUM_WORKERS` |
 | Public URL times out | open the port in the **cloud** firewall; check `*_BIND_ADDRESS` |
 | Langfuse login bounces to `localhost` | set `NEXTAUTH_URL=http://<server-ip>:3000`, recreate Langfuse |
-| Postgres auth error after deleting `.env` | restore `.env`, or `docker volume rm llmops_postgres_data` |
+| `.env` deleted | a new one is generated and the Postgres password re-synced; previously issued keys stop working |
 | `stale file handle` after `git pull` | `docker compose … up -d --force-recreate <service>` |
 
 ---
@@ -609,7 +634,7 @@ All settings live in `.env` (template: `.env.example`).
 
 ```text
 LLMOps/
-├── run_all.sh                     # detect · configure · boot · verify
+├── run_all.sh                     # detect · size · boot · self-heal · verify
 ├── docker-compose.yml             # base architecture
 ├── docker-compose.{gpu,rocm,cpu,metal,mock}.yml   # platform overlays
 ├── .env.example                   # model block · exposure · versions · secrets
@@ -638,6 +663,8 @@ LLMOps/
     ├── configure_model.py         # presets / auto-profile
     ├── init_env.py                # secrets
     ├── detect_hardware.py         # platform detection
+    ├── preflight.py               # host ports · sizing for this machine
+    ├── engine_doctor.py           # engine boot failure -> fix
     ├── deploy_k8s.sh              # Kubernetes deploy
     ├── llmops_client.py           # shared client
     ├── test_stack.py · load_test.py · eval_gate.py · online_eval_judge.py
