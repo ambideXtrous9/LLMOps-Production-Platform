@@ -18,7 +18,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional
 
-from llmops_client import GATEWAY_MODEL  # also loads the repo .env
+from llmops_client import GATEWAY_MODEL, SUPPORTS_REASONING  # also loads the repo .env
 
 DEFAULT_GATEWAY_URL = os.getenv("LITELLM_URL", "http://localhost:4000")
 MASTER_KEY = os.getenv("LITELLM_MASTER_KEY", "sk-admin-master-sec-9a8b7c6d5e4f3a2b1c0d")
@@ -117,6 +117,7 @@ def list_spend() -> None:
 
 def seed_definitions() -> List[Dict[str, Any]]:
     model = GATEWAY_MODEL
+    thinking = [f"{model}-thinking"] if SUPPORTS_REASONING else []
     return [
         {
             "team_id": "engineering",
@@ -125,7 +126,7 @@ def seed_definitions() -> List[Dict[str, Any]]:
             "max_budget": 500.0,
             "rpm_limit": 600,
             "tpm_limit": 2000000,
-            "models": [model, f"{model}-direct", f"{model}-thinking"],
+            "models": [model, f"{model}-direct", *thinking],
             "metadata": {"dept": "core-eng", "sla": "tier-1"},
         },
         {
@@ -135,7 +136,7 @@ def seed_definitions() -> List[Dict[str, Any]]:
             "max_budget": 200.0,
             "rpm_limit": 120,
             "tpm_limit": 500000,
-            "models": [model, f"{model}-thinking"],
+            "models": [model, *thinking],
             "metadata": {"dept": "ai-research", "sla": "tier-2"},
         },
         {
@@ -145,7 +146,7 @@ def seed_definitions() -> List[Dict[str, Any]]:
             "max_budget": 100.0,
             "rpm_limit": 300,
             "tpm_limit": 500000,
-            "models": [model, f"{model}-thinking"],
+            "models": [model, *thinking],
             "metadata": {"dept": "devops", "purpose": "eval-gate"},
         },
     ]

@@ -1,28 +1,19 @@
 # ==============================================================================
-# Development / Non-GPU Environment Compose Overlay
+# CPU Platform Overlay (x86_64 / arm64 Linux, Docker Desktop on any OS)
 # ==============================================================================
-# Automatically used on macOS (Apple Silicon) or Linux dev boxes without NVIDIA drivers.
-# Emulates the vLLM engine and DCGM hardware metrics with realistic PagedAttention
-# telemetry, streaming SSE, and prompt evaluation support.
+# Real inference on CPU with vLLM's CPU backend (vllm/vllm-openai-cpu), so the full
+# architecture - router, gateway, guardrails, telemetry, eval gates - runs unchanged
+# on machines without an accelerator. Use a small model (e.g. `./run_all.sh --model
+# qwen3-0.6b`): CPU decode is memory-bandwidth bound.
+#
+# No GPU: the hardware exporter stub reports the platform without GPU samples.
 # ==============================================================================
 
 services:
   vllm:
-    image: llmops-mock-vllm:latest
-    build:
-      context: ./engine
-      dockerfile: Dockerfile
-    command: []
-    deploy:
-      resources:
-        reservations: {}
-
-  dcgm-exporter:
-    image: llmops-mock-dcgm:latest
-    build:
-      context: ./engine
-      dockerfile: Dockerfile.dcgm
-    deploy:
-      resources:
-        reservations: {}
-    cap_add: []
+    image: vllm/vllm-openai-cpu:${VLLM_VERSION:-v0.31.0}
+    environment:
+      # GiB of RAM reserved for the KV cache (CPU equivalent of --gpu-memory-utilization)
+      - VLLM_CPU_KVCACHE_SPACE=${VLLM_CPU_KVCACHE_SPACE:-8}
+      # Pin OpenMP threads to physical cores ("auto" lets vLLM pick NUMA-local cores)
+      - VLLM_CPU_OMP_THREADS_BIND=${VLLM_CPU_OMP_THREADS_BIND:-auto}

@@ -9,59 +9,29 @@
 #  - Prometheus golden signal callbacks
 #  - Dynamic fallback routing & retries
 #
-# Served model: Qwen/Qwen3.5-9B on vLLM (served name "qwen3.5-9b").
-# vLLM starts with enable_thinking=false, so the default alias answers directly;
-# the "-thinking" alias opts into reasoning (returned as `reasoning_content`).
-# To serve a different model: change MODEL_* / SERVED_MODEL_NAME / VLLM_MODEL_ARGS
-# in .env and rename the aliases + upstream model below.
+# This file is gateway POLICY only. Routes to the self-hosted vLLM engine are
+# generated at container start by config/render_litellm_config.py from the model
+# settings in .env (SERVED_MODEL_NAME, MODEL_SUPPORTS_*, ...):
+#     <served-name>            -> KV-cache-aware router -> vLLM
+#     <served-name>-direct     -> vLLM (fallback, bypasses the router)
+#     <served-name>-thinking   -> reasoning mode (reasoning-capable models only)
+# so switching to any Hugging Face model needs no edit here.
 # ==============================================================================
 
-model_list:
-  # Primary Serving Route: KV-Cache-Aware Router -> vLLM Workers
-  - model_name: qwen3.5-9b
-    litellm_params: &qwen_router_params
-      model: hosted_vllm/qwen3.5-9b
-      api_base: os.environ/KV_ROUTER_URL
-      api_key: "none"
-      timeout: 600            # whole request; long generations stream for minutes
-      stream_timeout: 120     # max wait for the first streamed chunk
-      max_retries: 2
-    model_info: &qwen_model_info
-      max_input_tokens: 131072
-      max_output_tokens: 32768
-      supports_vision: true
-      supports_function_calling: true
-      supports_reasoning: true
-      # Internal chargeback rates (USD/token) so per-team budgets & spend tracking
-      # are meaningful for a self-hosted model. Tune to your GPU cost.
-      input_cost_per_token: 0.0000001
-      output_cost_per_token: 0.0000004
-
-  # Direct vLLM Engine Route (Bypasses Router for debugging / fallback)
-  - model_name: qwen3.5-9b-direct
-    litellm_params:
-      <<: *qwen_router_params
-      api_base: os.environ/VLLM_DIRECT_URL
-    model_info:
-      <<: *qwen_model_info
-
-  # Thinking / Reasoning Route (chain-of-thought in `reasoning_content`)
-  - model_name: qwen3.5-9b-thinking
-    litellm_params:
-      <<: *qwen_router_params
-      extra_body:
-        chat_template_kwargs:
-          enable_thinking: true
-    model_info:
-      <<: *qwen_model_info
+# Optional extra routes (kept alongside the generated engine routes), e.g. a
+# hosted provider as overflow capacity:
+# model_list:
+#   - model_name: gpt-4o-mini
+#     litellm_params:
+#       model: openai/gpt-4o-mini
+#       api_key: os.environ/OPENAI_API_KEY
 
 router_settings:
   routing_strategy: "least-busy"
   enable_pre_call_checks: true
   num_retries: 2
   timeout: 600
-  fallbacks:
-    - qwen3.5-9b: ["qwen3.5-9b-direct"]
+  # fallbacks: <served-name> -> <served-name>-direct is added automatically
 
 guardrails:
   - guardrail_name: "pii-masking"
@@ -75,7 +45,6 @@ litellm_settings:
   require_auth_for_metrics_endpoint: false
 
   # Multi-telemetry egress (Prometheus golden signals + OTLP traces via Alloy -> Tempo)
-  # To enable Langfuse application tracing, set LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, and add "langfuse"
   callbacks: ["prometheus", "otel"]
 
   # Distributed Redis exact-response cache (connection from REDIS_URL).

@@ -1,0 +1,23 @@
+# ==============================================================================
+# AMD ROCm Platform Overlay (Instinct MI2xx/MI3xx, Radeon RDNA3+)
+# ==============================================================================
+# Same engine command and model block as every other platform; only the ROCm
+# build of vLLM and the AMD device nodes change. Host prerequisites: the amdgpu
+# kernel driver (ROCm) installed and /dev/kfd + /dev/dri present.
+#
+# Hardware telemetry: the exporter stub reports the platform without GPU samples.
+# For AMD GPU metrics add AMD's device-metrics-exporter and a Prometheus job.
+# ==============================================================================
+
+services:
+  vllm:
+    image: vllm/vllm-openai-rocm:${VLLM_VERSION:-v0.31.0}
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp=unconfined

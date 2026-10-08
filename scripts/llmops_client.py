@@ -51,7 +51,16 @@ def gateway_chat_url() -> str:
     return f"{raw}/chat/completions" if raw.endswith("/v1") else f"{raw}/v1/chat/completions"
 
 
+def env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 GATEWAY_MODEL = os.getenv("GATEWAY_MODEL") or os.getenv("SERVED_MODEL_NAME") or "qwen3.5-9b"
+# Capabilities of the served model (model block in .env) gate capability-specific checks.
+SUPPORTS_REASONING = env_flag("MODEL_SUPPORTS_REASONING")
+REASONING_BY_DEFAULT = env_flag("MODEL_REASONING_BY_DEFAULT")
+SUPPORTS_TOOLS = env_flag("MODEL_SUPPORTS_TOOLS")
+SUPPORTS_VISION = env_flag("MODEL_SUPPORTS_VISION")
 VIRTUAL_KEY = os.getenv("TEAM_ENGINEERING_KEY", "sk-eng-team-a1b2c3d4e5f6g7h8i9j0")
 MASTER_KEY = os.getenv("LITELLM_MASTER_KEY", "sk-admin-master-sec-9a8b7c6d5e4f3a2b1c0d")
 

@@ -15,7 +15,11 @@ Executes before every model promotion or configuration update:
 Probe schema (one JSON object per line):
   id, prompt, type, max_tokens,
   required_keywords (all must appear), required_any (at least one must appear),
-  forbidden_keywords (none may appear), tools + expected_tool (tool_call probes)
+  forbidden_keywords (none may appear), tools + expected_tool (tool_call probes),
+  requires ("tools" | "vision": probe is skipped when the served model lacks it)
+
+Default thresholds come from the model block in .env (EVAL_MIN_ACCURACY,
+EVAL_MAX_TTFT, EVAL_MIN_TPS) so each model/hardware pair carries its own SLOs.
 """
 
 import argparse
@@ -24,7 +28,7 @@ import os
 import sys
 from typing import Any, Dict, List, Tuple
 
-from llmops_client import GATEWAY_MODEL, NO_CACHE, VIRTUAL_KEY, ChatResult, chat
+from llmops_client import GATEWAY_MODEL, NO_CACHE, SUPPORTS_TOOLS, SUPPORTS_VISION, VIRTUAL_KEY, ChatResult, chat
 
 DATASET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models", "golden_dataset.jsonl")
 # CI traffic is attributed to the CI team key when present.
@@ -85,7 +89,11 @@ def run_evaluation_gate(model: str, max_p95_ttft: float, min_tps: float, min_acc
         sys.exit(1)
     with open(DATASET_PATH, "r", encoding="utf-8") as f:
         items: List[Dict[str, Any]] = [json.loads(line) for line in f if line.strip()]
-    print(f"📋 Loaded {len(items)} golden evaluation probes.\n")
+    capabilities = {"tools": SUPPORTS_TOOLS, "vision": SUPPORTS_VISION}
+    skipped = [i["id"] for i in items if i.get("requires") and not capabilities.get(i["requires"], False)]
+    items = [i for i in items if i["id"] not in skipped]
+    print(f"📋 Loaded {len(items)} golden evaluation probes"
+          f"{f' (skipped {skipped}: capability not supported by this model)' if skipped else ''}.\n")
 
     ttft_samples: List[float] = []
     decode_tokens, decode_seconds, passed_probes = 0, 0.0, 0
@@ -135,9 +143,9 @@ def run_evaluation_gate(model: str, max_p95_ttft: float, min_tps: float, min_acc
 def main():
     parser = argparse.ArgumentParser(description="LLMOps Model Evaluation CI Gate")
     parser.add_argument("--model", default=GATEWAY_MODEL, help="Gateway model alias to evaluate")
-    parser.add_argument("--max-ttft", type=float, default=1.5, help="Max P95 TTFT in seconds")
-    parser.add_argument("--min-tps", type=float, default=30.0, help="Min decode tokens/sec per stream")
-    parser.add_argument("--min-accuracy", type=float, default=0.85, help="Min accuracy ratio (0-1)")
+    parser.add_argument("--max-ttft", type=float, default=float(os.getenv("EVAL_MAX_TTFT", "1.5")), help="Max P95 TTFT in seconds")
+    parser.add_argument("--min-tps", type=float, default=float(os.getenv("EVAL_MIN_TPS", "30")), help="Min decode tokens/sec per stream")
+    parser.add_argument("--min-accuracy", type=float, default=float(os.getenv("EVAL_MIN_ACCURACY", "0.85")), help="Min accuracy ratio (0-1)")
 
     args = parser.parse_args()
     success = run_evaluation_gate(

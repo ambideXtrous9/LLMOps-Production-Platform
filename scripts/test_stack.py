@@ -9,24 +9,33 @@ non-zero when any check fails, so it can gate deployments and CI:
   1. vLLM engine health + served model registration          (Plane 2)
   2. KV-cache-aware router health, backends & metrics          (Plane 1/2)
   3. Gateway SSE streaming through a team virtual key + TTFT   (Plane 1)
-  4. Thinking alias returns reasoning separately from answer   (Plane 1/2)
-  5. Auth: invalid virtual keys are rejected                   (Plane 1)
-  6. Guardrail: PII is masked before it reaches the model      (Plane 1)
-  7. Prometheus targets, recording rules & engine metrics      (Plane 3/4)
-  8. Alertmanager readiness                                    (Plane 3)
-  9. Alloy / Tempo / Loki + W3C trace-id round trip into Tempo  (Plane 5)
- 10. Grafana health & provisioned datasources                  (Plane 7)
+  4. Thinking alias returns reasoning separately (reasoning models only)
+  5. Vision request through gateway + router (vision models only)
+  6. Auth: invalid virtual keys are rejected                   (Plane 1)
+  7. Guardrail: PII is masked before it reaches the model      (Plane 1)
+  8. Prometheus targets, recording rules & engine metrics      (Plane 3/4)
+  9. Alertmanager readiness                                    (Plane 3)
+ 10. Alloy / Tempo / Loki + W3C trace-id round trip into Tempo  (Plane 5)
+ 11. Grafana health & provisioned datasources                  (Plane 7)
+
+Capability-specific checks follow the model block in .env (MODEL_SUPPORTS_*), so
+the same suite validates any served Hugging Face model.
 """
 
 import base64
 import json
 import os
+import struct
 import sys
 import time
 import urllib.parse
+import zlib
 from typing import Callable, List, Tuple
 
-from llmops_client import GATEWAY_MODEL, MASTER_KEY, VIRTUAL_KEY, chat, http_json
+from llmops_client import (
+    GATEWAY_MODEL, MASTER_KEY, REASONING_BY_DEFAULT, SUPPORTS_REASONING, SUPPORTS_VISION,
+    VIRTUAL_KEY, chat, http_json,
+)
 
 VLLM_URL = os.getenv("VLLM_URL", "http://localhost:8000")
 KV_ROUTER_URL = os.getenv("KV_ROUTER_URL", "http://localhost:8001")
@@ -94,12 +103,47 @@ def test_streaming_inference() -> bool:
         return fail(f"streaming inference failed (HTTP {res.status}): {res.error or 'empty answer'}")
     ok(f"TTFT {res.ttft:.3f}s | total {res.total:.2f}s | {res.completion_tokens} tokens ({res.tps:.1f} tok/s)")
     ok(f"Answer: \"{res.content.strip()[:110]}\"")
-    if res.reasoning:
-        return fail("default alias leaked reasoning tokens (expected instruct / non-thinking mode)")
+    if res.reasoning and SUPPORTS_REASONING and not REASONING_BY_DEFAULT:
+        return fail("default alias leaked reasoning tokens (reasoning should be opt-in via the -thinking alias)")
+    return True
+
+
+def solid_png(rgb: Tuple[int, int, int], size: int = 64) -> bytes:
+    """Minimal RGB PNG, generated with the standard library."""
+    row = b"\x00" + bytes(rgb) * size
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(row * size)) + chunk(b"IEND", b""))
+
+
+def test_vision() -> bool:
+    if not SUPPORTS_VISION:
+        ok("skipped: served model is text-only (MODEL_SUPPORTS_VISION=false)")
+        return True
+    image = "data:image/png;base64," + base64.b64encode(solid_png((220, 20, 20))).decode()
+    res = chat(
+        [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": image}},
+            {"type": "text", "text": "What single color fills this image? Answer with one word."},
+        ]}],
+        stream=False,
+        max_tokens=16,
+        temperature=0.0,
+        extra={"cache": {"no-cache": True}},
+    )
+    if not res.ok:
+        return fail(f"vision request failed (HTTP {res.status}): {res.error[:160]}")
+    if "red" not in res.content.lower():
+        return fail(f"model did not see the red image: {res.content.strip()[:80]!r}")
+    ok(f"Image understood through gateway + router: {res.content.strip()[:40]!r}")
     return True
 
 
 def test_thinking_alias() -> bool:
+    if not SUPPORTS_REASONING:
+        ok("skipped: served model has no reasoning mode (MODEL_SUPPORTS_REASONING=false)")
+        return True
     model = f"{GATEWAY_MODEL}-thinking"
     res = chat(
         [{"role": "user", "content": "What is 17 * 23? Reply with just the number."}],
@@ -237,6 +281,7 @@ CHECKS: List[Tuple[str, Callable[[], bool]]] = [
     ("Plane 1/2: KV-Cache-Aware Router", test_kv_router),
     ("Plane 1: Gateway SSE Streaming via Virtual Key", test_streaming_inference),
     ("Plane 1/2: Thinking (Reasoning) Alias", test_thinking_alias),
+    ("Plane 1/2: Vision Request via Gateway & Router", test_vision),
     ("Plane 1: Virtual Key Authentication", test_auth_rejects_invalid_key),
     ("Plane 1: PII Masking Guardrail", test_guardrails_pii),
     ("Plane 3/4: Prometheus Targets, Rules & Metrics", test_prometheus_signals),

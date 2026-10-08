@@ -7,10 +7,17 @@ set -eo pipefail
 # Executes all setup, deployment, bootstrapping, and end-to-end verifications
 # from the beginning in a single automated command.
 #
-# Hardware Detection Matrix:
-#   1. Apple Silicon (M1/M2/M3/M4) -> vLLM-Metal & MLX Unified Memory (zero-copy)
-#   2. NVIDIA CUDA GPUs           -> vLLM Engine & DCGM Telemetry
-#   3. Generic CPU Architecture    -> Architecture Emulation Tier
+# Same architecture on every platform; only the vLLM engine build changes:
+#   1. Apple Silicon (M1-M4) -> native vllm-metal on macOS, bridged into compose
+#   2. NVIDIA CUDA GPUs     -> vllm/vllm-openai + DCGM telemetry
+#   3. AMD ROCm GPUs        -> vllm/vllm-openai-rocm
+#   4. CPU (x86_64/arm64)   -> vllm/vllm-openai-cpu (real inference)
+#   (--mock: emulated engine, no inference - pipeline / dashboard development)
+#
+# Model: any Hugging Face repo or curated preset, e.g.
+#   ./run_all.sh --model qwen3.5-9b
+#   ./run_all.sh --model ibm-granite/granite-3.3-8b-instruct
+# (first boot picks the preset recommended for the detected hardware)
 #
 # Fresh GPU host (no driver / Docker yet)? Run scripts/bootstrap_host.sh first.
 # ==============================================================================
@@ -29,20 +36,26 @@ cd "$ROOT_DIR"
 
 # Parse CLI flags
 FORCE_MODE=""
+MODEL_ARG=""
 SKIP_TESTS=false
 TEST_ONLY=false
 
-for arg in "$@"; do
-    case "$arg" in
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --platform) FORCE_MODE="$2"; shift ;;
+        --platform=*) FORCE_MODE="${1#*=}" ;;
         --gpu|--cuda) FORCE_MODE="cuda" ;;
+        --rocm|--amd) FORCE_MODE="rocm" ;;
         --metal|--apple) FORCE_MODE="metal" ;;
         --cpu) FORCE_MODE="cpu" ;;
+        --mock) FORCE_MODE="mock" ;;
+        --model) MODEL_ARG="$2"; shift ;;
+        --model=*) MODEL_ARG="${1#*=}" ;;
         --skip-tests) SKIP_TESTS=true ;;
         --test|--test-only) TEST_ONLY=true ;;
         --down)
             echo -e "${YELLOW}🛑 Stopping all LLMOps services (volumes are kept)...${NC}"
-            docker compose -f docker-compose.yml -f docker-compose.gpu.yml down --remove-orphans 2>/dev/null \
-                || docker compose -f docker-compose.yml -f docker-compose.cpu.yml down --remove-orphans
+            docker compose -f docker-compose.yml down --remove-orphans
             echo -e "${GREEN}✓ All services stopped.${NC}"
             exit 0
             ;;
@@ -50,16 +63,19 @@ for arg in "$@"; do
             echo "Usage: ./run_all.sh [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --metal       Force Apple Silicon Metal acceleration (vLLM-Metal / MLX)"
-            echo "  --gpu         Force NVIDIA CUDA mode (requires NVIDIA driver & runtime)"
-            echo "  --cpu         Force CPU / dev emulation mode"
-            echo "  --skip-tests  Start the stack without running load tests & eval gates"
-            echo "  --test        Run verification & evaluation suite on existing running stack"
-            echo "  --down        Stop all running containers and networks (data volumes are kept)"
-            echo "  --help        Show this help message"
+            echo "  --model <preset|hf-repo>  Serve a curated preset or ANY Hugging Face model"
+            echo "                            (python3 scripts/configure_model.py --list shows presets)"
+            echo "  --platform <name>         Force cuda | rocm | cpu | metal | mock (default: auto-detect)"
+            echo "  --gpu | --rocm | --cpu | --metal | --mock   Shorthands for --platform"
+            echo "  --skip-tests              Start the stack without running load tests & eval gates"
+            echo "  --test                    Run verification & evaluation suite on existing running stack"
+            echo "  --down                    Stop all running containers and networks (data volumes are kept)"
+            echo "  --help                    Show this help message"
             exit 0
             ;;
+        *) echo -e "${RED}Unknown option: $1 (see --help)${NC}"; exit 1 ;;
     esac
+    shift
 done
 
 # wait_for <label> <timeout-seconds> <command...>: polls until the command succeeds.
@@ -105,33 +121,6 @@ wait_for_engine() {
     echo -e "  ${GREEN}✓${NC} Inference engine HEALTHY after ${waited}s"
 }
 
-# Replaces the well-known placeholder secrets of a freshly created .env with random values.
-generate_secrets() {
-    python3 - "$ROOT_DIR/.env" <<'PYEOF'
-import secrets, sys
-path = sys.argv[1]
-generated = {
-    "LITELLM_MASTER_KEY": "sk-admin-" + secrets.token_hex(24),
-    "TEAM_ENGINEERING_KEY": "sk-eng-" + secrets.token_hex(20),
-    "TEAM_RESEARCH_KEY": "sk-res-" + secrets.token_hex(20),
-    "TEAM_CI_KEY": "sk-ci-" + secrets.token_hex(20),
-    "POSTGRES_PASSWORD": secrets.token_hex(24),
-    "REDIS_PASSWORD": secrets.token_hex(24),
-    "NEXTAUTH_SECRET": secrets.token_hex(32),
-    "LANGFUSE_SALT": secrets.token_hex(32),
-    "CLICKHOUSE_PASSWORD": secrets.token_hex(24),
-    "MINIO_ROOT_PASSWORD": secrets.token_hex(24),
-    "GF_SECURITY_ADMIN_PASSWORD": secrets.token_urlsafe(18),
-}
-lines = []
-for line in open(path, encoding="utf-8").read().splitlines():
-    key = line.split("=", 1)[0].strip()
-    lines.append(f"{key}={generated.pop(key)}" if key in generated and "=" in line else line)
-lines += [f"{k}={v}" for k, v in generated.items()]
-open(path, "w", encoding="utf-8").write("\n".join(lines) + "\n")
-PYEOF
-}
-
 echo -e "${CYAN}${BOLD}"
 echo "=============================================================================="
 echo "    🚀 ENTERPRISE LLMOps PRODUCTION PLATFORM: MASTER RUNNER (LEVEL 4/5)      "
@@ -154,37 +143,26 @@ echo -e "  ${GREEN}✓${NC} Docker daemon is active and responsive."
 eval "$(python3 scripts/detect_hardware.py --env)"
 
 if [ -n "$FORCE_MODE" ]; then
-    TARGET_BACKEND="$FORCE_MODE"
-    echo -e "  ${YELLOW}ℹ Override:${NC} Manually forced backend: ${TARGET_BACKEND}"
+    case "$FORCE_MODE" in
+        cuda|rocm|cpu|metal|mock) TARGET_BACKEND="$FORCE_MODE" ;;
+        *) echo -e "${RED}❌ Unknown platform '$FORCE_MODE' (cuda | rocm | cpu | metal | mock)${NC}"; exit 1 ;;
+    esac
+    echo -e "  ${YELLOW}ℹ Override:${NC} Manually forced platform: ${TARGET_BACKEND}"
 fi
 
 case "$TARGET_BACKEND" in
-    metal)
-        echo -e "  ${GREEN}${BOLD}🍏 Apple Silicon Metal Acceleration Detected!${NC}"
-        echo -e "  • ${BOLD}Hardware:${NC} $HARDWARE_SUMMARY"
-        echo -e "  • ${BOLD}Memory Architecture:${NC} Unified Memory (Zero-Copy Shared CPU/Metal Pool)"
-        echo -e "  • ${BOLD}Backend Stack:${NC} vLLM-Metal (Apple MLX + PagedAttention Scheduler)"
-        echo -e "  • ${BOLD}Serving Profile:${NC} config/profiles/apple-silicon-metal.yaml"
-        echo -e "  • ${BOLD}Target Model:${NC} $RECOMMENDED_MODEL"
-        COMPOSE_FILES=("-f" "docker-compose.yml" "-f" "docker-compose.cpu.yml")
-        ;;
-    cuda)
-        echo -e "  ${GREEN}${BOLD}🚀 NVIDIA CUDA Hardware Acceleration Detected!${NC}"
-        echo -e "  • ${BOLD}Hardware:${NC} $HARDWARE_SUMMARY"
-        echo -e "  • ${BOLD}Memory Architecture:${NC} Dedicated VRAM Pool + PagedAttention"
-        echo -e "  • ${BOLD}Backend Stack:${NC} vLLM Native CUDA Engine & NVIDIA DCGM Exporter"
-        echo -e "  • ${BOLD}Serving Profile:${NC} config/profiles/$HARDWARE_PROFILE"
-        echo -e "  • ${BOLD}Recommended Model:${NC} $RECOMMENDED_MODEL"
-        COMPOSE_FILES=("-f" "docker-compose.yml" "-f" "docker-compose.gpu.yml")
-        ;;
-    *)
-        echo -e "  ${YELLOW}${BOLD}💻 Generic CPU Architecture Detected!${NC}"
-        echo -e "  • ${BOLD}Hardware:${NC} $HARDWARE_SUMMARY"
-        echo -e "  • ${BOLD}Serving Profile:${NC} config/profiles/edge-cpu-llamacpp.yaml"
-        echo -e "  • ${BOLD}Execution Mode:${NC} Architecture Emulation & Dev Tier"
-        COMPOSE_FILES=("-f" "docker-compose.yml" "-f" "docker-compose.cpu.yml")
-        ;;
+    cuda)  COMPOSE_OVERLAY="docker-compose.gpu.yml";   PLATFORM_LABEL="🚀 NVIDIA CUDA (vllm/vllm-openai + DCGM)" ;;
+    rocm)  COMPOSE_OVERLAY="docker-compose.rocm.yml";  PLATFORM_LABEL="🔥 AMD ROCm (vllm/vllm-openai-rocm)" ;;
+    metal) COMPOSE_OVERLAY="docker-compose.metal.yml"; PLATFORM_LABEL="🍏 Apple Silicon Metal (native vllm-metal, bridged)" ;;
+    mock)  COMPOSE_OVERLAY="docker-compose.mock.yml";  PLATFORM_LABEL="🧪 Mock engine (no inference)" ;;
+    *)     TARGET_BACKEND="cpu"; COMPOSE_OVERLAY="docker-compose.cpu.yml"; PLATFORM_LABEL="💻 CPU (vllm/vllm-openai-cpu)" ;;
 esac
+COMPOSE_FILES=("-f" "docker-compose.yml" "-f" "$COMPOSE_OVERLAY")
+export LLMOPS_PLATFORM="$TARGET_BACKEND"
+echo -e "  ${GREEN}${BOLD}${PLATFORM_LABEL}${NC}"
+echo -e "  • ${BOLD}Hardware:${NC} $HARDWARE_SUMMARY"
+echo -e "  • ${BOLD}Compose:${NC} docker-compose.yml + ${COMPOSE_OVERLAY}"
+echo -e "  • ${BOLD}Recommended Preset:${NC} $RECOMMENDED_PRESET"
 
 # ------------------------------------------------------------------------------
 # STEP 2: Configuration & Secrets Initialization
@@ -197,10 +175,14 @@ if [ ! -f ".env" ]; then
         echo -e "  ${RED}⚠ Existing volume llmops_postgres_data was initialised with the OLD Postgres password.${NC}"
         echo -e "  ${RED}  Restore the previous .env, or drop the volume: docker volume rm llmops_postgres_data${NC}"
     fi
-    cp .env.example .env
-    generate_secrets
-    chmod 600 .env
+    python3 scripts/init_env.py >/dev/null
     echo -e "  ${GREEN}✓${NC} Generated unique master key, team virtual keys, DB/cache passwords & Grafana admin password."
+    # First boot: size the model to the hardware unless one was requested explicitly.
+    [ -z "$MODEL_ARG" ] && [ "$TARGET_BACKEND" != "mock" ] && MODEL_ARG="$RECOMMENDED_PRESET"
+fi
+if [ -n "$MODEL_ARG" ]; then
+    echo -e "  • Configuring served model: ${BOLD}${MODEL_ARG}${NC}"
+    python3 scripts/configure_model.py "$MODEL_ARG" | sed 's/^/    /'
 fi
 set -a
 # shellcheck disable=SC1091
@@ -208,6 +190,7 @@ source "$ROOT_DIR/.env"
 set +a
 echo -e "  ${GREEN}✓${NC} Environment secrets loaded from .env (model: ${MODEL_NAME:-unset} as '${SERVED_MODEL_NAME:-unset}')"
 GATEWAY_MODEL="${GATEWAY_MODEL:-${SERVED_MODEL_NAME:-qwen3.5-9b}}"
+export LLMOPS_PLATFORM="$TARGET_BACKEND"  # re-export: .env must not override the detected platform
 
 # Ensure host cache directory exists (bind-mounted into the engine)
 mkdir -p "${HF_CACHE_DIR:-$HOME/.cache/huggingface}"
@@ -227,11 +210,10 @@ else
     # ------------------------------------------------------------------------------
     echo -e "\n${BLUE}${BOLD}[4/10] Pulling pinned images & building local microservices...${NC}"
     docker compose "${COMPOSE_FILES[@]}" pull --quiet --ignore-buildable
-    if [ "$TARGET_BACKEND" = "cuda" ]; then
-        docker compose "${COMPOSE_FILES[@]}" build --quiet kv-router
-    else
-        docker compose "${COMPOSE_FILES[@]}" build --quiet kv-router vllm dcgm-exporter
-    fi
+    BUILD_SERVICES=(kv-router)
+    [ "$TARGET_BACKEND" = "mock" ] && BUILD_SERVICES+=(vllm)
+    [ "$TARGET_BACKEND" != "cuda" ] && BUILD_SERVICES+=(dcgm-exporter)
+    docker compose "${COMPOSE_FILES[@]}" build --quiet "${BUILD_SERVICES[@]}"
     echo -e "  ${GREEN}✓${NC} Container images ready."
 
     # ------------------------------------------------------------------------------
@@ -245,6 +227,11 @@ else
     # STEP 6: Start the Inference Engine (loads in the background)
     # ------------------------------------------------------------------------------
     echo -e "\n${BLUE}${BOLD}[6/10] Starting Inference Engine (vLLM: ${MODEL_NAME:-default model})...${NC}"
+    if [ "$TARGET_BACKEND" = "metal" ] && ! curl -sf "http://localhost:${METAL_ENGINE_PORT:-8000}/health" >/dev/null 2>&1; then
+        echo -e "  ${RED}✗ No native engine on :${METAL_ENGINE_PORT:-8000}. Docker cannot reach the Metal GPU, so start it on macOS first:${NC}"
+        echo -e "    ${YELLOW}python3 scripts/serve_metal.py${NC}   (serves MODEL_NAME from .env with vllm-metal), then re-run."
+        exit 1
+    fi
     docker compose "${COMPOSE_FILES[@]}" up -d vllm
     echo -e "  ${GREEN}✓${NC} Engine container started; continuing while the model loads."
 
@@ -268,6 +255,19 @@ else
     wait_for_engine
     wait_for "KV-Aware Router backend health (:8001)" 60 \
         sh -c "curl -sf http://localhost:8001/health | grep -q '\"status\": \"ok\"'"
+
+    # The first request after boot pays one-time kernel JIT / graph warm-up (seconds on
+    # GPU, ~1 min on CPU). Absorb it here so users and latency gates see steady state.
+    echo -n "  Warming up the engine with one request..."
+    python3 - <<'PYWARM'
+import os, sys, time
+sys.path.insert(0, "scripts")
+from llmops_client import chat
+res = chat([{"role": "user", "content": "Say OK."}], model=os.environ.get("SERVED_MODEL_NAME", "qwen3.5-9b"),
+           url=f"http://localhost:{os.environ.get('VLLM_PORT', '8000')}/v1/chat/completions",
+           api_key="warmup", max_tokens=8, timeout=900)
+print(f" {'done' if res.ok else 'FAILED: ' + res.error[:200]} ({res.total:.1f}s)")
+PYWARM
 fi
 
 # ------------------------------------------------------------------------------
@@ -315,7 +315,11 @@ echo ""
 echo -e "  ${BOLD}Hardware Diagnostic Summary:${NC}"
 echo -e "  • ${PURPLE}Detected Architecture${NC} : $HARDWARE_SUMMARY"
 echo -e "  • ${PURPLE}Active Backend Profile${NC}: config/profiles/$HARDWARE_PROFILE"
-echo -e "  • ${PURPLE}Served Model          ${NC}: ${MODEL_NAME:-?} (gateway aliases: ${GATEWAY_MODEL}, ${GATEWAY_MODEL}-thinking, ${GATEWAY_MODEL}-direct)"
+THINKING_ALIAS=""
+[ "${MODEL_SUPPORTS_REASONING:-false}" = "true" ] && THINKING_ALIAS=", ${GATEWAY_MODEL}-thinking"
+echo -e "  • ${PURPLE}Platform              ${NC}: ${TARGET_BACKEND} (${COMPOSE_OVERLAY})"
+echo -e "  • ${PURPLE}Served Model          ${NC}: ${MODEL_NAME:-?} (gateway aliases: ${GATEWAY_MODEL}, ${GATEWAY_MODEL}-direct${THINKING_ALIAS})"
+echo -e "  • ${PURPLE}Switch Model          ${NC}: ./run_all.sh --model <preset | any/hf-repo>"
 echo ""
 echo -e "  ${BOLD}Interactive Service Endpoints (bound to ${BIND_ADDRESS:-127.0.0.1}):${NC}"
 echo -e "  • ${CYAN}Grafana Dashboard${NC}     : http://localhost:${GRAFANA_PORT:-3001}  (User: ${GF_SECURITY_ADMIN_USER:-admin} / Pass: GF_SECURITY_ADMIN_PASSWORD in .env)"

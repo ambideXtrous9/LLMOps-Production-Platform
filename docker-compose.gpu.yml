@@ -1,72 +1,36 @@
 # ==============================================================================
-# NVIDIA CUDA GPU Acceleration Compose Overlay
+# NVIDIA CUDA Platform Overlay
 # ==============================================================================
 # Applied automatically by run_all.sh when an NVIDIA GPU with container runtime is
-# detected. Replaces the emulated engine with the native vLLM CUDA server and the
-# mock DCGM exporter with NVIDIA's DCGM exporter.
+# detected (fresh host: run scripts/bootstrap_host.sh first). The engine command and
+# model come from docker-compose.yml + .env; this overlay only adds the CUDA image,
+# the GPU reservation and NVIDIA's DCGM exporter.
 #
-# Default model: Qwen/Qwen3.5-9B (BF16, hybrid Gated DeltaNet + Gated Attention,
-# vision-language, 262K native context). Sized for one 40-80 GB datacenter GPU
-# (A100 / L40S / H100). Model-specific flags live in VLLM_MODEL_ARGS (.env) so a
-# model swap is a .env change, not a compose change.
-#
-# First boot downloads ~19 GB of weights and compiles CUDA graphs (5-10 min);
-# torch.compile / Triton caches are kept in named volumes so restarts are fast.
+# First boot downloads the weights and compiles CUDA graphs (several minutes);
+# torch.compile / Triton caches live in named volumes so restarts are fast.
 # ==============================================================================
 
 services:
   vllm:
-    image: vllm/vllm-openai:${VLLM_IMAGE_TAG:-v0.31.0}
-    build: !reset null
-    # The image ENTRYPOINT is `vllm serve`, so the first argument is the model.
-    command: >
-      ${MODEL_NAME:-Qwen/Qwen3.5-9B}
-      --revision ${MODEL_REVISION:-main}
-      --served-model-name ${SERVED_MODEL_NAME:-qwen3.5-9b}
-      --dtype auto
-      --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION:-0.90}
-      --max-model-len ${MAX_MODEL_LEN:-131072}
-      --enable-prefix-caching
-      --otlp-traces-endpoint http://alloy:4317
-      --disable-access-log-for-endpoints /health,/metrics
-      --host 0.0.0.0
-      --port 8000
-      ${VLLM_MODEL_ARGS:-}
-      ${VLLM_EXTRA_ARGS:-}
-    environment:
-      - HF_TOKEN=${HF_TOKEN:-}
-      - OTEL_SERVICE_NAME=vllm-engine
-    volumes:
-      - vllm_compile_cache:/root/.cache/vllm
-      - vllm_triton_cache:/root/.triton
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 6
-      # Weight download + CUDA graph capture can take several minutes on first boot.
-      start_period: 1200s
+    image: vllm/vllm-openai:${VLLM_VERSION:-v0.31.0}
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              count: ${GPU_COUNT:-1}
               capabilities: [gpu]
 
   dcgm-exporter:
     image: nvcr.io/nvidia/k8s/dcgm-exporter:${DCGM_EXPORTER_TAG:-4.5.2-4.8.1-ubuntu22.04}
     build: !reset null
+    environment: !reset []
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              count: all
               capabilities: [gpu]
     cap_add:
       - SYS_ADMIN
-
-volumes:
-  vllm_compile_cache:
-  vllm_triton_cache:

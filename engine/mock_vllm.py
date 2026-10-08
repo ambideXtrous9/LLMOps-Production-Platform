@@ -21,7 +21,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] [vLL
 logger = logging.getLogger("vllm-engine")
 
 PORT = int(os.getenv("PORT", "8000"))
-MODEL_NAME = os.getenv("MODEL_NAME", "qwen3.5-9b")
+MODEL_NAME = os.getenv("SERVED_MODEL_NAME") or os.getenv("MODEL_NAME", "qwen3.5-9b")
 
 # Telemetry counters
 METRICS = {

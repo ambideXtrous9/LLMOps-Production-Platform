@@ -1,9 +1,15 @@
 # ==============================================================================
 # LLMOps Production Platform - Base Service Topology
 # ==============================================================================
-# Overlays:
-#   docker-compose.gpu.yml          NVIDIA CUDA: native vLLM + DCGM exporter
-#   docker-compose.cpu.yml          CPU / laptop: emulated engine + mock DCGM
+# The same architecture runs on every platform. The engine is vLLM everywhere and
+# is driven only by the model block in .env (any Hugging Face model; see
+# scripts/configure_model.py). Platform overlays swap just the engine image and
+# device wiring:
+#   docker-compose.gpu.yml    NVIDIA CUDA  (vllm/vllm-openai)       + NVIDIA DCGM exporter
+#   docker-compose.rocm.yml   AMD ROCm     (vllm/vllm-openai-rocm)
+#   docker-compose.cpu.yml    x86_64/arm64 CPU (vllm/vllm-openai-cpu)
+#   docker-compose.metal.yml  Apple Silicon: native vllm-metal on macOS, bridged in
+#   docker-compose.mock.yml   no inference at all: emulated engine for UI / pipeline dev
 #   docker-compose.langfuse-v3.yml  Langfuse v3 (ClickHouse + MinIO + worker)
 #
 # Network exposure: every host port binds to BIND_ADDRESS (default 127.0.0.1) so
@@ -20,27 +26,47 @@ services:
   # 1. INFERENCE ENGINE (Plane 2: GPU Inference Plane)
   # ============================================================================
   vllm:
-    build:
-      context: ./engine
-      dockerfile: Dockerfile
-    image: llmops-vllm-engine:latest
+    # Overlays replace only the image & device wiring (cuda | rocm | cpu | metal | mock).
+    image: vllm/vllm-openai:${VLLM_VERSION:-v0.31.0}
     container_name: vllm-inference
     ipc: host
     ports:
       - "${BIND_ADDRESS:-127.0.0.1}:${VLLM_PORT:-8000}:8000"
     volumes:
       - ${HF_CACHE_DIR:-~/.cache/huggingface}:/root/.cache/huggingface
+      # torch.compile / Triton kernel caches: warm restarts skip recompilation
+      - vllm_compile_cache:/root/.cache/vllm
+      - vllm_triton_cache:/root/.triton
     environment:
+      - HF_TOKEN=${HF_TOKEN:-}
       - HF_HUB_ENABLE_HF_TRANSFER=0
-      - OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4318
-      - MODEL_NAME=${SERVED_MODEL_NAME:-qwen3.5-9b}
+      - OTEL_SERVICE_NAME=vllm-engine
+      - SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-qwen3.5-9b}
+    # The image ENTRYPOINT is `vllm serve`, so the first argument is the model:
+    # any Hugging Face repo id (or a local directory under HF_CACHE_DIR).
+    command: >
+      ${MODEL_NAME:-Qwen/Qwen3.5-9B}
+      --revision ${MODEL_REVISION:-main}
+      --served-model-name ${SERVED_MODEL_NAME:-qwen3.5-9b}
+      --dtype ${MODEL_DTYPE:-auto}
+      --max-model-len ${MAX_MODEL_LEN:-auto}
+      --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION:-0.90}
+      --enable-prefix-caching
+      --otlp-traces-endpoint http://alloy:4317
+      --disable-access-log-for-endpoints /health,/metrics
+      --host 0.0.0.0
+      --port 8000
+      ${VLLM_MODEL_ARGS:-}
+      ${VLLM_EXTRA_ARGS:-}
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 5s
+      # python3 ships in every vLLM image (cuda/rocm/cpu); curl is not guaranteed
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=4)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      # Weight download + CUDA graph capture can take several minutes on first boot.
+      start_period: 1200s
     networks:
       - llmops-net
 
@@ -79,6 +105,7 @@ services:
       - "${GATEWAY_BIND_ADDRESS:-127.0.0.1}:${LITELLM_PORT:-4000}:4000"
     volumes:
       - ./config/litellm.yaml:/app/config.yaml:ro
+      - ./config/render_litellm_config.py:/app/render_litellm_config.py:ro
       - ./config/pii_guardrail.py:/app/pii_guardrail.py:ro
     environment:
       - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-admin-master-sec-9a8b7c6d5e4f3a2b1c0d}
@@ -89,10 +116,21 @@ services:
       # OTLP/HTTP -> Alloy -> Tempo (LiteLLM infers the otlp_http exporter from the endpoint)
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4318
       - OTEL_SERVICE_NAME=litellm-gateway
-    command: >
-      --config /app/config.yaml
-      --port 4000
-      --num_workers ${LITELLM_NUM_WORKERS:-2}
+      # Engine model settings -> generated gateway routes (config/render_litellm_config.py)
+      - SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-qwen3.5-9b}
+      - MAX_MODEL_LEN=${MAX_MODEL_LEN:-auto}
+      - MODEL_SUPPORTS_REASONING=${MODEL_SUPPORTS_REASONING:-false}
+      - MODEL_SUPPORTS_TOOLS=${MODEL_SUPPORTS_TOOLS:-false}
+      - MODEL_SUPPORTS_VISION=${MODEL_SUPPORTS_VISION:-false}
+      - MODEL_THINKING_EXTRA_BODY=${MODEL_THINKING_EXTRA_BODY:-}
+      - MODEL_INPUT_COST_PER_TOKEN=${MODEL_INPUT_COST_PER_TOKEN:-0.0000001}
+      - MODEL_OUTPUT_COST_PER_TOKEN=${MODEL_OUTPUT_COST_PER_TOKEN:-0.0000004}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - python3 /app/render_litellm_config.py /app/config.yaml /app/litellm.generated.yaml && exec docker/prod_entrypoint.sh "$$@"
+      - litellm-entrypoint
+    command: ["--config", "/app/litellm.generated.yaml", "--port", "4000", "--num_workers", "${LITELLM_NUM_WORKERS:-2}"]
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness', timeout=3)\""]
       interval: 10s
@@ -272,11 +310,17 @@ services:
   # 12. HARDWARE TELEMETRY AGENT (Plane 4: NVIDIA DCGM Exporter)
   # ============================================================================
   dcgm-exporter:
+    # Non-NVIDIA platforms: a stub that reports the platform and no GPU samples, so GPU
+    # panels show "No data" instead of invented numbers. The gpu overlay swaps in NVIDIA
+    # DCGM; the mock overlay switches the stub to synthetic GPU telemetry.
     build:
       context: ./engine
       dockerfile: Dockerfile.dcgm
-    image: llmops-dcgm-exporter:latest
+    image: llmops-hw-exporter:latest
     container_name: dcgm-hardware-exporter
+    environment:
+      - GPU_TELEMETRY_MODE=none
+      - LLMOPS_PLATFORM=${LLMOPS_PLATFORM:-unknown}
     ports:
       - "${BIND_ADDRESS:-127.0.0.1}:9400:9400"
     restart: unless-stopped
@@ -331,6 +375,8 @@ services:
 volumes:
   postgres_data:
   prometheus_data:
+  vllm_compile_cache:
+  vllm_triton_cache:
 
 networks:
   llmops-net:
