@@ -216,7 +216,9 @@ Client App       LiteLLM (:4000)     KV Router (:8001)      vLLM (:8000)       P
 ```text
 ┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ namespace: llmops                                                                                     │
-│  ┌──────────────┐      ┌────────────────┐      ┌────────────────┐   OTLP      ┌────────────────┐      │
+│       ┌─────────────────────────────── OTLP :4318 ────────────────────────────────────┐               │
+│       │    ┌────── <name>-direct fallback ─────────────┐                              │               │
+│  ┌────┴────┴────┐      ┌────────────────┐      ┌───────▼────────┐ OTLP :4317  ┌───────▼────────┐      │
 │  │ litellm ×2   │─────>│ kv-router ×2   │─────>│ vllm ×1…8      │────────────>│ tempo          │      │
 │  └──────┬───────┘      └────────────────┘      └────────────┬───┘             └────────────────┘      │
 │         │                           scale replicas   ▲      │ /metrics                                │
@@ -231,6 +233,7 @@ Client App       LiteLLM (:4000)     KV Router (:8001)      vLLM (:8000)       P
 │                                                    └──────────────────┘                               │
 │                                                                                                       │
 └───────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ Not in k8s/base: Grafana · Loki · Langfuse (cluster-wide) · Alloy DaemonSet in k8s/extras/
 ```
 
 ---
@@ -528,7 +531,7 @@ client.chat.completions.create(model="qwen3.5-9b", messages=[{"role": "user", "c
 | `k8s/extras/` | Argo Rollouts canary · Karpenter · Gateway API · Alloy · kind |
 
 - **Same inputs as Compose** — model block + secrets from `.env`; configs from the repo.
-- **Cluster-wide services** — Grafana, Loki and Langfuse; set `LANGFUSE_HOST` + keys to send traces.
+- **Not in the base** — Grafana, Loki, Langfuse (use cluster-wide instances). For LLM traces, add `LANGFUSE_HOST`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` to the LiteLLM env in `k8s/base/litellm.yaml`.
 
 ### 11.3 Single-Node Test Cluster (k3s)
 
