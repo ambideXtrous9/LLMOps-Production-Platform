@@ -55,7 +55,7 @@
 │    LiteLLM AI Gateway (:4000) - routes rendered from the .env model block                             │
 │    • Team Virtual Keys (Postgres)   • Spend Limits & Budgets         • PII Masking Guardrail          │
 │    • Redis Rate-Limit Sync          • Redis Response Cache           • traceparent Forwarded          │
-│                                                                                                       │
+│    • Aliases: <name> → router · <name>-thinking → router · <name>-direct → vLLM (fallback)            │
 │    KV-Cache-Aware Router (:8001)                                                                      │
 │    • Prefix-Hash Affinity           • Health-Tracked Backends        • Streaming Pass-Through         │
 └──────────────────┬───────────────────────────────────────────────────┬────────────────────────────────┘
@@ -75,25 +75,25 @@
            ▼                                                                  ▼
 ┌──────────────────────────────────────────────────┐ ┌──────────────────────────────────────────────────┐
 │ 5. LOGS & TRACES PLANE                           │ │ 3. METRICS & ALERTING PLANE                      │
-│    Grafana Alloy (:12345)                        │ │    Prometheus (:9090)                            │
-│    • Docker Log Collection + OTLP Receiver       │ │    • Golden-Signal Recording Rules:              │
-│                                                  │ │      TTFT · ITL · KV-Cache % · Queue Backlog     │
-│    Grafana Loki (:3100)                          │ │      Prefix-Cache Hit Rate · Gateway Errors      │
+│    Grafana Alloy (:12345)                        │ │    Prometheus (:9090) - 15 s scrape:             │
+│    • Docker Logs + OTLP from Gateway & Engine    │ │    vLLM :8000 · LiteLLM :9095 · router · Plane 4 │
+│                                                  │ │    • Golden Signals: TTFT · ITL · KV-Cache %     │
+│    Grafana Loki (:3100)                          │ │      Queue Backlog · Prefix-Cache Hits · Errors  │
 │    • LogQL Log Storage                           │ │                                                  │
 │                                                  │ │    Alertmanager (:9093)                          │
-│    Grafana Tempo (:3200)                         │ │    • Multi-Window SLO Burn-Rate Alerts           │
+│    Grafana Tempo (:3200)                         │ │    • SLO Burn-Rate Alerts (fast + slow window)   │
 │    • One Trace Spans Gateway + Engine            │ │    • Saturation & GPU Thermal Alerts             │
 └───────────────┬──────────────────────────────────┘ └──────────────────────────────────┬───────────────┘
                 │ LogQL · TraceQL                           ▲                           │ PromQL
                 │ PromQL                                    │ scraped                   │ polling
                 ▼                                                                       ▼
 ┌────────────────────────────────┐ ┌────────────────────────┴──────┐ ┌──────────────────────────────────┐
-│ 7. VISUALIZATION PLANE         │ │ 4. HARDWARE TELEMETRY PLANE   │ │ 8. AUTOSCALING PLANE (KEDA)      │
+│ 7. VISUALIZATION PLANE         │ │ 4. HARDWARE TELEMETRY PLANE   │ │ 8. AUTOSCALING (KEDA · k8s only) │
 │    Grafana (:3001)             │ │    • NVIDIA DCGM (:9400)      │ │    • Reads Prometheus Directly   │
 │    • Dashboards Only           │ │      GPU util · VRAM · temp   │ │    • Queue Backlog / Replica > 4 │
 │      (no control-loop role)    │ │    • node-exporter (:9100)    │ │    • KV-Cache Saturation > 80 %  │
 │    • SLOs, Engine, GPU, Cost   │ │      CPU · RAM · disk · net   │ │    • 300 s Scale-Down Window     │
-│    • Loki → Tempo Deep Links   │ │    • Platform stub off-NVIDIA │ │    • Karpenter Adds GPU Nodes    │
+│    • Loki → Tempo Deep Links   │ │    • Platform stub off-NVIDIA │ │    • Karpenter GPU Nodes (EKS)   │
 │                                │ │                               │ │                                  │
 └────────────────────────────────┘ └───────────────────────────────┘ └──────────────────────────────────┘
 
@@ -119,7 +119,7 @@
 | 5 | Logs & Traces | Alloy, Loki, Tempo | container logs · OTLP traces |
 | 6 | LLM Observability | Langfuse v4 (ClickHouse, MinIO) | prompts · completions · cost · judge scores |
 | 7 | Visualization | Grafana | dashboards only — never in a control loop |
-| 8 | Autoscaling | KEDA | scale vLLM on saturation signals |
+| 8 | Autoscaling | KEDA (Kubernetes only) | scale vLLM on saturation signals |
 | 9 | Model Lifecycle | model block, presets, eval gate, judge, Argo Rollouts | qualify and promote models |
 
 ### 2.3 End-to-End Request & Control Lifecycle
@@ -146,8 +146,9 @@ Client App       LiteLLM (:4000)     KV Router (:8001)      vLLM (:8000)       P
 11  │                   │                    │                    │┄┄ OTLP spans + logs ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄>│                 │
 12  │                   │┄┄ prompt · completion · tokens · cost ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄>│
 13  │                   │                    │                    │<┄┄ scrape 15 s ┄┄┄┄┄│                  │                │                 │
-14  │                   │                    │                    │                     │<┄┄ poll ┄┄┄┄┄┄┄┄┄│                │                 │
-15  │                   │                    │                    │<── scale 1..N ─────────────────────────│                │                 │
+14  │                   │<┄┄ scrape :9095 (internal) ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄│                  │                │                 │
+15  │                   │                    │                    │                     │<┄┄ poll (k8s) ┄┄┄│                │                 │
+16  │                   │                    │                    │<── scale 1..N (k8s) ───────────────────│                │                 │
     │                   │                    │                    │                     │                  │                │                 │
 ```
 
@@ -197,6 +198,7 @@ Client App       LiteLLM (:4000)     KV Router (:8001)      vLLM (:8000)       P
 │ Gateway + UI   :4000   GATEWAY_BIND_ADDRESS      │ │ vLLM :8000 · KV router :8001                     │
 │ Grafana        :3001   UI_BIND_ADDRESS           │ │ Prometheus :9090 · Alertmanager :9093            │
 │ Langfuse       :3000   UI_BIND_ADDRESS           │ │ Loki :3100 · Tempo :3200 · Alloy :12345          │
+│                                                  │ │ OTLP :4317/:4318 · DCGM :9400 · node :9100       │
 │                                                  │ │ Postgres :5432 · Redis :6379                     │
 └──────────────────────────────────────────────────┘ └──────────────────────────────────────────────────┘
 
@@ -221,8 +223,8 @@ Client App       LiteLLM (:4000)     KV Router (:8001)      vLLM (:8000)       P
 │         │                         ┌──────────────────┘      │                                         │
 │         ▼                         │                         ▼                                         │
 │ ┌───────────────────┐     ┌───────┴────────┐       ┌──────────────────┐                               │
-│ │ postgres · redis  │     │ KEDA           │<──────│ prometheus       │                               │
-│ └───────────────────┘     └────────────────┘       └────────┬─────────┘                               │
+│ │ postgres · redis  │     │ KEDA           │<──────│ prometheus       │ also scrapes litellm          │
+│ └───────────────────┘     └────────────────┘       └────────┬─────────┘ :9095 + kv-router, per pod    │
 │                          backlog > 4 · KV > 80 %            ▼                                         │
 │                                                    ┌──────────────────┐                               │
 │                                                    │ alertmanager     │                               │
