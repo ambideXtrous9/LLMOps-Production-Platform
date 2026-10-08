@@ -44,8 +44,12 @@ litellm_settings:
   # Internal Prometheus scraper access within docker network
   require_auth_for_metrics_endpoint: false
 
-  # Multi-telemetry egress (Prometheus golden signals + OTLP traces via Alloy -> Tempo)
-  callbacks: ["prometheus", "otel"]
+  # Multi-telemetry egress: Prometheus golden signals, OTLP spans via Alloy -> Tempo,
+  # and LLM traces (prompts, completions, tokens, cost) to Langfuse over OTLP
+  callbacks: ["prometheus", "otel", "langfuse_otel"]
+  # Pass the caller's W3C traceparent on to the router / vLLM so engine spans join the
+  # same Tempo trace as the gateway spans (LiteLLM's default is to drop it).
+  forward_traceparent_to_llm_provider: true
 
   # Distributed Redis exact-response cache (connection from REDIS_URL).
   # Clients bypass it per request with {"cache": {"no-cache": true}}.

@@ -16,7 +16,8 @@ non-zero when any check fails, so it can gate deployments and CI:
   8. Prometheus targets, recording rules & engine metrics      (Plane 3/4)
   9. Alertmanager readiness                                    (Plane 3)
  10. Alloy / Tempo / Loki + W3C trace-id round trip into Tempo  (Plane 5)
- 11. Grafana health & provisioned datasources                  (Plane 7)
+ 11. Langfuse: gateway requests land as LLM traces             (Plane 6)
+ 12. Grafana health & provisioned datasources                  (Plane 7)
 
 Capability-specific checks follow the model block in .env (MODEL_SUPPORTS_*), so
 the same suite validates any served Hugging Face model.
@@ -45,10 +46,12 @@ TEMPO_URL = os.getenv("TEMPO_URL", "http://localhost:3200")
 ALLOY_URL = os.getenv("ALLOY_URL", "http://localhost:12345")
 LOKI_URL = os.getenv("LOKI_URL", "http://localhost:3100")
 GRAFANA_URL = os.getenv("GRAFANA_URL", "http://localhost:3001")
+LANGFUSE_URL = os.getenv("LANGFUSE_URL", "http://localhost:3000")
 SERVED_MODEL = os.getenv("SERVED_MODEL_NAME", GATEWAY_MODEL)
 
 TRACE_ID = os.urandom(16).hex()
 TRACEPARENT = f"00-{TRACE_ID}-{os.urandom(8).hex()}-01"
+SUITE_START = time.time()
 
 
 def ok(msg: str) -> None:
@@ -233,20 +236,29 @@ def test_telemetry_alloy_tempo_loki() -> bool:
 
     # The gateway continues the caller's W3C trace, so the trace id we injected in
     # check 3 must show up in Tempo once spans are flushed (OTLP batch + Alloy batch).
+    # Engines on cuda / rocm / cpu export OTLP spans; mock and native metal may not.
+    engine_exports_spans = os.getenv("LLMOPS_PLATFORM", "") in ("cuda", "rocm", "cpu")
+    wanted = {"litellm-gateway", "vllm-engine"} if engine_exports_spans else {"litellm-gateway"}
     services: List[str] = []
-    for _ in range(15):
+    for _ in range(15):  # gateway and engine flush their span batches independently
         status, trace = http_json(f"{TEMPO_URL}/api/traces/{TRACE_ID}")
         if status == 200 and isinstance(trace, dict):
-            for batch in trace.get("batches", trace.get("resourceSpans", [])):
-                for attr in batch.get("resource", {}).get("attributes", []):
-                    if attr.get("key") == "service.name":
-                        services.append(attr.get("value", {}).get("stringValue", "?"))
-            break
+            services = [
+                attr.get("value", {}).get("stringValue", "?")
+                for batch in trace.get("batches", trace.get("resourceSpans", []))
+                for attr in batch.get("resource", {}).get("attributes", [])
+                if attr.get("key") == "service.name"
+            ]
+            if wanted <= set(services):
+                break
         time.sleep(2)
-    if services:
-        ok(f"trace {TRACE_ID[:12]}... found in Tempo (services: {sorted(set(services))})")
+    found = sorted(set(services))
+    if not services:
+        passed = fail(f"trace {TRACE_ID[:12]}... never reached Tempo (OTLP export broken)")
+    elif engine_exports_spans and "vllm-engine" not in found:
+        passed = fail(f"trace {TRACE_ID[:12]}... has {found} but no vllm-engine spans (traceparent not propagated)")
     else:
-        passed = fail(f"trace {TRACE_ID[:12]}... never reached Tempo (W3C propagation / OTLP export broken)")
+        ok(f"trace {TRACE_ID[:12]}... found in Tempo spanning {found}")
 
     query = urllib.parse.urlencode({"query": '{container="vllm-inference"}', "limit": 5, "since": "30m"})
     status, logs = http_json(f"{LOKI_URL}/loki/api/v1/query_range?{query}")
@@ -256,6 +268,32 @@ def test_telemetry_alloy_tempo_loki() -> bool:
     else:
         passed = fail("Loki has no vllm-inference log lines (Alloy docker log shipping broken)")
     return passed
+
+
+def test_langfuse() -> bool:
+    status, _ = http_json(f"{LANGFUSE_URL}/api/public/health")
+    if status != 200:
+        return fail(f"Langfuse unhealthy ({status})")
+    ok("Langfuse web + API healthy")
+    public, secret = os.getenv("LANGFUSE_PUBLIC_KEY", ""), os.getenv("LANGFUSE_SECRET_KEY", "")
+    auth = {"Authorization": "Basic " + base64.b64encode(f"{public}:{secret}".encode()).decode()}
+    # Ingestion is asynchronous (OTLP -> Redis queue -> worker -> ClickHouse). Langfuse v4
+    # serves reads from /api/public/v2/observations; v3 servers from /api/public/traces.
+    for _ in range(30):
+        status, page = http_json(f"{LANGFUSE_URL}/api/public/v2/observations?traceId={TRACE_ID}&limit=10", headers=auth)
+        if status in (401, 403):
+            return fail("Langfuse rejected the project API keys (LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY)")
+        if status == 200 and page.get("data"):
+            kinds = sorted({f"{o.get('type')}:{o.get('name')}" for o in page["data"]})
+            ok(f"trace {TRACE_ID[:12]}... ingested with the caller's W3C trace id ({', '.join(kinds)})")
+            return True
+        if status == 404:  # Langfuse v3
+            status, trace = http_json(f"{LANGFUSE_URL}/api/public/traces/{TRACE_ID}", headers=auth)
+            if status == 200:
+                ok(f"trace {TRACE_ID[:12]}... ingested with the caller's W3C trace id")
+                return True
+        time.sleep(2)
+    return fail("gateway trace never reached Langfuse within 60s (check litellm langfuse_otel callback / worker logs)")
 
 
 def test_grafana() -> bool:
@@ -287,6 +325,7 @@ CHECKS: List[Tuple[str, Callable[[], bool]]] = [
     ("Plane 3/4: Prometheus Targets, Rules & Metrics", test_prometheus_signals),
     ("Plane 3: Alertmanager", test_alertmanager),
     ("Plane 5: Alloy, Tempo & Loki Telemetry", test_telemetry_alloy_tempo_loki),
+    ("Plane 6: Langfuse LLM Tracing", test_langfuse),
     ("Plane 7: Grafana", test_grafana),
 ]
 

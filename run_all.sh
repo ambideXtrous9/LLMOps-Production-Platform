@@ -176,9 +176,13 @@ if [ ! -f ".env" ]; then
         echo -e "  ${RED}  Restore the previous .env, or drop the volume: docker volume rm llmops_postgres_data${NC}"
     fi
     python3 scripts/init_env.py >/dev/null
-    echo -e "  ${GREEN}✓${NC} Generated unique master key, team virtual keys, DB/cache passwords & Grafana admin password."
+    echo -e "  ${GREEN}✓${NC} Generated unique master key, team virtual keys, DB/cache/Langfuse secrets & admin passwords."
     # First boot: size the model to the hardware unless one was requested explicitly.
     [ -z "$MODEL_ARG" ] && [ "$TARGET_BACKEND" != "mock" ] && MODEL_ARG="$RECOMMENDED_PRESET"
+else
+    # Existing deployment: only back-fill secrets introduced by newer stack versions.
+    INIT_STATUS=$(python3 scripts/init_env.py)
+    [ "$INIT_STATUS" != "exists" ] && echo -e "  ${GREEN}✓${NC} .env ${INIT_STATUS}"
 fi
 if [ -n "$MODEL_ARG" ]; then
     echo -e "  • Configuring served model: ${BOLD}${MODEL_ARG}${NC}"
@@ -240,7 +244,7 @@ else
     # ------------------------------------------------------------------------------
     echo -e "\n${BLUE}${BOLD}[7/10] Starting AI Gateway & Observability Planes (Router, LiteLLM, Prometheus, Alloy, Tempo, Loki, Grafana, Langfuse)...${NC}"
     docker compose "${COMPOSE_FILES[@]}" up -d kv-router litellm prometheus alertmanager alloy tempo loki \
-        dcgm-exporter node-exporter grafana langfuse
+        dcgm-exporter node-exporter grafana langfuse langfuse-worker clickhouse minio
 
     # ------------------------------------------------------------------------------
     # STEP 8: Readiness Gates
@@ -251,6 +255,7 @@ else
     wait_for "Tempo (:3200)" 180 curl -sf "http://localhost:3200/ready"
     wait_for "Loki (:3100)" 180 curl -sf "http://localhost:${LOKI_PORT:-3100}/ready"
     wait_for "Grafana (:${GRAFANA_PORT:-3001})" 120 curl -sf "http://localhost:${GRAFANA_PORT:-3001}/api/health"
+    wait_for "Langfuse (:${LANGFUSE_PORT:-3000})" 300 curl -sf "http://localhost:${LANGFUSE_PORT:-3000}/api/public/health"
     wait_for "LiteLLM AI Gateway (:${LITELLM_PORT:-4000})" 300 curl -sf "http://localhost:${LITELLM_PORT:-4000}/health/liveliness"
     wait_for_engine
     wait_for "KV-Aware Router backend health (:8001)" 60 \
@@ -289,7 +294,9 @@ else
     python3 scripts/test_stack.py || FAILED_STAGES+=("test_stack")
 
     echo -e "\n${CYAN}>>> [B] Streaming Traffic Spike & KEDA Saturation Test...${NC}"
-    CONCURRENCY="${LOAD_TEST_CONCURRENCY:-32}" python3 scripts/load_test.py || FAILED_STAGES+=("load_test")
+    # CPU decode is bandwidth-bound: a smaller burst keeps the test meaningful, not minutes long.
+    DEFAULT_CONCURRENCY=32; [ "$TARGET_BACKEND" = "cpu" ] && DEFAULT_CONCURRENCY=8
+    CONCURRENCY="${LOAD_TEST_CONCURRENCY:-$DEFAULT_CONCURRENCY}" python3 scripts/load_test.py || FAILED_STAGES+=("load_test")
 
     echo -e "\n${CYAN}>>> [C] CI/CD Model Evaluation Gate (Plane 9)...${NC}"
     python3 scripts/eval_gate.py --model "$GATEWAY_MODEL" || FAILED_STAGES+=("eval_gate")
@@ -331,7 +338,7 @@ echo -e "  • ${CYAN}Alertmanager Engine${NC}   : http://localhost:${ALERTMANAG
 echo -e "  • ${CYAN}Grafana Tempo Tracing${NC} : http://localhost:3200"
 echo -e "  • ${CYAN}Grafana Alloy Agent${NC}   : http://localhost:12345"
 echo -e "  • ${CYAN}Grafana Loki Engine${NC}   : http://localhost:${LOKI_PORT:-3100}"
-echo -e "  • ${CYAN}Langfuse Server${NC}       : http://localhost:${LANGFUSE_PORT:-3000}"
+echo -e "  • ${CYAN}Langfuse (LLM traces)${NC} : http://localhost:${LANGFUSE_PORT:-3000}  (User: ${LANGFUSE_ADMIN_EMAIL:-admin@llmops.local} / Pass: LANGFUSE_ADMIN_PASSWORD in .env)"
 if [ -n "${SSH_CONNECTION:-}" ]; then
     echo ""
     echo -e "  ${BOLD}Remote host detected - open the UIs from your laptop through an SSH tunnel:${NC}"

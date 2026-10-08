@@ -61,6 +61,9 @@ SUPPORTS_REASONING = env_flag("MODEL_SUPPORTS_REASONING")
 REASONING_BY_DEFAULT = env_flag("MODEL_REASONING_BY_DEFAULT")
 SUPPORTS_TOOLS = env_flag("MODEL_SUPPORTS_TOOLS")
 SUPPORTS_VISION = env_flag("MODEL_SUPPORTS_VISION")
+# Models that always reason (e.g. gpt-oss) spend tokens before answering; give every
+# request this much extra budget so short-answer probes are not truncated mid-thought.
+REASONING_HEADROOM = int(os.getenv("REASONING_HEADROOM", "1024")) if REASONING_BY_DEFAULT else 0
 VIRTUAL_KEY = os.getenv("TEAM_ENGINEERING_KEY", "sk-eng-team-a1b2c3d4e5f6g7h8i9j0")
 MASTER_KEY = os.getenv("LITELLM_MASTER_KEY", "sk-admin-master-sec-9a8b7c6d5e4f3a2b1c0d")
 
@@ -135,7 +138,9 @@ def chat(
     timeout: float = 120.0,
 ) -> ChatResult:
     """Sends one chat completion and measures it end to end."""
-    payload: Dict[str, Any] = {"model": model, "messages": messages, "max_tokens": max_tokens, "stream": stream}
+    payload: Dict[str, Any] = {
+        "model": model, "messages": messages, "max_tokens": max_tokens + REASONING_HEADROOM, "stream": stream,
+    }
     if temperature is not None:
         payload["temperature"] = temperature
     if stream:

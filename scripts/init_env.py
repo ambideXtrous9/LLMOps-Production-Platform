@@ -2,10 +2,11 @@
 """
 scripts/init_env.py
 Creates the repo .env from .env.example on first use and replaces every well-known
-placeholder secret with a freshly generated random value. Idempotent: an existing
-.env is never modified. Used by run_all.sh and scripts/configure_model.py.
+placeholder secret with a freshly generated random value. On an existing .env it
+only appends secrets introduced by newer versions of the stack (existing values are
+never changed). Used by run_all.sh and scripts/configure_model.py.
 
-Usage: python3 scripts/init_env.py   (prints "created" or "exists")
+Usage: python3 scripts/init_env.py   (prints "created", "updated" or "exists")
 """
 
 import os
@@ -32,12 +33,29 @@ def generated_secrets() -> dict:
         "CLICKHOUSE_PASSWORD": secrets.token_hex(24),
         "MINIO_ROOT_PASSWORD": secrets.token_hex(24),
         "GF_SECURITY_ADMIN_PASSWORD": secrets.token_urlsafe(18),
+        "LANGFUSE_ENCRYPTION_KEY": secrets.token_hex(32),  # 256-bit, required by Langfuse v3+
+        "LANGFUSE_PUBLIC_KEY": "pk-lf-" + secrets.token_hex(16),
+        "LANGFUSE_SECRET_KEY": "sk-lf-" + secrets.token_hex(16),
+        "LANGFUSE_ADMIN_PASSWORD": secrets.token_urlsafe(18),
     }
+
+
+def add_missing_secrets() -> list:
+    """Appends generated values for secret keys an older .env does not define yet."""
+    with open(ENV_PATH, encoding="utf-8") as f:
+        present = {line.split("=", 1)[0].strip() for line in f if "=" in line and not line.lstrip().startswith("#")}
+    missing = {k: v for k, v in generated_secrets().items() if k not in present}
+    if missing:
+        with open(ENV_PATH, "a", encoding="utf-8") as f:
+            f.write("\n# --- Secrets added by scripts/init_env.py for newer stack components ---\n")
+            f.writelines(f"{key}={value}\n" for key, value in missing.items())
+    return sorted(missing)
 
 
 def ensure_env() -> bool:
     """Returns True when a new .env was created."""
     if os.path.exists(ENV_PATH):
+        add_missing_secrets()
         return False
     shutil.copyfile(EXAMPLE_PATH, ENV_PATH)
     values = generated_secrets()
@@ -54,5 +72,10 @@ def ensure_env() -> bool:
 
 
 if __name__ == "__main__":
-    print("created" if ensure_env() else "exists")
+    if not os.path.exists(ENV_PATH):
+        ensure_env()
+        print("created")
+    else:
+        added = add_missing_secrets()
+        print(f"updated: added {', '.join(added)}" if added else "exists")
     sys.exit(0)
