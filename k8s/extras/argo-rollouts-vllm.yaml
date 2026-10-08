@@ -1,11 +1,13 @@
 # ==============================================================================
-# Argo Rollouts Model Canary Specification (Plane 9: Model Lifecycle)
+# Argo Rollouts Model Canary Specification (Plane 9: Model Lifecycle) - optional
 # ==============================================================================
-# Automated canary deployment for model weight updates or engine configuration changes.
-# Steps:
-#  1. Routes 10% of traffic to candidate model
-#  2. Analyzes Prometheus metrics for P95 TTFT and Error Rate
-#  3. Promotes to 50% -> 100% or aborts and rolls back immediately if SLO degrades.
+# Canary for a model / engine change, on clusters running Argo Rollouts + an NGINX
+# ingress. Use instead of the base vllm Deployment (scale that one to 0):
+#   1. Routes 10% of traffic to the candidate model block
+#   2. Gates on the shared Prometheus SLO rules (P95 TTFT, gateway error rate)
+#   3. Promotes to 50% -> 100%, or aborts and rolls back automatically
+# The candidate reads the same llmops-model ConfigMap as the base Deployment; point
+# the canary at a candidate ConfigMap to trial a different Hugging Face model.
 # ==============================================================================
 
 apiVersion: argoproj.io/v1alpha1
@@ -17,8 +19,8 @@ spec:
   replicas: 4
   strategy:
     canary:
-      canaryService: vllm-canary-service
-      stableService: vllm-stable-service
+      canaryService: vllm-canary
+      stableService: vllm
       trafficRouting:
         nginx:
           stableIngress: vllm-ingress
@@ -43,19 +45,28 @@ spec:
     spec:
       containers:
         - name: vllm
-          image: vllm/vllm-openai:v0.6.6
+          image: vllm/vllm-openai:v0.31.0
+          command: ["/bin/sh", "-c"]
           args:
-            - --model
-            - HuggingFaceTB/SmolLM2-360M-Instruct
-            - --dtype
-            - half
-            - --gpu-memory-utilization
-            - "0.85"
-            - --enable-prefix-caching
-            - --otlp-traces-endpoint
-            - http://tempo.llmops.svc.cluster.local:4317
+            - >-
+              exec vllm serve "$MODEL_NAME"
+              --revision "$MODEL_REVISION"
+              --served-model-name "$SERVED_MODEL_NAME"
+              --dtype "$MODEL_DTYPE"
+              --max-model-len "$MAX_MODEL_LEN"
+              --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"
+              --enable-prefix-caching
+              --otlp-traces-endpoint http://tempo:4317
+              --host 0.0.0.0 --port 8000
+              $VLLM_MODEL_ARGS $VLLM_EXTRA_ARGS
+          envFrom:
+            - configMapRef:
+                name: llmops-model
           ports:
             - containerPort: 8000
+          resources:
+            limits:
+              nvidia.com/gpu: 1
 ---
 apiVersion: argoproj.io/v1alpha1
 kind: AnalysisTemplate
@@ -72,7 +83,7 @@ spec:
       failureLimit: 1
       provider:
         prometheus:
-          address: http://prometheus-service.llmops.svc.cluster.local:9090
+          address: http://prometheus.llmops.svc.cluster.local:9090
           query: job:vllm_time_to_first_token_seconds_p95
 
     # 2. Error rate must stay under 0.5%
@@ -83,5 +94,5 @@ spec:
       failureLimit: 1
       provider:
         prometheus:
-          address: http://prometheus-service.llmops.svc.cluster.local:9090
+          address: http://prometheus.llmops.svc.cluster.local:9090
           query: job:litellm_error_rate_percent

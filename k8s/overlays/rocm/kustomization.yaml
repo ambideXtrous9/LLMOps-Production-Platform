@@ -1,0 +1,16 @@
+# AMD ROCm: vllm/vllm-openai-rocm on one amd.com/gpu (AMD GPU device plugin)
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+images:
+  - name: vllm/vllm-openai
+    newName: vllm/vllm-openai-rocm
+patches:
+  - target: {kind: Deployment, name: vllm}
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/resources
+        value:
+          limits:
+            amd.com/gpu: 1

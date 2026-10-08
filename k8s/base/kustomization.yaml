@@ -1,0 +1,61 @@
+# ==============================================================================
+# LLMOps Platform - Kubernetes Base (kustomize)
+# ==============================================================================
+# The same architecture as docker-compose, driven by the same inputs:
+#   - generated/model.env    model block from .env (any Hugging Face model)
+#   - generated/secrets.env  secrets from .env
+#   - ../../config/*         gateway policy, route renderer, guardrail, alert rules
+#   - ../../router/*         KV-cache-aware router source
+# Service names match the compose service names, so configs work unchanged.
+#
+# Do not apply directly: scripts/deploy_k8s.sh generates the env files and builds
+#   kubectl kustomize --load-restrictor LoadRestrictionsNone k8s/overlays/<platform>
+# ==============================================================================
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: llmops
+
+resources:
+  - namespace.yaml
+  - postgres.yaml
+  - redis.yaml
+  - vllm.yaml
+  - kv-router.yaml
+  - litellm.yaml
+  - prometheus.yaml
+  - alertmanager.yaml
+  - tempo.yaml
+  - keda-scaledobject.yaml
+
+configMapGenerator:
+  - name: llmops-model
+    envs:
+      - generated/model.env
+  - name: litellm-config
+    files:
+      - config.yaml=../../config/litellm.yaml
+      - render_litellm_config.py=../../config/render_litellm_config.py
+      - pii_guardrail.py=../../config/pii_guardrail.py
+  - name: kv-router-code
+    files:
+      - kv_router.py=../../router/kv_router.py
+  - name: prometheus-config
+    files:
+      - prometheus.yml=prometheus-scrape.yml
+      - prometheus-rules.yaml=../../config/prometheus-rules.yaml
+      - prometheus-alerts.yaml=../../config/prometheus-alerts.yaml
+  - name: alertmanager-config
+    files:
+      - alertmanager.yml=../../config/alertmanager.yaml
+  - name: tempo-config
+    files:
+      - tempo.yaml=../../config/tempo.yaml
+
+secretGenerator:
+  - name: llmops-secrets
+    envs:
+      - generated/secrets.env
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: llmops-platform

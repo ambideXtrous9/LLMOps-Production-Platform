@@ -196,9 +196,14 @@ def test_guardrails_pii() -> bool:
 
 
 def test_prometheus_signals() -> bool:
-    status, body = http_json(f"{PROMETHEUS_URL}/api/v1/targets")
-    if status != 200:
-        return fail(f"Prometheus unreachable: {str(body)[:120]}")
+    # A freshly (re)started Prometheus reports "unknown" until each target's first scrape.
+    for _ in range(12):
+        status, body = http_json(f"{PROMETHEUS_URL}/api/v1/targets")
+        if status != 200:
+            return fail(f"Prometheus unreachable: {str(body)[:120]}")
+        if all(t.get("health") != "unknown" for t in body["data"]["activeTargets"]):
+            break
+        time.sleep(3)
     passed = True
     for target in body["data"]["activeTargets"]:
         job, health = target["labels"].get("job", "?"), target.get("health")
@@ -213,11 +218,16 @@ def test_prometheus_signals() -> bool:
     else:
         passed = fail(f"rule groups missing (loaded: {groups})")
     for metric in ("vllm:num_requests_running", "vllm:kv_cache_usage_perc", "litellm_requests_metric_total"):
-        status, res = http_json(f"{PROMETHEUS_URL}/api/v1/query?query={urllib.parse.quote(metric)}")
+        # Counters appear only after the first request has been scraped (15s interval).
+        for _ in range(12):
+            status, res = http_json(f"{PROMETHEUS_URL}/api/v1/query?query={urllib.parse.quote(metric)}")
+            if status == 200 and res.get("data", {}).get("result"):
+                break
+            time.sleep(3)
         if status == 200 and res.get("data", {}).get("result"):
             ok(f"metric {metric} present")
         else:
-            passed = fail(f"metric {metric} has no series yet")
+            passed = fail(f"metric {metric} has no series after 36s")
     return passed
 
 

@@ -2,7 +2,8 @@
 # Hardware Serving Profile: Dev / Edge Tier (NVIDIA GeForce GTX 1650 - 4GB VRAM)
 # ==============================================================================
 # Target Hardware: Consumer GPU, Turing SM 7.5, 4,096 MiB VRAM
-# Model: HuggingFaceTB/SmolLM2-360M-Instruct (FP16 weights ~ 691 MiB)
+# Preset: smollm2-360m (HuggingFaceTB/SmolLM2-360M-Instruct, FP16 weights ~ 691 MiB)
+# Not yet verified on vLLM v0.31.0. Informational: the engine is configured by the .env model block.
 # ==============================================================================
 
 engine: vllm

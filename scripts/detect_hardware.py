@@ -115,7 +115,7 @@ def analyze_hardware() -> Dict[str, Any]:
     )
     if backend == "cpu":
         cores = os.cpu_count() or 0
-        res = {"summary": f"Generic CPU ({platform.machine()}, {cores} threads)", "profile": "edge-cpu-llamacpp.yaml",
+        res = {"summary": f"Generic CPU ({platform.machine()}, {cores} threads)", "profile": "cpu-vllm.yaml",
                "preset": "qwen3-4b"}
         unusable = [n for n, r in found.items() if r.get("supported") and not r.get("docker_runtime", True)]
         notes = (f"{', '.join(unusable)} accelerator found but not usable from Docker; run scripts/bootstrap_host.sh. "

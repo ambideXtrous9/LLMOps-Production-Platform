@@ -22,7 +22,7 @@ spec:
             type: PathPrefix
             value: /v1/chat/completions
       backendRefs:
-        - name: kv-router-service
+        - name: kv-router
           port: 8000
           weight: 100
       filters:

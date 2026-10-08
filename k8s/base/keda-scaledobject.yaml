@@ -1,0 +1,57 @@
+# ==============================================================================
+# Autoscaling Controller (Plane 8): KEDA scales vLLM on LLM saturation signals
+# ==============================================================================
+# KEDA polls Prometheus directly (Grafana is never in the control loop):
+#   1. normalized queue backlog: waiting requests per running replica > 4
+#   2. KV-cache saturation: average vllm:kv_cache_usage_perc > 80%
+# The HPA's 300 s scale-down stabilization window absorbs cold starts (weights take
+# minutes to load). KEDA's cooldownPeriod only applies when scaling to zero.
+# ==============================================================================
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: vllm-inference-scaler
+  labels:
+    app: vllm
+    plane: autoscaling
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: vllm
+  minReplicaCount: 1
+  maxReplicaCount: 8
+  advanced:
+    restoreToOriginalReplicaCount: false
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 60
+          selectPolicy: Min
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Pods
+              value: 2
+              periodSeconds: 15
+          selectPolicy: Max
+  triggers:
+    - type: prometheus
+      name: queue-backlog-per-replica
+      metadata:
+        serverAddress: http://prometheus.llmops.svc.cluster.local:9090
+        query: >-
+          sum(vllm:num_requests_waiting)
+          /
+          clamp_min(count(vllm:num_requests_running), 1)
+        threshold: "4"
+    - type: prometheus
+      name: kv-cache-saturation-percent
+      metadata:
+        serverAddress: http://prometheus.llmops.svc.cluster.local:9090
+        query: avg(vllm:kv_cache_usage_perc) * 100
+        threshold: "80"

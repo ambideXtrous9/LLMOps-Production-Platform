@@ -1,26 +1,10 @@
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: alertmanager-config
-  namespace: llmops
-data:
-  alertmanager.yml: |
-    global:
-      resolve_timeout: 5m
-    route:
-      group_by: ['alertname', 'slo']
-      group_wait: 10s
-      group_interval: 30s
-      repeat_interval: 3h
-      receiver: 'default-receiver'
-    receivers:
-      - name: 'default-receiver'
----
+# ==============================================================================
+# Alerting Engine (Plane 3): Alertmanager with the shared routing config
+# ==============================================================================
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: alertmanager-deployment
-  namespace: llmops
+  name: alertmanager
   labels:
     app: alertmanager
     plane: alerting
@@ -33,29 +17,38 @@ spec:
     metadata:
       labels:
         app: alertmanager
+        plane: alerting
     spec:
       containers:
         - name: alertmanager
-          image: prom/alertmanager:latest
+          image: prom/alertmanager:v0.34.1
           args:
             - --config.file=/etc/alertmanager/alertmanager.yml
             - --storage.path=/alertmanager
           ports:
             - containerPort: 9093
+              name: http
+          readinessProbe:
+            httpGet: {path: /-/ready, port: 9093}
+            periodSeconds: 10
           volumeMounts:
-            - name: config-volume
-              mountPath: /etc/alertmanager/alertmanager.yml
-              subPath: alertmanager.yml
+            - name: config
+              mountPath: /etc/alertmanager
+            - name: data
+              mountPath: /alertmanager
       volumes:
-        - name: config-volume
+        - name: config
           configMap:
             name: alertmanager-config
+        - name: data
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: alertmanager-service
-  namespace: llmops
+  name: alertmanager
+  labels:
+    app: alertmanager
 spec:
   selector:
     app: alertmanager

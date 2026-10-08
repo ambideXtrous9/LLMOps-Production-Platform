@@ -263,7 +263,7 @@
       "type": "stat",
       "targets": [
         {
-          "expr": "litellm_proxy_spend_metric_total or vector(12.45)",
+          "expr": "sum by (team, model) (litellm_spend_metric_total)",
           "legendFormat": "{{team_id}}"
         }
       ]

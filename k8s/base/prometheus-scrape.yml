@@ -1,0 +1,84 @@
+# ==============================================================================
+# Prometheus scrape config for the Kubernetes base (Plane 3)
+# ==============================================================================
+# Same jobs and recording/alert rules as config/prometheus.yaml, limited to the
+# components the base deploys. GPU (DCGM) and node metrics usually come from
+# cluster-wide stacks (NVIDIA GPU Operator, kube-prometheus-stack): add their
+# targets here or federate.
+# ==============================================================================
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  scrape_timeout: 10s
+
+rule_files:
+  - /etc/prometheus/prometheus-rules.yaml
+  - /etc/prometheus/prometheus-alerts.yaml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  # Every vLLM replica, discovered through the Service endpoints (KEDA scales them).
+  - job_name: "vllm"
+    kubernetes_sd_configs:
+      - role: endpoints
+        namespaces:
+          names: [llmops]
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_service_name]
+        regex: vllm
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+      - target_label: plane
+        replacement: gpu-inference
+
+  # Gateway and router run several replicas with per-pod counters: scrape every pod
+  # (a Service VIP would hit a random pod per scrape and make counters jump).
+  - job_name: "litellm"
+    metrics_path: /metrics/
+    kubernetes_sd_configs:
+      - role: endpoints
+        namespaces:
+          names: [llmops]
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_service_name]
+        regex: litellm
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+      - target_label: plane
+        replacement: ingress-gateway
+
+  - job_name: "kv-router"
+    kubernetes_sd_configs:
+      - role: endpoints
+        namespaces:
+          names: [llmops]
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_service_name]
+        regex: kv-router
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+      - target_label: plane
+        replacement: kv-routing
+
+  - job_name: "tempo"
+    static_configs:
+      - targets: ["tempo:3200"]
+    relabel_configs:
+      - target_label: plane
+        replacement: distributed-tracing
+
+  - job_name: "alertmanager"
+    static_configs:
+      - targets: ["alertmanager:9093"]
+
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
