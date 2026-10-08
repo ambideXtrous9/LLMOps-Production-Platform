@@ -52,9 +52,10 @@ litellm_settings:
   # Internal Prometheus scraper access within docker network
   require_auth_for_metrics_endpoint: false
 
-  # Multi-telemetry egress (Prometheus golden signals + Tempo OTel + Langfuse)
-  success_callback: ["prometheus", "otel", "langfuse"]
-  failure_callback: ["prometheus", "otel", "langfuse"]
+  # Multi-telemetry egress (Prometheus golden signals + Tempo OTel)
+  # To enable Langfuse application tracing, set LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, and add "langfuse"
+  success_callback: ["prometheus", "otel"]
+  failure_callback: ["prometheus", "otel"]
 
   # Distributed Redis Caching (Exact response cache & prefix hits)
   cache: true
@@ -82,3 +83,4 @@ general_settings:
   proxy_budget_resets: "monthly"
   store_prompts_in_spend_logs: false  # PII protection: don't store raw prompts in DB logs
   enable_proxy_cache: true
+  trusted_proxy_ranges: []
