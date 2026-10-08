@@ -258,7 +258,7 @@ Client App       LiteLLM (:4000)     KV Router (:8001)      vLLM (:8000)       P
 | Platform | Needs |
 | :--- | :--- |
 | NVIDIA GPU host | Ubuntu 22.04/24.04 with the NVIDIA driver; Docker + NVIDIA toolkit are installed by `run_all.sh` when missing (passwordless sudo) |
-| CPU host / laptop | Docker with Compose v2.24+, Python 3.8+ |
+| CPU host / laptop | Docker, Python 3.8+ (Compose older than v2.24 is replaced by a pinned release in `~/.docker/cli-plugins`) |
 | Apple Silicon | macOS 15+, Docker Desktop, Homebrew (vllm-metal is installed by `run_all.sh`) |
 
 ### 3.2 Cloud GPU Host
@@ -302,7 +302,7 @@ git clone <repo> && cd LLMOps
 - **Ports** — a port used by another program moves to the next free one (saved in `.env`).
 - **Sizing** — the engine takes the GPU with the most free memory and sizes itself to it; gateway workers follow CPU threads; CPU KV cache follows RAM.
 - **Engine recovery** — a failed boot gets context `auto`, fp16, a retry, a smaller preset, and finally the CPU; a model dropped because the GPU was shared is retried next run.
-- **Database** — the Postgres password is re-synced with `.env`.
+- **Database & keys** — the Postgres password is re-synced with `.env`; team keys left by a lost `.env` are retired and the seed keys re-issued.
 - **Timing** — cold start ≈ 3.5 min (9B on A100, includes 19 GB download); warm restart ≈ 80 s.
 
 ---
@@ -413,6 +413,7 @@ Reads Hub metadata only — no weights downloaded.
 - **Auto-detection** — Metal → CUDA → ROCm → CPU (`scripts/detect_hardware.py`).
 - **ROCm** — needs `rocm-smi` and ≥ 8 GB VRAM; integrated AMD graphics run on CPU.
 - **Old NVIDIA GPUs** — compute capability < 7.0 (pre-Volta) run on CPU.
+- **SELinux (Fedora / RHEL)** — `docker-compose.selinux.yml` is added automatically when enforcing.
 - **GPU Docker cannot use** — NVIDIA toolkit installed automatically (Linux, passwordless sudo, no other containers running), else CPU.
 - **Override** — `./run_all.sh --platform cuda | rocm | cpu | metal | mock`; a platform the machine cannot run falls back to the detected one.
 - **Same engine** — vLLM `v0.31.0` everywhere: identical API, metrics and tests.
@@ -533,6 +534,20 @@ client.chat.completions.create(model="qwen3.5-9b", messages=[{"role": "user", "c
 | Mock engine | 11/11 | skipped | 32/32 |
 | k3s · Qwen3.5-9B | 10/10 | — | KEDA scaled 1 → 8 |
 
+### 10.3 Self-Healing Scenarios (`./run_all.sh`, A100 host, 2026-10-08)
+
+| Scenario | What `run_all.sh` did | Result |
+| :--- | :--- | :--- |
+| Plain re-run | 8 gateway workers (auto), ports free | 13/13 · eval 8/8 · 32/32 streams |
+| Ports 5432 + 9100 taken, 20 GiB of GPU held | ports → 5433 / 9101, memory 0.45, 9B → 4B | 13/13 · eval 100 % |
+| GPU free again | retried and restored the 9B | 13/13 · eval 100 % |
+| `--cpu` (platform switch) | model re-sized to `qwen3-4b`, 2 workers, KV 8 GiB | 13/13 · eval 100 % · 9.8 tok/s |
+| CPU + `smollm2-360m` (laptop path) | — (found a judge bug, fixed) | 13/13 · eval 57 % (gate 40 %) |
+| 4 GB-class GPU (4.1 GiB free) | 9B → 4B → `smollm2-360m` | 13/13 · eval 71 % |
+| GPU full (0.5 GiB free) | engine on CPU this run | 13/13 · eval 100 % |
+| `.env` lost, old databases | new secrets, DB re-synced, stale keys retired | 13/13 · eval 100 % |
+| Original `.env` restored | DB re-synced, original keys re-issued | 13/13 · eval 100 % · 74 tok/s |
+
 ---
 
 ## 11. Kubernetes
@@ -626,7 +641,7 @@ All settings live in `.env` (template: `.env.example`).
 | Client TTFT ≫ engine TTFT | gateway CPU-bound: raise `LITELLM_NUM_WORKERS` |
 | Public URL times out | open the port in the **cloud** firewall; check `*_BIND_ADDRESS` |
 | Langfuse login bounces to `localhost` | set `NEXTAUTH_URL=http://<server-ip>:3000`, recreate Langfuse |
-| `.env` deleted | a new one is generated and the Postgres password re-synced; previously issued keys stop working |
+| `.env` deleted | a new one is generated, the Postgres password re-synced and the old team keys retired (they stop working) |
 | `stale file handle` after `git pull` | `docker compose … up -d --force-recreate <service>` |
 
 ---
@@ -638,6 +653,7 @@ LLMOps/
 ├── run_all.sh                     # detect · size · boot · self-heal · verify
 ├── docker-compose.yml             # base architecture
 ├── docker-compose.{gpu,rocm,cpu,metal,mock}.yml   # platform overlays
+├── docker-compose.selinux.yml     # added on SELinux-enforcing hosts
 ├── .env.example                   # model block · exposure · versions · secrets
 ├── config/
 │   ├── litellm.yaml               # gateway policy

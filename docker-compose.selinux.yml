@@ -1,0 +1,32 @@
+# ==============================================================================
+# SELinux Overlay (Fedora / RHEL / CentOS / Rocky / Alma with SELinux enforcing)
+# ==============================================================================
+# Under an enforcing SELinux policy, containers cannot read bind-mounted configs,
+# scripts or the Hugging Face cache unless they are relabelled. run_all.sh adds
+# this overlay automatically when `getenforce` reports Enforcing: it turns off
+# SELinux label separation for this stack's containers only (the host policy is
+# unchanged).
+# ==============================================================================
+
+x-no-selinux-label: &no-selinux-label
+  security_opt:
+    - label=disable
+
+services:
+  alertmanager: *no-selinux-label
+  alloy: *no-selinux-label
+  clickhouse: *no-selinux-label
+  dcgm-exporter: *no-selinux-label
+  grafana: *no-selinux-label
+  kv-router: *no-selinux-label
+  langfuse: *no-selinux-label
+  langfuse-worker: *no-selinux-label
+  litellm: *no-selinux-label
+  loki: *no-selinux-label
+  minio: *no-selinux-label
+  node-exporter: *no-selinux-label
+  postgres: *no-selinux-label
+  prometheus: *no-selinux-label
+  redis: *no-selinux-label
+  tempo: *no-selinux-label
+  vllm: *no-selinux-label

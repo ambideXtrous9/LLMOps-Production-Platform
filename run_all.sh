@@ -159,6 +159,10 @@ set_platform() {
         *)     TARGET_BACKEND="cpu"; COMPOSE_OVERLAY="docker-compose.cpu.yml"; PLATFORM_LABEL="💻 CPU (vllm/vllm-openai-cpu)" ;;
     esac
     COMPOSE_FILES=("-f" "docker-compose.yml" "-f" "$COMPOSE_OVERLAY")
+    # SELinux enforcing (Fedora / RHEL family): containers cannot read bind mounts otherwise
+    if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = "Enforcing" ]; then
+        COMPOSE_FILES+=("-f" "docker-compose.selinux.yml")
+    fi
     export LLMOPS_PLATFORM="$TARGET_BACKEND"
 }
 
@@ -230,13 +234,13 @@ decide_model() {
 }
 
 ensure_docker() {
-    if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
+    if ! command -v docker >/dev/null 2>&1; then
         if [ "$(uname -s)" = "Linux" ] && can_sudo; then
-            echo -e "  Docker Engine / compose v2 missing: installing with scripts/bootstrap_host.sh..."
+            echo -e "  Docker Engine missing: installing with scripts/bootstrap_host.sh..."
             bash scripts/bootstrap_host.sh
             fixed "Installed Docker Engine + compose (scripts/bootstrap_host.sh)"
         else
-            die "Docker with the compose v2 plugin is required (https://docs.docker.com/get-docker/); install it and re-run."
+            die "Docker is required (https://docs.docker.com/get-docker/); install it and re-run."
         fi
     fi
     if docker info >/dev/null 2>&1; then return 0; fi
@@ -261,6 +265,39 @@ ensure_docker() {
     esac
     wait_for "Docker daemon" 180 docker info || die "Docker daemon is not running; start Docker and re-run."
     fixed "Docker daemon was not running: started it"
+}
+
+# Compose v2.24+ is needed (the overlays use its !reset tag). On Linux a missing or older
+# plugin is replaced by a pinned, checksum-verified release in ~/.docker/cli-plugins (no sudo).
+COMPOSE_PIN="v2.29.7"
+ensure_compose() {
+    local version arch url dir="$HOME/.docker/cli-plugins"
+    version="$(docker compose version --short 2>/dev/null || true)"
+    if python3 - "$version" <<'PY'
+import re, sys
+m = re.match(r"v?(\d+)\.(\d+)", sys.argv[1])
+sys.exit(0 if m and (int(m.group(1)), int(m.group(2))) >= (2, 24) else 1)
+PY
+    then
+        return 0
+    fi
+    if [ "$(uname -s)" = "Linux" ]; then
+        arch="$(uname -m)"
+        if [ "$arch" = "arm64" ]; then arch="aarch64"; fi
+        url="https://github.com/docker/compose/releases/download/${COMPOSE_PIN}/docker-compose-linux-${arch}"
+        echo -e "  Installing Docker Compose ${COMPOSE_PIN} into ${dir} (found: ${version:-none})..."
+        mkdir -p "$dir"
+        if curl -fsSL "$url" -o "$dir/docker-compose.download" && curl -fsSL "$url.sha256" -o "$dir/docker-compose.sha256" \
+            && [ "$(sha256sum "$dir/docker-compose.download" | cut -d' ' -f1)" = "$(cut -d' ' -f1 "$dir/docker-compose.sha256")" ]; then
+            mv "$dir/docker-compose.download" "$dir/docker-compose"
+            chmod +x "$dir/docker-compose"
+            rm -f "$dir/docker-compose.sha256"
+            fixed "Installed Docker Compose ${COMPOSE_PIN} (v2.24+ needed, found ${version:-none})"
+            return 0
+        fi
+        rm -f "$dir/docker-compose.download" "$dir/docker-compose.sha256"
+    fi
+    die "Docker Compose v2.24+ is required (found ${version:-none}); update Docker and re-run."
 }
 
 check_disk() {
@@ -480,6 +517,7 @@ if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import sys; sys.exit(sy
 fi
 command -v curl >/dev/null 2>&1 || die "curl is required."
 ensure_docker
+ensure_compose
 echo -e "  ${GREEN}✓${NC} Docker $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '?') with compose $(docker compose version --short 2>/dev/null || echo '?') is active."
 check_disk
 

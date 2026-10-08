@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
 
@@ -152,6 +153,18 @@ def seed_definitions() -> List[Dict[str, Any]]:
     ]
 
 
+def retire_alias(alias: str) -> int:
+    """Deletes the keys carrying `alias` - left behind when .env was regenerated - so their
+    old values stop working and the alias is free for the seed key. Returns how many."""
+    listing = api_request(f"/key/list?key_alias={urllib.parse.quote(alias)}&return_full_object=true&size=100",
+                          fail_silently=True)
+    tokens = [k["token"] for k in listing.get("keys", [])
+              if isinstance(k, dict) and k.get("key_alias") == alias and k.get("token")]
+    if tokens:
+        api_request("/key/delete", method="POST", data={"keys": tokens}, fail_silently=True)
+    return len(tokens)
+
+
 def bootstrap_seed_keys() -> None:
     """Idempotent: creates teams/keys, or re-syncs limits & allowed models of existing keys
     (e.g. after a model swap), then verifies every key exists. Exits 1 on any failure."""
@@ -201,6 +214,22 @@ def bootstrap_seed_keys() -> None:
                     fail_silently=True,
                 )
                 print(f"\n🔄 Existing key '{item['key_alias']}' re-synced (models: {', '.join(item['models'])})")
+            except urllib.error.HTTPError as e:
+                if e.code != 404:
+                    failures.append(f"{item['key_alias']}: update failed: {e}")
+                    continue
+                # The alias belongs to a key from an earlier .env: retire it, issue this one.
+                try:
+                    retired = retire_alias(item["key_alias"])
+                    generate_key(
+                        team_id=item["team_id"], key_alias=item["key_alias"], max_budget=item["max_budget"],
+                        rpm_limit=item["rpm_limit"], tpm_limit=item["tpm_limit"], models=item["models"],
+                        metadata=item["metadata"], key=item["key"], duration=None,
+                    )
+                    print(f"\n🔁 Replaced {retired} stale key(s) '{item['key_alias']}' from an earlier .env")
+                except Exception as e2:
+                    failures.append(f"{item['key_alias']}: replacing the stale key failed: {e2}")
+                    continue
             except Exception as e:
                 failures.append(f"{item['key_alias']}: update failed: {e}")
                 continue
