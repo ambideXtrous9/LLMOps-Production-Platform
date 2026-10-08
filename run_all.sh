@@ -290,19 +290,26 @@ else
     # ------------------------------------------------------------------------------
     echo -e "\n${BLUE}${BOLD}[10/10] End-to-End Verification, Stress Simulation & Plane 9 Model Lifecycle Gates...${NC}"
 
+    # The mock engine emulates the API and metrics, not a model: skip model-quality checks.
+    TEST_SKIP=""; [ "$TARGET_BACKEND" = "mock" ] && TEST_SKIP="--skip thinking,vision"
+
     echo -e "\n${CYAN}>>> [A] End-to-End Health & Telemetry Verification...${NC}"
-    python3 scripts/test_stack.py || FAILED_STAGES+=("test_stack")
+    python3 scripts/test_stack.py $TEST_SKIP || FAILED_STAGES+=("test_stack")
 
     echo -e "\n${CYAN}>>> [B] Streaming Traffic Spike & KEDA Saturation Test...${NC}"
     # CPU decode is bandwidth-bound: a smaller burst keeps the test meaningful, not minutes long.
     DEFAULT_CONCURRENCY=32; [ "$TARGET_BACKEND" = "cpu" ] && DEFAULT_CONCURRENCY=8
     CONCURRENCY="${LOAD_TEST_CONCURRENCY:-$DEFAULT_CONCURRENCY}" python3 scripts/load_test.py || FAILED_STAGES+=("load_test")
 
-    echo -e "\n${CYAN}>>> [C] CI/CD Model Evaluation Gate (Plane 9)...${NC}"
-    python3 scripts/eval_gate.py --model "$GATEWAY_MODEL" || FAILED_STAGES+=("eval_gate")
+    if [ "$TARGET_BACKEND" = "mock" ]; then
+        echo -e "\n${YELLOW}ℹ Mock engine: skipping the model eval gate and LLM-as-judge (no real model).${NC}"
+    else
+        echo -e "\n${CYAN}>>> [C] CI/CD Model Evaluation Gate (Plane 9)...${NC}"
+        python3 scripts/eval_gate.py --model "$GATEWAY_MODEL" || FAILED_STAGES+=("eval_gate")
 
-    echo -e "\n${CYAN}>>> [D] Online LLM-as-Judge Evaluation Worker...${NC}"
-    python3 scripts/online_eval_judge.py || FAILED_STAGES+=("online_eval_judge")
+        echo -e "\n${CYAN}>>> [D] Online LLM-as-Judge Evaluation Worker...${NC}"
+        python3 scripts/online_eval_judge.py || FAILED_STAGES+=("online_eval_judge")
+    fi
 fi
 
 # ------------------------------------------------------------------------------
