@@ -13,12 +13,17 @@
 services:
   vllm:
     image: vllm/vllm-openai:${VLLM_VERSION:-v0.31.0}
+    environment:
+      # Every GPU is visible; the engine uses the one(s) run_all.sh picked: the GPU_COUNT
+      # GPUs with the most free memory (nvidia-smi order)
+      - CUDA_DEVICE_ORDER=PCI_BUS_ID
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: ${GPU_COUNT:-1}
+              count: all
               capabilities: [gpu]
 
   dcgm-exporter:

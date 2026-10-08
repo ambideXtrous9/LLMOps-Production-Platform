@@ -144,25 +144,26 @@ def cmd_ports(platform_name: str) -> int:
 # ------------------------------------------------------------------------------
 # fit
 # ------------------------------------------------------------------------------
-def gpu_memory_mb(platform_name: str, count: str) -> Optional[Tuple[int, int]]:
-    """(free, total) MiB of the GPU(s) the engine uses; the smallest when it spans several."""
-    rows: List[Tuple[int, int]] = []
+def gpu_memory_mb(platform_name: str, count: str) -> Optional[Tuple[int, int, List[int]]]:
+    """(free, total, indexes) for the GPU(s) with the most free memory: on a shared
+    multi-GPU host the engine takes the emptiest ones (the smallest values when several)."""
+    rows: List[Tuple[int, int, int]] = []  # (index, free, total) MiB
     if platform_name == "cuda":
-        out = run(["nvidia-smi", "--query-gpu=memory.free,memory.total", "--format=csv,noheader,nounits"])
+        out = run(["nvidia-smi", "--query-gpu=index,memory.free,memory.total", "--format=csv,noheader,nounits"])
         for line in out.splitlines():
             parts = [p.strip() for p in line.split(",")]
-            if len(parts) == 2 and all(p.isdigit() for p in parts):
-                rows.append((int(parts[0]), int(parts[1])))
+            if len(parts) == 3 and all(p.isdigit() for p in parts):
+                rows.append((int(parts[0]), int(parts[1]), int(parts[2])))
     elif platform_name == "rocm":
         out = run(["rocm-smi", "--showmeminfo", "vram"])
         totals = [int(x) for x in re.findall(r"Total Memory \(B\):\s*(\d+)", out)]
         used = [int(x) for x in re.findall(r"Total Used Memory \(B\):\s*(\d+)", out)]
-        rows = [((t - u) // 2 ** 20, t // 2 ** 20) for t, u in zip(totals, used)]
+        rows = [(i, (t - u) // 2 ** 20, t // 2 ** 20) for i, (t, u) in enumerate(zip(totals, used))]
     if not rows:
         return None
-    if count.isdigit():
-        rows = rows[: max(int(count), 1)]
-    return min(r[0] for r in rows), min(r[1] for r in rows)
+    wanted = int(count) if count.isdigit() and int(count) > 0 else len(rows)
+    chosen = sorted(rows, key=lambda r: r[1], reverse=True)[:wanted]
+    return min(r[1] for r in chosen), min(r[2] for r in chosen), sorted(r[0] for r in chosen)
 
 
 def cmd_fit(platform_name: str) -> int:
@@ -181,12 +182,17 @@ def cmd_fit(platform_name: str) -> int:
     if platform_name in ("cuda", "rocm"):
         mem = gpu_memory_mb(platform_name, str(cfg.get("GPU_COUNT") or "1"))
         if mem:
-            free_mb, total_mb = mem
+            free_mb, total_mb, indexes = mem
+            if platform_name == "cuda":
+                exports["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in indexes)
+                note(f"  • Engine GPU(s)     : {exports['CUDA_VISIBLE_DEVICES']} (most free memory)")
             configured = float(cfg.get("GPU_MEMORY_UTILIZATION") or 0.90)
             # vLLM refuses to start when less than fraction x total is free; keep 1 GiB spare
             usable = (free_mb - 1024) / total_mb
             note(f"  • GPU memory free   : {free_mb / 1024:.1f} of {total_mb / 1024:.1f} GiB")
-            if usable < configured:
+            if free_mb - 1024 < 1536:  # below the smallest preset (~1.5 GiB): use the CPU this run
+                exports["GPU_TOO_BUSY"] = "1"
+            elif usable < configured:
                 fraction = max(0.05, math.floor(usable * 100) / 100)
                 exports["GPU_MEMORY_UTILIZATION"] = f"{fraction:.2f}"
                 note(f"  ↻ GPU is shared with other processes: engine memory fraction {configured:.2f} -> {fraction:.2f}")

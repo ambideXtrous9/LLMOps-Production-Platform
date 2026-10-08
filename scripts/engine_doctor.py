@@ -4,7 +4,7 @@ scripts/engine_doctor.py
 Works out why the inference engine stopped and prints the fix ./run_all.sh applies
 before its next boot attempt, as shell assignments on stdout:
 
-  DOCTOR_ACTION   retry | set | model | fail
+  DOCTOR_ACTION   retry | set | model | cpu | fail
   DOCTOR_KEY, DOCTOR_VALUE, DOCTOR_PERSIST   set: one engine setting (PERSIST=1: save in .env)
   DOCTOR_MODEL                                model: preset to fall back to
   DOCTOR_REASON                               one line for the log and the final report
@@ -31,6 +31,9 @@ LADDER = ["qwen3.5-9b", "qwen3-4b", "smollm2-360m"]  # verified presets, largest
 
 # Ordered: the first matching rule names the cause (vLLM v0.31 messages).
 RULES = [
+    ("gpu_arch", r"no kernel image is available for execution on the device|CUDA error: unsupported|"
+                 r"compute capability .{0,40}(is not supported|not supported)"),
+    ("disk", r"No space left on device"),
     ("dtype", r"Bfloat16 is only supported on GPUs"),
     ("gpu_share", r"less than desired GPU memory utilization"),
     ("context", r"estimated maximum model length is|larger than the maximum number of tokens that can be stored in KV cache"),
@@ -82,8 +85,11 @@ def fallback_model(env: Dict[str, str]) -> Optional[str]:
     return next((c for c in candidates if c not in tried), None)
 
 
-def decide(env: Dict[str, str], text: str, oom_killed: bool) -> Dict[str, str]:
+def decide(env: Dict[str, str], text: str, oom_killed: bool, platform_name: str = "cuda") -> Dict[str, str]:
     kind = "memory" if oom_killed else classify(text)
+    on_gpu = platform_name in ("cuda", "rocm")
+    if kind == "gpu_arch" and on_gpu:
+        return {"DOCTOR_ACTION": "cpu", "DOCTOR_REASON": "this GPU cannot run vLLM's kernels: running the engine on CPU"}
     model = env.get("MODEL_NAME", "the model")
     retries = int(env.get("ENGINE_RETRIES") or 0)
 
@@ -120,12 +126,15 @@ def decide(env: Dict[str, str], text: str, oom_killed: bool) -> Dict[str, str]:
 
     why = {
         "memory": f"{model} does not fit this machine's memory",
+        "disk": f"not enough disk space for the {model} weights",
         "access": f"{model} is gated or private (accept its license and set HF_TOKEN in .env)",
         "unsupported": f"{model} is not supported by this vLLM release",
     }.get(kind or "", f"{model} failed to start twice")
     nxt = fallback_model(env)
     if nxt:
         return {"DOCTOR_ACTION": "model", "DOCTOR_MODEL": nxt, "DOCTOR_REASON": f"{why}: falling back to preset {nxt}"}
+    if on_gpu and kind not in ("access", "disk"):
+        return {"DOCTOR_ACTION": "cpu", "DOCTOR_REASON": f"{why}, even the smallest preset: running the engine on CPU"}
     return {"DOCTOR_ACTION": "fail", "DOCTOR_REASON": f"{why}, and no smaller verified preset is left"}
 
 
@@ -139,7 +148,7 @@ def main() -> int:
             text, oom = f.read(), False
     else:
         text, oom = engine_output(args.platform)
-    for key, value in decide(dict(os.environ), text, oom).items():
+    for key, value in decide(dict(os.environ), text, oom, args.platform).items():
         print(f"{key}={shlex.quote(value)}")
     return 0
 

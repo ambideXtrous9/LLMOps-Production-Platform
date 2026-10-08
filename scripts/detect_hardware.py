@@ -103,6 +103,12 @@ def detect_nvidia_gpu() -> Dict[str, Any]:
     fields = [f.strip() for f in lines[0].split(",")]
     gpu_name = fields[0] if fields else "NVIDIA GPU"
     mem_total_mb = int(fields[1]) if len(fields) > 1 and fields[1].isdigit() else 0
+    try:
+        compute_cap = float(fields[2]) if len(fields) > 2 else 0.0
+    except ValueError:
+        compute_cap = 0.0
+    if 0 < compute_cap < 7.0:
+        return {"supported": False, "hint": f"{gpu_name} has compute capability {compute_cap} (vLLM needs 7.0+, Volta or newer)"}
     # The container runtime must expose the GPU too (scripts/bootstrap_host.sh sets this up).
     docker_gpu_ok = run_cmd("docker run --rm --gpus all alpine echo ok", timeout=120) == "ok"
     return {

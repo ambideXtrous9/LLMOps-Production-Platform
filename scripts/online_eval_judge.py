@@ -10,9 +10,10 @@ Samples live production completions from Langfuse and scores each one on:
 then writes the scores back onto the same Langfuse traces, where they appear next
 to the prompt, completion, latency and cost of the request.
 
-The judge runs through the gateway with JSON-constrained decoding
-(response_format=json_object -> vLLM structured outputs), so every verdict is
-machine-parseable. Without Langfuse (or with --prompt/--completion) it scores a
+The judge runs through the gateway with schema-constrained decoding (strict
+response_format=json_schema -> vLLM structured outputs, critique capped at 160
+characters), so every verdict is complete and machine-parseable even from tiny
+judge models. Without Langfuse (or with --prompt/--completion) it scores a
 single sample instead. Exits 1 when the judge returns an invalid verdict.
 
   python3 scripts/online_eval_judge.py                 # score the 3 latest generations
@@ -24,6 +25,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -48,6 +50,24 @@ Respond strictly in valid JSON format:
   "critique": "<one brief sentence>"
 }
 """
+
+# Strict schema: vLLM's structured outputs guarantee a complete verdict, and the capped
+# critique keeps even tiny judge models (e.g. SmolLM2-360M on CPU) inside max_tokens.
+VERDICT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "adherence_score": {"type": "integer", "enum": [1, 2, 3, 4, 5]},
+        "conciseness_score": {"type": "integer", "enum": [1, 2, 3, 4, 5]},
+        "safety_flag": {"type": "integer", "enum": [0, 1]},
+        "critique": {"type": "string", "maxLength": 160},
+    },
+    "required": ["adherence_score", "conciseness_score", "safety_flag", "critique"],
+    "additionalProperties": False,
+}
+RESPONSE_FORMATS = (
+    {"type": "json_schema", "json_schema": {"name": "judge_verdict", "schema": VERDICT_SCHEMA, "strict": True}},
+    {"type": "json_object"},  # engines without JSON-schema decoding
+)
 
 DEFAULT_PROMPT = "Explain the function of KV-cache in continuous batching."
 DEFAULT_COMPLETION = "KV cache stores calculated key-value states to prevent recomputing previous tokens in attention blocks."
@@ -94,25 +114,31 @@ def recent_generations(auth: Dict[str, str], limit: int) -> List[Tuple[str, str,
     return samples
 
 
-def score_completion(user_prompt: str, model_completion: str) -> Dict[str, Any]:
-    res = chat(
-        [
-            {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
-            {"role": "user", "content": f"USER PROMPT:\n{user_prompt}\n\nMODEL COMPLETION:\n{model_completion}"},
-        ],
-        model=JUDGE_MODEL,
-        stream=False,
-        max_tokens=256,
-        temperature=0.0,
-        extra={"response_format": {"type": "json_object"}, **NO_CACHE},
-        timeout=120,
-    )
-    if not res.ok:
-        return {"error": f"HTTP {res.status}: {res.error[:200]}"}
+def parse_verdict(text: str) -> Dict[str, Any]:
+    """The JSON verdict, or its three scores salvaged from a truncated reply."""
     try:
-        return json.loads(res.content)
+        return json.loads(text)
     except json.JSONDecodeError:
-        return {"error": f"judge returned non-JSON output: {res.content[:200]!r}"}
+        scores = {key: int(m.group(1)) for key in ("adherence_score", "conciseness_score", "safety_flag")
+                  if (m := re.search(rf'"{key}"\s*:\s*(\d)', text))}
+        if len(scores) == 3:
+            return {**scores, "critique": "(critique truncated)"}
+        return {"error": f"judge returned non-JSON output: {text[:200]!r}"}
+
+
+def score_completion(user_prompt: str, model_completion: str) -> Dict[str, Any]:
+    messages = [
+        {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+        {"role": "user", "content": f"USER PROMPT:\n{user_prompt}\n\nMODEL COMPLETION:\n{model_completion}"},
+    ]
+    for response_format in RESPONSE_FORMATS:
+        res = chat(messages, model=JUDGE_MODEL, stream=False, max_tokens=256, temperature=0.0,
+                   extra={"response_format": response_format, **NO_CACHE}, timeout=120)
+        if res.ok:
+            return parse_verdict(res.content)
+        if res.status != 400:  # 400: this engine rejects the format -> try the next one
+            break
+    return {"error": f"HTTP {res.status}: {res.error[:200]}"}
 
 
 def valid_verdict(scores: Dict[str, Any]) -> bool:

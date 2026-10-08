@@ -300,8 +300,8 @@ git clone <repo> && cd LLMOps
 - **Secrets** — the first run creates `.env` with fresh keys and passwords; later runs only add new ones.
 - **Model** — the first run picks the preset for the hardware; a platform change re-sizes it.
 - **Ports** — a port used by another program moves to the next free one (saved in `.env`).
-- **Sizing** — gateway workers follow CPU threads, engine memory follows free GPU memory, CPU KV cache follows RAM.
-- **Engine recovery** — a failed boot gets context `auto`, fp16, a retry, then a smaller preset; a model dropped because the GPU was shared is retried next run.
+- **Sizing** — the engine takes the GPU with the most free memory and sizes itself to it; gateway workers follow CPU threads; CPU KV cache follows RAM.
+- **Engine recovery** — a failed boot gets context `auto`, fp16, a retry, a smaller preset, and finally the CPU; a model dropped because the GPU was shared is retried next run.
 - **Database** — the Postgres password is re-synced with `.env`.
 - **Timing** — cold start ≈ 3.5 min (9B on A100, includes 19 GB download); warm restart ≈ 80 s.
 
@@ -412,6 +412,7 @@ Reads Hub metadata only — no weights downloaded.
 
 - **Auto-detection** — Metal → CUDA → ROCm → CPU (`scripts/detect_hardware.py`).
 - **ROCm** — needs `rocm-smi` and ≥ 8 GB VRAM; integrated AMD graphics run on CPU.
+- **Old NVIDIA GPUs** — compute capability < 7.0 (pre-Volta) run on CPU.
 - **GPU Docker cannot use** — NVIDIA toolkit installed automatically (Linux, passwordless sudo, no other containers running), else CPU.
 - **Override** — `./run_all.sh --platform cuda | rocm | cpu | metal | mock`; a platform the machine cannot run falls back to the detected one.
 - **Same engine** — vLLM `v0.31.0` everywhere: identical API, metrics and tests.
@@ -519,7 +520,7 @@ client.chat.completions.create(model="qwen3.5-9b", messages=[{"role": "user", "c
 | `test_stack.py` | 13 checks: engine · router · streaming · thinking · vision · auth · PII · Prometheus · Alertmanager · Tempo trace · Loki log for the same trace id · Langfuse · Grafana (GPU telemetry reported, not required) |
 | `load_test.py` | concurrent streaming burst: TTFT / latency percentiles, saturation, KEDA trigger state |
 | `eval_gate.py` | accuracy · injection + PII safety · formatting · arithmetic · tool calling |
-| `online_eval_judge.py` | scores live generations from Langfuse, writes scores back |
+| `online_eval_judge.py` | scores live generations from Langfuse (schema-constrained verdicts), writes scores back; `JUDGE_MODEL` picks a stronger judge than the served model |
 
 ### 10.2 Verified Results (Lambda Cloud, 2026-10-08)
 
@@ -574,7 +575,7 @@ All settings live in `.env` (template: `.env.example`).
 | Group | Keys |
 | :--- | :--- |
 | Model | `MODEL_NAME` · `MODEL_REVISION` · `SERVED_MODEL_NAME` |
-| Engine sizing | `MODEL_DTYPE` · `MAX_MODEL_LEN` · `GPU_MEMORY_UTILIZATION` |
+| Engine sizing | `MODEL_DTYPE` · `MAX_MODEL_LEN` · `GPU_MEMORY_UTILIZATION` · `GPU_COUNT` (GPUs used; the emptiest are picked) |
 | Auto when empty | `LITELLM_NUM_WORKERS` · `VLLM_CPU_KVCACHE_SPACE` |
 | Boot patience | `VLLM_READY_TIMEOUT` (seconds without engine progress) |
 | Host ports | `VLLM_PORT` · `ROUTER_PORT` · `LITELLM_PORT` · `LANGFUSE_PORT` · `GRAFANA_PORT` · `PROMETHEUS_PORT` · `ALERTMANAGER_PORT` · `LOKI_PORT` · `TEMPO_PORT` · `ALLOY_PORT` · `OTLP_GRPC_PORT` · `OTLP_HTTP_PORT` · `POSTGRES_PORT` · `REDIS_PORT` · `DCGM_PORT` · `NODE_EXPORTER_PORT` |

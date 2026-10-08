@@ -420,6 +420,15 @@ boot_engine() {
                     python3 scripts/preflight.py set "MODEL_FALLBACK_FROM=$from" >/dev/null
                 fi
                 ENGINE_TRIED="$ENGINE_TRIED,$DOCTOR_MODEL"; ENGINE_RETRIES=0; MODEL_CHANGED=true ;;
+            cpu)
+                # Last resort: the accelerator cannot run any verified preset.
+                docker rm -f vllm-inference >/dev/null 2>&1 || true
+                set_platform cpu
+                RECOMMENDED_PRESET="$CPU_PRESET"
+                if ! configure_model "$CPU_PRESET"; then
+                    echo -e "  ${RED}✗ Could not configure preset ${CPU_PRESET}.${NC}"; return 1
+                fi
+                ENGINE_TRIED="$CPU_PRESET"; ENGINE_RETRIES=0; MODEL_CHANGED=true ;;
             *)
                 echo -e "  ${RED}✗ ${DOCTOR_REASON:-engine failure could not be diagnosed}${NC}"; return 1 ;;
         esac
@@ -546,6 +555,17 @@ else
     preflight fit FIT_EXPORTS
     FIT_DONE=true
     case "$FIT_EXPORTS" in *GPU_MEMORY_UTILIZATION*) GPU_SHARED=true ;; esac
+    if [ "${GPU_TOO_BUSY:-0}" = "1" ]; then
+        # Other processes hold nearly all GPU memory: no preset fits. Run on CPU this time;
+        # the next run sees the platform change and moves back to the GPU.
+        fixed "GPU memory is almost fully used by other processes: the engine runs on CPU this run"
+        set_platform cpu
+        RECOMMENDED_PRESET="$CPU_PRESET"
+        configure_model "$CPU_PRESET" || die "Could not configure preset ${CPU_PRESET}."
+        preflight fit FIT_EXPORTS
+        GPU_TOO_BUSY=0
+        load_env
+    fi
     load_env
     echo -e "  ${GREEN}✓${NC} Host ports free; engine and gateway sized for this machine."
 
