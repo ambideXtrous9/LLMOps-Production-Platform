@@ -41,25 +41,71 @@
 
 ## 2. Architecture
 
-### 2.1 System Overview
+### 2.1 System Architecture — 9 Planes
 
-```mermaid
-flowchart LR
-    client(["Client<br/>OpenAI SDK"])
+```text
+                    ┌────────────────────────────────────────────────────────┐
+                    │       API CLIENT  ·  MICROSERVICE  ·  OPENAI SDK       │
+                    └───────────────────────────┬────────────────────────────┘
+                                                │ POST /v1/chat/completions  (stream · tools · images)
+                                                │ Bearer <team virtual key>  ·  W3C traceparent
+                                                ▼
+┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ 1. INGRESS & ROUTING PLANE                                                                            │
+│    LiteLLM AI Gateway (:4000) - routes rendered from the .env model block                             │
+│    • Team Virtual Keys (Postgres)   • Spend Limits & Budgets         • PII Masking Guardrail          │
+│    • Redis Rate-Limit Sync          • Redis Response Cache           • traceparent Forwarded          │
+│                                                                                                       │
+│    KV-Cache-Aware Router (:8001)                                                                      │
+│    • Prefix-Hash Affinity           • Health-Tracked Backends        • Streaming Pass-Through         │
+└──────────────────┬───────────────────────────────────────────────────┬────────────────────────────────┘
+                   │ Forward via Router (:8000/v1)                     │ OTLP LLM traces (langfuse_otel)
+                   ▼                                                   ▼
+┌──────────────────────────────────────────────────┐ ┌──────────────────────────────────────────────────┐
+│ 2. INFERENCE PLANE (vLLM v0.31)                  │ │ 6. LLM OBSERVABILITY PLANE (Langfuse v4)         │
+│    • Any Hugging Face model (.env model block)   │ │    • Web + Worker (async ingestion queue)        │
+│    • cuda | rocm | cpu | metal engines           │ │    • ClickHouse Analytics Store                  │
+│    • Continuous Batching & PagedAttention        │ │    • MinIO Raw Payload Storage                   │
+│    • Automatic Prefix Caching                    │ │    • Traces Keyed by Caller's W3C Trace ID       │
+│    • Reasoning & Tool-Call Parsers               │ │    • Online LLM-as-Judge Scores Written Back     │
+│    • Native OTLP Trace Export                    │ │    • Prompts, Completions, Tokens & Cost         │
+└──────────┬───────────────────────────┬───────────┘ └──────────────────────────────────────────────────┘
+           │ Logs & OTLP Spans         │
+           │                           └──── /metrics (:8000) · 15 s scrape ──┐
+           ▼                                                                  ▼
+┌──────────────────────────────────────────────────┐ ┌──────────────────────────────────────────────────┐
+│ 5. LOGS & TRACES PLANE                           │ │ 3. METRICS & ALERTING PLANE                      │
+│    Grafana Alloy (:12345)                        │ │    Prometheus (:9090)                            │
+│    • Docker Log Collection + OTLP Receiver       │ │    • Golden-Signal Recording Rules:              │
+│                                                  │ │      TTFT · ITL · KV-Cache % · Queue Backlog     │
+│    Grafana Loki (:3100)                          │ │      Prefix-Cache Hit Rate · Gateway Errors      │
+│    • LogQL Log Storage                           │ │                                                  │
+│                                                  │ │    Alertmanager (:9093)                          │
+│    Grafana Tempo (:3200)                         │ │    • Multi-Window SLO Burn-Rate Alerts           │
+│    • One Trace Spans Gateway + Engine            │ │    • Saturation & GPU Thermal Alerts             │
+└───────────────┬──────────────────────────────────┘ └──────────────────────────────────┬───────────────┘
+                │ LogQL · TraceQL                           ▲                           │ PromQL
+                │ PromQL                                    │ scraped                   │ polling
+                ▼                                                                       ▼
+┌────────────────────────────────┐ ┌────────────────────────┴──────┐ ┌──────────────────────────────────┐
+│ 7. VISUALIZATION PLANE         │ │ 4. HARDWARE TELEMETRY PLANE   │ │ 8. AUTOSCALING PLANE (KEDA)      │
+│    Grafana (:3001)             │ │    • NVIDIA DCGM (:9400)      │ │    • Reads Prometheus Directly   │
+│    • Dashboards Only           │ │      GPU util · VRAM · temp   │ │    • Queue Backlog / Replica > 4 │
+│      (no control-loop role)    │ │    • node-exporter (:9100)    │ │    • KV-Cache Saturation > 80 %  │
+│    • SLOs, Engine, GPU, Cost   │ │      CPU · RAM · disk · net   │ │    • 300 s Scale-Down Window     │
+│    • Loki → Tempo Deep Links   │ │    • Platform stub off-NVIDIA │ │    • Karpenter Adds GPU Nodes    │
+│                                │ │                               │ │                                  │
+└────────────────────────────────┘ └───────────────────────────────┘ └──────────────────────────────────┘
 
-    subgraph serving["Serving Path"]
-        gw["LiteLLM Gateway<br/>:4000"] --> router["KV Router<br/>:8001"] --> vllm["vLLM Engine<br/>:8000"]
-    end
-
-    state[("State<br/>Postgres<br/>Redis")]
-    observe["Observability<br/>Prometheus<br/>Alertmanager<br/>Loki · Tempo<br/>Alloy · Langfuse<br/>Grafana"]
-    control["Control<br/>KEDA<br/>Eval gate<br/>LLM judge"]
-
-    client -->|"virtual key<br/>+ traceparent"| gw
-    state --- gw
-    serving -->|"metrics<br/>traces · logs"| observe
-    observe -->|"signals"| control
-    control -.->|"scale · probe"| serving
+┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ 9. MODEL LIFECYCLE & GOVERNANCE PLANE                                                                 │
+│    • Model Block: one place defines the model for engine, gateway, keys & tests (.env)                │
+│    • Presets + Auto-Profiling: any Hub repo configured from metadata (scripts/configure_model.py)     │
+│    • Model Registry: pinned Hugging Face revisions & thresholds (models/catalog.yaml)                 │
+│    • CI/CD Eval Gate: golden probes before promotion (scripts/eval_gate.py)                           │
+│    • Online Evaluation: LLM-as-judge on live traffic (scripts/online_eval_judge.py)                   │
+│    • Canary Rollouts: Argo Rollouts with SLO analysis (k8s/extras/argo-rollouts-vllm.yaml)            │
+└───────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 2.2 Planes
@@ -76,26 +122,33 @@ flowchart LR
 | 8 | Autoscaling | KEDA | scale vLLM on saturation signals |
 | 9 | Model Lifecycle | model block, presets, eval gate, judge, Argo Rollouts | qualify and promote models |
 
-### 2.3 Request Flow
+### 2.3 End-to-End Request & Control Lifecycle
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as Client
-    participant G as Gateway
-    participant R as KV Router
-    participant V as vLLM
-    participant O as Tempo / Loki
-    participant L as Langfuse
-    C->>G: POST /v1/chat/completions
-    G->>G: auth · budget · rate limit · PII mask · cache
-    G->>R: forward + traceparent
-    R->>R: hash prompt prefix → replica
-    R->>V: proxy (stream)
-    V-->>C: SSE tokens (via router and gateway)
-    G--)O: gateway spans + logs
-    V--)O: engine spans + logs
-    G--)L: prompt · completion · tokens · cost
+```text
+Client App       LiteLLM (:4000)     KV Router (:8001)      vLLM (:8000)       Prometheus (:9090)        KEDA         Alloy · Tempo       Langfuse
+    │                   │                    │                    │                     │                  │                │                 │
+ 1  │── POST /v1/chat ─>│                    │                    │                     │                  │                │                 │
+ 2  │                   │── auth · budget    │                    │                     │                  │                │                 │
+    │                   │   PII mask · cache │                    │                     │                  │                │                 │
+ 3  │                   │── + traceparent ──>│                    │                     │                  │                │                 │
+ 4  │                   │                    │── hash prefix      │                     │                  │                │                 │
+    │                   │                    │   → pick replica   │                     │                  │                │                 │
+ 5  │                   │                    │── proxy (stream) ─>│                     │                  │                │                 │
+ 6  │                   │                    │                    │── batch + prefix    │                  │                │                 │
+    │                   │                    │                    │   KV-cache reuse    │                  │                │                 │
+ 7  │                   │                    │<── stream tokens ──│                     │                  │                │                 │
+ 8  │                   │<── stream tokens ──│                    │                     │                  │                │                 │
+ 9  │<── SSE · TTFT ────│                    │                    │                     │                  │                │                 │
+    │                   │                    │                    │                     │                  │                │                 │
+  ── [ ASYNCHRONOUS TELEMETRY & CONTROL LOOP ] ───────────────────────────────────────────────────────────────────────────────────────────────────────────
+    │                   │                    │                    │                     │                  │                │                 │
+10  │                   │┄┄ OTLP spans + logs ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄>│                 │
+11  │                   │                    │                    │┄┄ OTLP spans + logs ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄>│                 │
+12  │                   │┄┄ prompt · completion · tokens · cost ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄>│
+13  │                   │                    │                    │<┄┄ scrape 15 s ┄┄┄┄┄│                  │                │                 │
+14  │                   │                    │                    │                     │<┄┄ poll ┄┄┄┄┄┄┄┄┄│                │                 │
+15  │                   │                    │                    │<── scale 1..N ─────────────────────────│                │                 │
+    │                   │                    │                    │                     │                  │                │                 │
 ```
 
 - **One trace id** — the caller's `traceparent` is continued by the gateway and forwarded to the engine.
@@ -105,16 +158,24 @@ sequenceDiagram
 
 ### 2.4 Configuration Flow
 
-```mermaid
-flowchart LR
-    hub[("Hugging Face Hub")] -->|"metadata"| cfg["configure_model.py"]
-    cfg --> block[".env<br/>model block"]
-    block --> engine["vLLM command"]
-    block --> routes["Gateway routes"]
-    block --> keys["Key scopes"]
-    block --> tests["Tests · gates"]
-    block --> k8s["k8s ConfigMap"]
-    overlay["Platform overlay"] -->|"image + devices"| engine
+```text
+┌─────────────────────┐      ┌──────────────────────────┐      ┌────────────────────────────────────────┐
+│ Hugging Face Hub    │─────>│ configure_model.py       │─────>│ .env  MODEL BLOCK                      │
+│ (metadata only)     │      │ preset | auto-profile    │      │ MODEL_NAME · VLLM_MODEL_ARGS · EVAL_*  │
+└─────────────────────┘      └──────────────────────────┘      └───────────────────┬────────────────────┘
+                                                                                   │
+          ┌────────────────────┬────────────────────┬────────────────────┬─────────┴──────────┐
+          ▼                    ▼                    ▼                    ▼                    ▼
+┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
+│ vLLM command     │ │ Gateway routes   │ │ Key scopes       │ │ Tests & gates    │ │ k8s ConfigMap    │
+│ engine flags     │ │ model aliases    │ │ allowed models   │ │ capability-aware │ │ deploy_k8s.sh    │
+└──────────────────┘ └──────────────────┘ └──────────────────┘ └──────────────────┘ └──────────────────┘
+          ▲
+          │ engine image + devices
+┌─────────┴─────────────────────────────┐
+│ Platform overlay                      │
+│ gpu · rocm · cpu · metal · mock       │
+└───────────────────────────────────────┘
 ```
 
 - **Model block** — the single place a model is defined; a model swap edits nothing else.
@@ -123,20 +184,25 @@ flowchart LR
 
 ### 2.5 Network Exposure
 
-```mermaid
-flowchart TB
-    net(["Internet"]) -->|"cloud firewall · 3000 3001 4000"| pub
-    you(["Your laptop"]) -->|"SSH tunnel · port 22"| priv
+```text
+  ┌──────────────────┐                                                ┌──────────────────┐
+  │ Internet         │                                                │ Your laptop      │
+  └────────┬─────────┘                                                └────────┬─────────┘
+           │ cloud firewall                                                    │ SSH tunnel
+           │ TCP 3000 · 3001 · 4000                                            │ port 22
+           ▼                                                                   ▼
+┌──────────────────────────────────────────────────┐ ┌──────────────────────────────────────────────────┐
+│ PUBLISHABLE · LOGIN REQUIRED                     │ │ SERVER-LOCAL · 127.0.0.1 · NO LOGIN              │
+│                                                  │ │                                                  │
+│ Gateway + UI   :4000   GATEWAY_BIND_ADDRESS      │ │ vLLM :8000 · KV router :8001                     │
+│ Grafana        :3001   UI_BIND_ADDRESS           │ │ Prometheus :9090 · Alertmanager :9093            │
+│ Langfuse       :3000   UI_BIND_ADDRESS           │ │ Loki :3100 · Tempo :3200 · Alloy :12345          │
+│                                                  │ │ Postgres :5432 · Redis :6379                     │
+└──────────────────────────────────────────────────┘ └──────────────────────────────────────────────────┘
 
-    subgraph pub["Publishable · login required"]
-        a["Gateway + UI :4000"]
-        b["Grafana :3001"]
-        c["Langfuse :3000"]
-    end
-
-    subgraph priv["Server-local · 127.0.0.1 · no login"]
-        d["vLLM · Router<br/>Prometheus · Alertmanager<br/>Loki · Tempo · Alloy<br/>Postgres · Redis"]
-    end
+┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ DOCKER NETWORK ONLY:  LiteLLM metrics :9095 · ClickHouse · MinIO (never published)                    │
+└───────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 - **Default** — every port binds to `127.0.0.1`.
@@ -145,16 +211,24 @@ flowchart TB
 
 ### 2.6 Kubernetes Topology
 
-```mermaid
-flowchart LR
-    subgraph ns["namespace: llmops"]
-        lite["litellm ×2"] --> kvr["kv-router ×2"] --> eng["vllm ×1…8"]
-        lite --- st[("postgres · redis")]
-        eng -->|"OTLP"| tempo["tempo"]
-        eng -->|"/metrics"| prom["prometheus"]
-        prom -->|"backlog · KV-cache"| keda["KEDA"]
-        keda -.->|"scale replicas"| eng
-    end
+```text
+┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ namespace: llmops                                                                                     │
+│  ┌──────────────┐      ┌────────────────┐      ┌────────────────┐   OTLP      ┌────────────────┐      │
+│  │ litellm ×2   │─────>│ kv-router ×2   │─────>│ vllm ×1…8      │────────────>│ tempo          │      │
+│  └──────┬───────┘      └────────────────┘      └────────────┬───┘             └────────────────┘      │
+│         │                           scale replicas   ▲      │ /metrics                                │
+│         │                         ┌──────────────────┘      │                                         │
+│         ▼                         │                         ▼                                         │
+│ ┌───────────────────┐     ┌───────┴────────┐       ┌──────────────────┐                               │
+│ │ postgres · redis  │     │ KEDA           │<──────│ prometheus       │                               │
+│ └───────────────────┘     └────────────────┘       └────────┬─────────┘                               │
+│                          backlog > 4 · KV > 80 %            ▼                                         │
+│                                                    ┌──────────────────┐                               │
+│                                                    │ alertmanager     │                               │
+│                                                    └──────────────────┘                               │
+│                                                                                                       │
+└───────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
