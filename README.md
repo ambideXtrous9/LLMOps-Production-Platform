@@ -3,6 +3,13 @@
 > **One architecture · any Hugging Face model · any hardware.**
 > Self-hosted LLM serving with gateway governance, routing, observability, autoscaling and quality gates.
 
+<p align="center">
+  <img src="docs/images/grafana-slo-cost-gateway.png" alt="Grafana dashboard: TTFT SLO, KV-cache saturation, team spend and gateway latency" width="100%">
+  <br>
+  <img src="docs/images/grafana-throughput-gpu.png" alt="Grafana dashboard: concurrency vs queue backlog, token throughput and NVIDIA GPU telemetry" width="100%">
+</p>
+<p align="center"><sub><b>Live Grafana dashboard</b> · Qwen3.5-9B on 1× A100 40 GB · load test 8 → 32 → 64 concurrent streams · 1,248/1,248 requests OK · ~2,000 tokens/s · GPU 95 %</sub></p>
+
 ```bash
 ./run_all.sh                                  # detect hardware → pick model → boot → verify
 ./run_all.sh --model <preset | any/hf-repo>   # serve a different model
@@ -616,6 +623,7 @@ LLMOps/
 │   └── profiles/                  # hardware tier notes
 ├── router/kv_router.py            # KV-cache-aware router
 ├── engine/                        # mock engine · hardware-exporter stub
+├── docs/images/                   # README screenshots
 ├── models/
 │   ├── presets/*.env              # verified model blocks
 │   ├── catalog.yaml               # model registry
