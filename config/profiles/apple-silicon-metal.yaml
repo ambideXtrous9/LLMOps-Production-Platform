@@ -1,0 +1,38 @@
+# ==============================================================================
+# Hardware Serving Profile: Apple Silicon Metal Tier (Apple M-Series)
+# ==============================================================================
+# Target Hardware: Apple Silicon (M1, M2, M3, M4) Unified Memory Architecture
+# Compute Backend: Apple MLX Framework + Metal GPU Shaders (vllm-metal plugin)
+# Repository: https://github.com/vllm-project/vllm-metal
+# ==============================================================================
+
+engine: vllm-metal
+profile_name: apple-silicon-metal
+target_hardware:
+  platform: "macOS (Darwin arm64)"
+  gpu_family: "Apple Metal GPU"
+  compute_backend: "mlx"
+  memory_architecture: "unified_memory"
+  zero_copy_tensors: true
+  supported_precision: ["4bit", "8bit", "fp16", "bfloat16"]
+
+serving_parameters:
+  model: "mlx-community/SmolLM2-360M-Instruct-4bit"
+  framework: "mlx-lm"
+  quantization: "4bit"
+  max_model_len: 4096
+  continuous_batching: true
+  paged_attention: true
+  # Unified Memory headroom reserved for macOS window server and apps
+  unified_memory_headroom_gb: 4.0
+
+telemetry:
+  otlp_traces_endpoint: "http://localhost:4317"
+  metrics_interval: 15s
+  hardware_monitoring:
+    engine: "powermetrics / sysctl"
+    metrics_exposed:
+      - "metal_gpu_utilization_percent"
+      - "unified_memory_used_bytes"
+      - "unified_memory_free_bytes"
+      - "soc_power_watts"

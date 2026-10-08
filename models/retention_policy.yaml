@@ -1,0 +1,55 @@
+# ==============================================================================
+# LLM Data Governance & Trace Retention Policy (Plane 6)
+# ==============================================================================
+# Enforces enterprise data compliance, privacy, and sovereignty:
+#  - Zero unredacted PII in traces or logs
+#  - Enforced lifecycle time-to-live (TTL) across all storage engines
+#  - Cryptographic tokenization of sensitive inputs
+# ==============================================================================
+
+governance:
+  classification: "Restricted Enterprise Inference Data"
+  air_gap_compliant: true
+  third_party_egress: "BLOCKED (100% On-Premise)"
+
+pii_redaction_policy:
+  mode: "mask_at_gateway_before_ingest"
+  enforcement_points:
+    - litellm_guardrails
+    - alloy_log_filter
+    - langfuse_ingest_pipeline
+  entities_masked:
+    - name: "email"
+      regex: "[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\\.[a-zA-Z0-9-.]+"
+      mask: "[REDACTED_EMAIL]"
+    - name: "credit_card"
+      regex: "\\b(?:\\d[ -]*?){13,16}\\b"
+      mask: "[REDACTED_CARD]"
+    - name: "ssn"
+      regex: "\\b\\d{3}-\\d{2}-\\d{4}\\b"
+      mask: "[REDACTED_SSN]"
+    - name: "api_key"
+      regex: "(?i)(?:bearer\\s+|sk-[a-zA-Z0-9]{20,})"
+      mask: "[REDACTED_SECRET]"
+
+data_retention_ttl:
+  # Langfuse S3 Raw Traces & Payload Blobs
+  raw_prompt_payloads_days: 14
+
+  # Langfuse ClickHouse Analytics Spans & Metrics
+  trace_metadata_spans_days: 90
+
+  # PostgreSQL Virtual Key Spend & Audit Ledger
+  financial_spend_audit_days: 365
+
+  # Grafana Loki Container Logs
+  container_logs_days: 7
+
+  # Prometheus TSDB Metrics
+  prometheus_tsdb_retention_days: 30
+
+audit_logging:
+  track_caller_team: true
+  track_virtual_key_id: true
+  track_token_counts: true
+  track_raw_prompt_text: false           # Set to false to avoid storing sensitive payloads in audit log

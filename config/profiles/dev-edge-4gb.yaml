@@ -1,0 +1,31 @@
+# ==============================================================================
+# Hardware Serving Profile: Dev / Edge Tier (NVIDIA GeForce GTX 1650 - 4GB VRAM)
+# ==============================================================================
+# Target Hardware: Consumer GPU, Turing SM 7.5, 4,096 MiB VRAM
+# Model: HuggingFaceTB/SmolLM2-360M-Instruct (FP16 weights ~ 691 MiB)
+# ==============================================================================
+
+engine: vllm
+profile_name: dev-edge-4gb
+target_hardware:
+  gpu_family: "NVIDIA GeForce GTX 1650"
+  vram_total_mib: 4096
+  compute_capability: "7.5"
+  supported_precision: ["fp16"]
+
+serving_parameters:
+  model: "HuggingFaceTB/SmolLM2-360M-Instruct"
+  dtype: "half"                           # Pure FP16 (SM 7.5 lacks native bfloat16)
+  gpu_memory_utilization: 0.60            # Locks VRAM pool to 1,952 MiB, leaving 2GB cushion for OS/Display
+  max_model_len: 2048                     # Bounded context window to prevent memory fragmentation
+  enforce_eager: true                     # Disables CUDA Graph capture to save ~800MB warm-up memory
+  enable_prefix_caching: true             # Retains common system prompt prefixes in PagedAttention KV blocks
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  max_num_seqs: 64                        # Max concurrent continuous batch sequences
+  max_num_batched_tokens: 2048
+
+telemetry:
+  otlp_traces_endpoint: "http://tempo:4317"
+  metrics_interval: 15s
+  dcgm_profiling_supported: false         # Consumer GPUs lack DCGM profiling (Bandwidth/SM occupancy empty)

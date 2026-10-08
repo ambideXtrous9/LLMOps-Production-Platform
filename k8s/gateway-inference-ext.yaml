@@ -1,0 +1,33 @@
+# ==============================================================================
+# Kubernetes Gateway API Inference Extension Specification (Plane 1 & 2)
+# ==============================================================================
+# Declarative KV-cache-aware routing policy for Gateway API.
+# Directs requests based on model target, prompt prefix hash, and backend saturation.
+# ==============================================================================
+
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: llm-inference-gateway-route
+  namespace: llmops
+spec:
+  parentRefs:
+    - name: llmops-ingress-gateway
+      namespace: llmops
+  hostnames:
+    - "api.llmops.internal"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1/chat/completions
+      backendRefs:
+        - name: kv-router-service
+          port: 8000
+          weight: 100
+      filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            add:
+              - name: X-LLMOps-Routing-Tier
+                value: "prefix-affinity"

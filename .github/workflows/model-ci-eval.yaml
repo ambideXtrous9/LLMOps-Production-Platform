@@ -1,0 +1,38 @@
+name: Model Qualification & CI Evaluation Gate
+
+on:
+  pull_request:
+    paths:
+      - 'models/**'
+      - 'config/litellm.yaml'
+      - 'config/profiles/**'
+  workflow_dispatch:
+
+jobs:
+  model-eval-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Codebase
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pyyaml
+
+      - name: Run Model Catalog Validation
+        run: |
+          python3 -c "import yaml; yaml.safe_load(open('models/catalog.yaml'))"
+          echo "✓ Model registry catalog syntax valid."
+
+      - name: Execute Model Evaluation Gate
+        env:
+          TEAM_ENGINEERING_KEY: ${{ secrets.TEAM_ENGINEERING_KEY }}
+          LITELLM_URL: ${{ secrets.LITELLM_STAGING_URL || 'http://localhost:4000/v1/chat/completions' }}
+        run: |
+          python3 scripts/eval_gate.py --model smollm2 --max-ttft 1.5 --min-tps 25.0 --min-accuracy 0.85

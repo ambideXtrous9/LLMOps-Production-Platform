@@ -1,56 +1,45 @@
 services:
-  # ==========================================
-  # 1. INFERENCE ENGINE (vLLM)
-  # ==========================================
+  # ============================================================================
+  # 1. INFERENCE ENGINE (Plane 2: GPU Inference Plane)
+  # ============================================================================
   vllm:
-    image: vllm/vllm-openai:v0.6.6
+    build:
+      context: ./engine
+      dockerfile: Dockerfile
+    image: llmops-vllm-engine:latest
     container_name: vllm-inference
     ipc: host
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
     ports:
-      - "8000:8000"
+      - "${VLLM_PORT:-8000}:8000"
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
     environment:
       - HF_HUB_ENABLE_HF_TRANSFER=0
-    command: >
-      --model HuggingFaceTB/SmolLM2-360M-Instruct
-      --dtype half
-      --gpu-memory-utilization 0.60
-      --max-model-len 2048
-      --enforce-eager
-      --host 0.0.0.0
-      --port 8000
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4318
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
-      interval: 10s
-      timeout: 5s
+      interval: 5s
+      timeout: 3s
       retries: 10
-      start_period: 30s
+      start_period: 5s
     networks:
       - llmops-net
 
-  # ==========================================
-  # 2. AI GATEWAY (LiteLLM Proxy)
-  # ==========================================
-  litellm:
-    image: ghcr.io/berriai/litellm:main-latest
-    container_name: litellm-gateway
+  # ============================================================================
+  # 2. KV-CACHE-AWARE INTELLIGENT ROUTER (Plane 1 & 2: Routing Plane)
+  # ============================================================================
+  kv-router:
+    build:
+      context: ./router
+      dockerfile: Dockerfile
+    container_name: kv-router
+    environment:
+      - ROUTER_PORT=8000
+      - VLLM_BACKENDS=http://vllm:8000
+      - ROUTER_TIMEOUT=60
     ports:
-      - "4000:4000"
-    volumes:
-      - ./config/litellm.yaml:/app/config.yaml:ro
-    command: >
-      --config /app/config.yaml
-      --port 4000
-      --num_workers 1
+      - "8001:8000"
     depends_on:
       vllm:
         condition: service_healthy
@@ -58,109 +47,188 @@ services:
     networks:
       - llmops-net
 
-  # ==========================================
-  # 3. OBSERVABILITY DB (Postgres for Langfuse)
-  # ==========================================
-  postgres:
-    image: postgres:16-alpine
-    container_name: langfuse-postgres
-    environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgrespassword
-      - POSTGRES_DB=langfuse
+  # ============================================================================
+  # 3. AI GATEWAY (Plane 1: Ingress & Routing Plane)
+  # ============================================================================
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    container_name: litellm-gateway
+    ports:
+      - "${LITELLM_PORT:-4000}:4000"
     volumes:
-      - langfuse_pgdata:/var/lib/postgresql/data
+      - ./config/litellm.yaml:/app/config.yaml:ro
+    environment:
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-admin-master-sec-9a8b7c6d5e4f3a2b1c0d}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-llmops_admin}:${POSTGRES_PASSWORD:-llmops_production_secure_pass_2026}@postgres:5432/${POSTGRES_DB:-litellm_db}
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-redis_cluster_production_pass_2026}@redis:6379
+      - KV_ROUTER_URL=http://kv-router:8000/v1
+      - VLLM_DIRECT_URL=http://vllm:8000/v1
+      - EDGE_FALLBACK_URL=http://vllm:8000/v1
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4318
+    command: >
+      --config /app/config.yaml
+      --port 4000
+      --num_workers ${LITELLM_NUM_WORKERS:-2}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kv-router:
+        condition: service_started
     restart: unless-stopped
     networks:
       - llmops-net
 
-  # ==========================================
-  # 4. TRACING & EVALUATION (Langfuse)
-  # ==========================================
+  # ============================================================================
+  # 4. DISTRIBUTED STATE & CACHE (Plane 1: Redis Rate-Limit Sync & Response Cache)
+  # ============================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: llmops-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --requirepass ${REDIS_PASSWORD:-redis_cluster_production_pass_2026}
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-redis_cluster_production_pass_2026}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - llmops-net
+
+  # ============================================================================
+  # 5. RELATIONAL PERSISTENCE (Plane 1 & 6: PostgreSQL for Keys, Budgets & Traces)
+  # ============================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: llmops-postgres
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-llmops_admin}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-llmops_production_secure_pass_2026}
+      - POSTGRES_DB=${POSTGRES_DB:-litellm_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-postgres.sh:/docker-entrypoint-initdb.d/init-databases.sh:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-llmops_admin} -d ${POSTGRES_DB:-litellm_db}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - llmops-net
+
+  # ============================================================================
+  # 6. APPLICATION OBSERVABILITY (Plane 6: Langfuse Tracing Engine)
+  # ============================================================================
   langfuse:
     image: langfuse/langfuse:2
     container_name: langfuse-server
     ports:
-      - "3000:3000"
+      - "${LANGFUSE_PORT:-3000}:3000"
     environment:
-      - DATABASE_URL=postgresql://postgres:postgrespassword@postgres:5432/langfuse
-      - NEXTAUTH_SECRET=my-super-secret-nextauth-token-1234
-      - SALT=my-salt-salt-salt-salt-1234
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-llmops_admin}:${POSTGRES_PASSWORD:-llmops_production_secure_pass_2026}@postgres:5432/langfuse
+      - NEXTAUTH_SECRET=${NEXTAUTH_SECRET:-sec-nextauth-token-984729104827104928}
+      - SALT=${LANGFUSE_SALT:-sec-salt-83920194857291048572910485}
       - NEXTAUTH_URL=http://localhost:3000
       - TELEMETRY_ENABLED=false
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
     networks:
       - llmops-net
 
-  # ==========================================
-  # 5. METRICS SCRAPER (Prometheus)
-  # ==========================================
+  # ============================================================================
+  # 7. METRICS ENGINE (Plane 3: Prometheus with Recording & Alerting Rules)
+  # ============================================================================
   prometheus:
     image: prom/prometheus:latest
     container_name: prometheus-scraper
     ports:
-      - "9090:9090"
+      - "${PROMETHEUS_PORT:-9090}:9090"
     volumes:
       - ./config/prometheus.yaml:/etc/prometheus/prometheus.yml:ro
+      - ./config/prometheus-rules.yaml:/etc/prometheus/rules/prometheus-rules.yaml:ro
+      - ./config/prometheus-alerts.yaml:/etc/prometheus/rules/prometheus-alerts.yaml:ro
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
     restart: unless-stopped
     networks:
       - llmops-net
 
-  # ==========================================
-  # 6. VISUALIZATION DASHBOARD (Grafana)
-  # ==========================================
-  grafana:
-    image: grafana/grafana:latest
-    container_name: grafana-dashboard
+  # ============================================================================
+  # 8. ALERTING ENGINE (Plane 3: Alertmanager for SLO Burn-Rate Alerts)
+  # ============================================================================
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: alertmanager-engine
     ports:
-      - "3001:3000"
+      - "${ALERTMANAGER_PORT:-9093}:9093"
     volumes:
-      - ./config/grafana-datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml:ro
-      - ./config/grafana-dashboards.yaml:/etc/grafana/provisioning/dashboards/dashboards.yaml:ro
-      - ./config/llmops-dashboard.json:/var/lib/grafana/dashboards/llmops-dashboard.json:ro
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_USERS_ALLOW_SIGN_UP=false
-    depends_on:
-      - prometheus
+      - ./config/alertmanager.yaml:/etc/alertmanager/alertmanager.yml:ro
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
     restart: unless-stopped
     networks:
       - llmops-net
 
-  # ==========================================
-  # 7. HARDWARE AGENT (NVIDIA DCGM Exporter)
-  # ==========================================
-  dcgm-exporter:
-    image: nvcr.io/nvidia/k8s/dcgm-exporter:latest
-    container_name: dcgm-hardware-exporter
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    cap_add:
-      - SYS_ADMIN
+  # ============================================================================
+  # 9. UNIFIED TELEMETRY AGENT (Plane 5: Grafana Alloy - Replaces Promtail)
+  # ============================================================================
+  alloy:
+    image: grafana/alloy:v1.1.0
+    container_name: alloy-telemetry-agent
     ports:
-      - "9400:9400"
+      - "12345:12345"
+      - "4317:4317"
+      - "4318:4318"
+    volumes:
+      - ./config/alloy.config:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --storage.path=/tmp/alloy
+      - --server.http.listen-addr=0.0.0.0:12345
+    depends_on:
+      - loki
+      - tempo
     restart: unless-stopped
     networks:
       - llmops-net
 
-  # ==========================================
-  # 8. LOG AGGREGATION ENGINE (Grafana Loki)
-  # ==========================================
+  # ============================================================================
+  # 10. DISTRIBUTED TRACING ENGINE (Plane 5: Grafana Tempo)
+  # ============================================================================
+  tempo:
+    image: grafana/tempo:2.4.1
+    container_name: tempo-tracing-engine
+    ports:
+      - "3200:3200"
+    volumes:
+      - ./config/tempo.yaml:/etc/tempo/tempo.yaml:ro
+    command:
+      - -config.file=/etc/tempo/tempo.yaml
+    restart: unless-stopped
+    networks:
+      - llmops-net
+
+  # ============================================================================
+  # 11. LOG STORAGE ENGINE (Plane 5: Grafana Loki)
+  # ============================================================================
   loki:
     image: grafana/loki:3.0.0
     container_name: loki-engine
     ports:
-      - "3100:3100"
+      - "${LOKI_PORT:-3100}:3100"
     volumes:
       - ./config/loki.yaml:/etc/loki/local-config.yaml:ro
     command: -config.file=/etc/loki/local-config.yaml
@@ -168,25 +236,24 @@ services:
     networks:
       - llmops-net
 
-  # ==========================================
-  # 9. CONTAINER LOG COLLECTOR (Promtail)
-  # ==========================================
-  promtail:
-    image: grafana/promtail:3.0.0
-    container_name: promtail-shipper
-    volumes:
-      - ./config/promtail.yaml:/etc/promtail/config.yaml:ro
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    command: -config.file=/etc/promtail/config.yaml
-    depends_on:
-      - loki
+  # ============================================================================
+  # 12. HARDWARE TELEMETRY AGENT (Plane 4: NVIDIA DCGM Exporter)
+  # ============================================================================
+  dcgm-exporter:
+    build:
+      context: ./engine
+      dockerfile: Dockerfile.dcgm
+    image: llmops-dcgm-exporter:latest
+    container_name: dcgm-hardware-exporter
+    ports:
+      - "9400:9400"
     restart: unless-stopped
     networks:
       - llmops-net
 
-  # ==========================================
-  # 10. SYSTEM METRICS AGENT (Node Exporter)
-  # ==========================================
+  # ============================================================================
+  # 13. HOST TELEMETRY AGENT (Plane 4: Node Exporter)
+  # ============================================================================
   node-exporter:
     image: prom/node-exporter:v1.8.0
     container_name: node-exporter
@@ -204,10 +271,35 @@ services:
     networks:
       - llmops-net
 
+  # ============================================================================
+  # 14. PRODUCTION VISUALIZATION (Plane 7: Grafana 11)
+  # ============================================================================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana-dashboard
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+    volumes:
+      - ./config/grafana-datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml:ro
+      - ./config/grafana-dashboards.yaml:/etc/grafana/provisioning/dashboards/dashboards.yaml:ro
+      - ./config/llmops-dashboard.json:/var/lib/grafana/dashboards/llmops-dashboard.json:ro
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GF_SECURITY_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+      - alertmanager
+    restart: unless-stopped
+    networks:
+      - llmops-net
+
 volumes:
-  langfuse_pgdata:
+  postgres_data:
+  prometheus_data:
 
 networks:
   llmops-net:
     driver: bridge
-

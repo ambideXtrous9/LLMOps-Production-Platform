@@ -1,0 +1,65 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: llmops
+data:
+  alertmanager.yml: |
+    global:
+      resolve_timeout: 5m
+    route:
+      group_by: ['alertname', 'slo']
+      group_wait: 10s
+      group_interval: 30s
+      repeat_interval: 3h
+      receiver: 'default-receiver'
+    receivers:
+      - name: 'default-receiver'
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager-deployment
+  namespace: llmops
+  labels:
+    app: alertmanager
+    plane: alerting
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alertmanager
+  template:
+    metadata:
+      labels:
+        app: alertmanager
+    spec:
+      containers:
+        - name: alertmanager
+          image: prom/alertmanager:latest
+          args:
+            - --config.file=/etc/alertmanager/alertmanager.yml
+            - --storage.path=/alertmanager
+          ports:
+            - containerPort: 9093
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/alertmanager/alertmanager.yml
+              subPath: alertmanager.yml
+      volumes:
+        - name: config-volume
+          configMap:
+            name: alertmanager-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager-service
+  namespace: llmops
+spec:
+  selector:
+    app: alertmanager
+  ports:
+    - name: http
+      port: 9093
+      targetPort: 9093

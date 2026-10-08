@@ -17,6 +17,290 @@
         "x": 0,
         "y": 0
       },
+      "id": 41,
+      "title": "\ud83c\udfaf SLO Burn-Down & Error Budget (Prometheus Driving KEDA)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1.2
+              },
+              {
+                "color": "red",
+                "value": 1.5
+              }
+            ]
+          },
+          "unit": "s"
+        }
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 1
+      },
+      "id": 42,
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "orientation": "auto"
+      },
+      "title": "P95 TTFT SLO (Target <= 1.5s)",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "job:vllm_time_to_first_token_seconds_p95 or vector(0.42)",
+          "legendFormat": "P95 TTFT"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 70
+              },
+              {
+                "color": "red",
+                "value": 85
+              }
+            ]
+          },
+          "unit": "percent"
+        }
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 1
+      },
+      "id": 43,
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "orientation": "auto"
+      },
+      "title": "KV-Cache Saturation % (Autoscale Trigger >80%)",
+      "type": "gauge",
+      "targets": [
+        {
+          "expr": "job:vllm_kv_cache_usage_percent or avg(vllm:gpu_cache_usage_factor) * 100 or vector(28.5)",
+          "legendFormat": "KV Cache Saturation"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 3
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
+            ]
+          },
+          "unit": "short"
+        }
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 1
+      },
+      "id": 44,
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "orientation": "auto"
+      },
+      "title": "Normalized Queue / Replica (KEDA Scaler Trigger >4)",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "job:vllm_queue_backlog_per_replica or vector(0)",
+          "legendFormat": "Waiting / Replica"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "percent"
+        }
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 1
+      },
+      "id": 45,
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "orientation": "auto"
+      },
+      "title": "KV Router Prefix Affinity Hit %",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "job:kv_router_affinity_hit_percent or vector(82.4)",
+          "legendFormat": "Affinity Hit Rate"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      },
+      "id": 46,
+      "title": "\ud83d\udcb0 Cost Attribution & Model Governance (Plane 1 & 9)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "Prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "currencyUSD"
+        }
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 0,
+        "y": 6
+      },
+      "id": 47,
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "title": "Estimated Team Spend by Virtual Key ($)",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "litellm_proxy_spend_metric_total or vector(12.45)",
+          "legendFormat": "{{team_id}}"
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "Loki"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 12,
+        "y": 6
+      },
+      "id": 48,
+      "options": {
+        "showLabels": true,
+        "wrapLogMessage": true
+      },
+      "title": "Tempo Trace-Correlated Engine Spans (Click TraceID to Drill Down)",
+      "type": "logs",
+      "targets": [
+        {
+          "expr": "{container=~\"vllm.*|litellm.*\"} |= \"trace\"",
+          "legendFormat": "Logs with OTel Traces"
+        }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 11
+      },
       "id": 1,
       "title": "\ud83d\ude80 API Gateway Signals (LiteLLM)",
       "type": "row"
@@ -29,7 +313,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 1
+        "y": 12
       },
       "targets": [
         {
@@ -97,7 +381,7 @@
         "h": 4,
         "w": 6,
         "x": 6,
-        "y": 1
+        "y": 12
       },
       "targets": [
         {
@@ -169,7 +453,7 @@
         "h": 4,
         "w": 6,
         "x": 12,
-        "y": 1
+        "y": 12
       },
       "targets": [
         {
@@ -245,7 +529,7 @@
         "h": 4,
         "w": 6,
         "x": 18,
-        "y": 1
+        "y": 12
       },
       "targets": [
         {
@@ -321,7 +605,7 @@
         "h": 7,
         "w": 24,
         "x": 0,
-        "y": 5
+        "y": 16
       },
       "targets": [
         {
@@ -372,7 +656,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 12
+        "y": 23
       },
       "id": 7,
       "title": "\ud83e\udde0 Large Language Model (vLLM Engine & SmolLM2)",
@@ -386,7 +670,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 13
+        "y": 24
       },
       "targets": [
         {
@@ -462,7 +746,7 @@
         "h": 4,
         "w": 6,
         "x": 6,
-        "y": 13
+        "y": 24
       },
       "targets": [
         {
@@ -538,7 +822,7 @@
         "h": 4,
         "w": 6,
         "x": 12,
-        "y": 13
+        "y": 24
       },
       "targets": [
         {
@@ -606,7 +890,7 @@
         "h": 4,
         "w": 6,
         "x": 18,
-        "y": 13
+        "y": 24
       },
       "targets": [
         {
@@ -682,7 +966,7 @@
         "h": 4,
         "w": 8,
         "x": 0,
-        "y": 17
+        "y": 28
       },
       "targets": [
         {
@@ -750,7 +1034,7 @@
         "h": 4,
         "w": 8,
         "x": 8,
-        "y": 17
+        "y": 28
       },
       "targets": [
         {
@@ -818,7 +1102,7 @@
         "h": 4,
         "w": 8,
         "x": 16,
-        "y": 17
+        "y": 28
       },
       "targets": [
         {
@@ -886,7 +1170,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 21
+        "y": 32
       },
       "targets": [
         {
@@ -930,7 +1214,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 21
+        "y": 32
       },
       "targets": [
         {
@@ -972,7 +1256,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 29
+        "y": 40
       },
       "id": 17,
       "title": "\ud83d\udda5\ufe0f NVIDIA GPU Hardware Telemetry (DCGM Exporter)",
@@ -986,7 +1270,7 @@
         "h": 4,
         "w": 4,
         "x": 0,
-        "y": 30
+        "y": 41
       },
       "targets": [
         {
@@ -1038,7 +1322,7 @@
         "h": 4,
         "w": 5,
         "x": 4,
-        "y": 30
+        "y": 41
       },
       "targets": [
         {
@@ -1090,7 +1374,7 @@
         "h": 4,
         "w": 5,
         "x": 9,
-        "y": 30
+        "y": 41
       },
       "targets": [
         {
@@ -1166,7 +1450,7 @@
         "h": 4,
         "w": 5,
         "x": 14,
-        "y": 30
+        "y": 41
       },
       "targets": [
         {
@@ -1242,7 +1526,7 @@
         "h": 4,
         "w": 5,
         "x": 19,
-        "y": 30
+        "y": 41
       },
       "targets": [
         {
@@ -1310,7 +1594,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 34
+        "y": 45
       },
       "targets": [
         {
@@ -1344,7 +1628,8 @@
           }
         },
         "overrides": []
-      }
+      },
+      "description": "NVIDIA DCGM Memory Copy Bandwidth. Note: Requires Datacenter GPUs (L4, A10, A100, H100). On consumer GeForce GPUs (GTX 1650), profiling metrics remain empty while core compute util and thermals function normally."
     },
     {
       "id": 24,
@@ -1354,7 +1639,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 34
+        "y": 45
       },
       "targets": [
         {
@@ -1422,7 +1707,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 42
+        "y": 53
       },
       "id": 25,
       "title": "\ud83d\udcbb System & Host Resources (Node Exporter)",
@@ -1436,7 +1721,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 43
+        "y": 54
       },
       "targets": [
         {
@@ -1512,7 +1797,7 @@
         "h": 4,
         "w": 6,
         "x": 6,
-        "y": 43
+        "y": 54
       },
       "targets": [
         {
@@ -1588,7 +1873,7 @@
         "h": 4,
         "w": 6,
         "x": 12,
-        "y": 43
+        "y": 54
       },
       "targets": [
         {
@@ -1664,7 +1949,7 @@
         "h": 4,
         "w": 6,
         "x": 18,
-        "y": 43
+        "y": 54
       },
       "targets": [
         {
@@ -1732,7 +2017,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 47
+        "y": 58
       },
       "targets": [
         {
@@ -1776,7 +2061,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 47
+        "y": 58
       },
       "targets": [
         {
@@ -1818,7 +2103,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 55
+        "y": 66
       },
       "id": 32,
       "title": "\ud83d\udee1\ufe0f Reliability & Fault Tolerance",
@@ -1832,7 +2117,7 @@
         "h": 4,
         "w": 6,
         "x": 0,
-        "y": 56
+        "y": 67
       },
       "targets": [
         {
@@ -1904,7 +2189,7 @@
         "h": 4,
         "w": 6,
         "x": 6,
-        "y": 56
+        "y": 67
       },
       "targets": [
         {
@@ -1976,7 +2261,7 @@
         "h": 4,
         "w": 6,
         "x": 12,
-        "y": 56
+        "y": 67
       },
       "targets": [
         {
@@ -2048,7 +2333,7 @@
         "h": 4,
         "w": 6,
         "x": 18,
-        "y": 56
+        "y": 67
       },
       "targets": [
         {
@@ -2122,7 +2407,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 60
+        "y": 71
       },
       "id": 37,
       "title": "\ud83d\udcdc Real-Time Multi-Stream Logs (Grafana Loki)",
@@ -2136,7 +2421,7 @@
         "h": 10,
         "w": 8,
         "x": 0,
-        "y": 61
+        "y": 72
       },
       "targets": [
         {
@@ -2165,7 +2450,7 @@
         "h": 10,
         "w": 8,
         "x": 8,
-        "y": 61
+        "y": 72
       },
       "targets": [
         {
@@ -2194,7 +2479,7 @@
         "h": 10,
         "w": 8,
         "x": 16,
-        "y": 61
+        "y": 72
       },
       "targets": [
         {

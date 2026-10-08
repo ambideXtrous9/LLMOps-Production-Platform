@@ -2,8 +2,10 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: vllm-deployment
+  namespace: llmops
   labels:
     app: vllm
+    plane: gpu-inference
 spec:
   replicas: 1
   selector:
@@ -13,7 +15,13 @@ spec:
     metadata:
       labels:
         app: vllm
+        plane: gpu-inference
     spec:
+      terminationGracePeriodSeconds: 60
+      tolerations:
+        - key: "nvidia.com/gpu"
+          operator: "Exists"
+          effect: "NoSchedule"
       containers:
         - name: vllm
           image: vllm/vllm-openai:v0.6.6
@@ -24,41 +32,59 @@ spec:
             - --dtype
             - half
             - --gpu-memory-utilization
-            - "0.60"
+            - "0.85"
             - --max-model-len
             - "2048"
-            - --enforce-eager
+            - --enable-prefix-caching
+            - --otlp-traces-endpoint
+            - http://tempo.llmops.svc.cluster.local:4317
             - --host
-            - "0.0.0.0"
+            - 0.0.0.0
             - --port
             - "8000"
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+              memory: 12Gi
+            requests:
+              nvidia.com/gpu: "1"
+              memory: 8Gi
           ports:
             - containerPort: 8000
+              name: http
           volumeMounts:
-            - name: hf-cache
+            - name: model-cache
               mountPath: /root/.cache/huggingface
           readinessProbe:
             httpGet:
               path: /health
               port: 8000
-            initialDelaySeconds: 20
+            initialDelaySeconds: 30
             periodSeconds: 10
+            failureThreshold: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 15
       volumes:
-        - name: hf-cache
-          hostPath:
-            path: /root/.cache/huggingface
-            type: DirectoryOrCreate
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: llm-model-weight-cache
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: vllm-service
+  namespace: llmops
+  labels:
+    app: vllm
 spec:
-  type: NodePort
+  type: ClusterIP
   selector:
     app: vllm
   ports:
     - name: http
       port: 8000
       targetPort: 8000
-      nodePort: 30080

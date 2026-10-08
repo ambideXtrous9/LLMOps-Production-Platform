@@ -1,0 +1,25 @@
+# ==============================================================================
+# Hardware Serving Profile: Edge / CPU Fallback (llama.cpp / GGUF)
+# ==============================================================================
+# Target Hardware: x86_64 / ARM64 CPU or constrained edge devices
+# Model: SmolLM2-360M-Instruct-Q4_K_M.gguf
+# ==============================================================================
+
+engine: llamacpp
+profile_name: edge-cpu-llamacpp
+target_hardware:
+  cpu_threads: 4
+  memory_limit_mb: 2048
+  gpu_acceleration: none
+
+serving_parameters:
+  model_path: "/models/smollm2-360m-q4_k_m.gguf"
+  n_ctx: 2048
+  n_batch: 512
+  n_threads: 4
+  cont_batching: true
+
+endpoint:
+  host: "0.0.0.0"
+  port: 8080
+  api_compatibility: "openai"
