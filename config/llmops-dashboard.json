@@ -284,12 +284,13 @@
         "showLabels": true,
         "wrapLogMessage": true
       },
-      "title": "Tempo Trace-Correlated Engine Spans (Click TraceID to Drill Down)",
+      "title": "Trace-Correlated Request Logs (Click TraceID \u2192 Tempo)",
       "type": "logs",
       "targets": [
         {
-          "expr": "{container=~\"vllm.*|litellm.*\"} |= \"trace\"",
-          "legendFormat": "Logs with OTel Traces"
+          "expr": "{container=\"kv-router\"} |= \"trace_id=\"",
+          "legendFormat": "Router logs with W3C trace ids",
+          "refId": "A"
         }
       ]
     },

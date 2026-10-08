@@ -7,6 +7,7 @@ Shared zero-dependency helpers for the operational scripts (Python standard libr
   - Resolves gateway URL, team virtual key and model alias from the environment
   - OpenAI-compatible chat calls with true streaming TTFT measurement, reasoning
     deltas (`reasoning` / `reasoning_content`) and server-reported token usage
+  - A fresh W3C traceparent per request, so gateway, router and engine share one trace id
 
 Client traffic always uses a team virtual key. There is deliberately no fallback
 to the master key: a broken virtual key must fail loudly, not be masked.
@@ -120,6 +121,11 @@ def http_json(
         return status, body
 
 
+def new_traceparent() -> str:
+    """Fresh sampled W3C traceparent: version-traceid-spanid-flags."""
+    return f"00-{os.urandom(16).hex()}-{os.urandom(8).hex()}-01"
+
+
 def _delta_reasoning(delta: Dict[str, Any]) -> str:
     # vLLM >= 0.30 emits `reasoning`; LiteLLM and older engines use `reasoning_content`.
     return delta.get("reasoning_content") or delta.get("reasoning") or ""
@@ -154,6 +160,7 @@ def chat(
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
             "Accept": "text/event-stream" if stream else "application/json",
+            "traceparent": new_traceparent(),
             **(headers or {}),
         },
     )

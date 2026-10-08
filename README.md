@@ -159,9 +159,9 @@ Client App       LiteLLM (:4000)     KV Router (:8001)      vLLM (:8000)       P
     │                   │                    │                    │                     │                  │                │                 │
 ```
 
-- **One trace id** — the caller's `traceparent` is continued by the gateway and forwarded to the engine.
+- **One trace id** — the caller's `traceparent` is continued by the gateway and forwarded to the engine; the bundled scripts start a fresh one per request.
 - **Tempo** — gateway and engine spans land in a single trace.
-- **Loki** — container logs; Grafana links trace ids to Tempo.
+- **Loki** — container logs; the router logs each request's `trace_id=`, which Grafana links to Tempo.
 - **Langfuse** — the same trace id carries prompt, completion, cost and judge scores.
 
 ### 2.4 Configuration Flow

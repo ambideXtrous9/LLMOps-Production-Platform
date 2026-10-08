@@ -146,6 +146,12 @@ async def health_check_loop():
             await asyncio.sleep(HEALTH_CHECK_INTERVAL)
 
 
+def trace_id_from(headers) -> str:
+    """Trace id of an incoming W3C traceparent (version-traceid-spanid-flags), or ''."""
+    parts = headers.get("traceparent", "").split("-")
+    return parts[1] if len(parts) == 4 and len(parts[1]) == 32 else ""
+
+
 async def handle_proxy(request: web.Request) -> web.StreamResponse:
     """Proxies OpenAI requests with KV-cache prefix awareness and streaming SSE support."""
     METRICS["requests_total"] += 1
@@ -162,13 +168,16 @@ async def handle_proxy(request: web.Request) -> web.StreamResponse:
 
     prefix = ring.extract_prefix_key(payload)
     node, is_affinity = ring.select_node(prefix)
+    # trace_id=<id> lets Grafana link the log line to the request's trace in Tempo
+    trace_id = trace_id_from(request.headers)
+    trace = f" trace_id={trace_id}" if trace_id else ""
 
     if is_affinity:
         METRICS["prefix_affinity_routes"] += 1
-        logger.info(f"Routed prefix hash [{hashlib.md5(prefix.encode('utf-8')).hexdigest()[:8]}] -> {node.url} (Affinity hit)")
+        logger.info(f"Routed prefix hash [{hashlib.md5(prefix.encode('utf-8')).hexdigest()[:8]}] -> {node.url} (Affinity hit){trace}")
     else:
         METRICS["fallback_routes"] += 1
-        logger.info(f"Routed request (least-busy) -> {node.url}")
+        logger.info(f"Routed request (least-busy) -> {node.url}{trace}")
 
     target_url = f"{node.url}{full_path}"
 
