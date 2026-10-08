@@ -34,6 +34,7 @@ RULES = [
     ("gpu_arch", r"no kernel image is available for execution on the device|CUDA error: unsupported|"
                  r"compute capability .{0,40}(is not supported|not supported)"),
     ("disk", r"No space left on device"),
+    ("args", r"unrecognized arguments|error: argument --|invalid choice:"),
     ("dtype", r"Bfloat16 is only supported on GPUs"),
     ("gpu_share", r"less than desired GPU memory utilization"),
     ("context", r"estimated maximum model length is|larger than the maximum number of tokens that can be stored in KV cache"),
@@ -92,12 +93,17 @@ def fallback_model(env: Dict[str, str]) -> Optional[str]:
 
 def decide(env: Dict[str, str], text: str, oom_killed: bool, platform_name: str = "cuda") -> Dict[str, str]:
     kind = "memory" if oom_killed else classify(text)
-    on_gpu = platform_name in ("cuda", "rocm")
+    on_gpu = platform_name in ("cuda", "rocm", "metal")  # accelerators with a CPU last resort
     if kind == "gpu_arch" and on_gpu:
         return {"DOCTOR_ACTION": "cpu", "DOCTOR_REASON": "this GPU cannot run vLLM's kernels: running the engine on CPU"}
     model = env.get("MODEL_NAME", "the model")
     retries = int(env.get("ENGINE_RETRIES") or 0)
 
+    if kind == "args" and (env.get("VLLM_MODEL_ARGS") or "").strip():
+        # e.g. an older engine build (vllm-metal) without a parser flag: serve without them
+        return {"DOCTOR_ACTION": "set", "DOCTOR_KEY": "VLLM_MODEL_ARGS", "DOCTOR_VALUE": "", "DOCTOR_PERSIST": "0",
+                "DOCTOR_REASON": "the engine rejected the model's flags (reasoning / tool parsers): "
+                                 "serving without them this run"}
     if kind == "dtype" and env.get("MODEL_DTYPE", "auto") not in ("half", "float16"):
         return {"DOCTOR_ACTION": "set", "DOCTOR_KEY": "MODEL_DTYPE", "DOCTOR_VALUE": "half", "DOCTOR_PERSIST": "1",
                 "DOCTOR_REASON": "GPU has no bfloat16 support: engine dtype set to float16 (saved in .env)"}

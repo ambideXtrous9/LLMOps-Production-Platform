@@ -231,7 +231,7 @@ configure_model() {
 # decide_model: on an existing .env, re-size the model when the platform changed, and
 # retry a model the last run gave up only because the GPU was shared at the time
 decide_model() {
-    local cfg_platform cfg_preset previous
+    local cfg_platform cfg_preset previous repair
     if [ -n "$MODEL_ARG" ] || [ "$TARGET_BACKEND" = "mock" ]; then return 0; fi
     cfg_platform="$(env_get MODEL_PLATFORM)"
     cfg_preset="$(env_get MODEL_PRESET)"
@@ -244,6 +244,11 @@ decide_model() {
     elif [ -n "$previous" ]; then
         MODEL_ARG="$previous"
         fixed "Retrying ${previous}: the last run fell back to a smaller model because the GPU was shared"
+    fi
+    # a model block whose names and weights disagree (e.g. duplicated keys) is rebuilt
+    if [ -z "$MODEL_ARG" ] && ! repair="$(python3 scripts/configure_model.py --check-preset 2>/dev/null)" && [ -n "$repair" ]; then
+        MODEL_ARG="$repair"
+        fixed "Model settings in .env did not match their preset: re-applied ${repair}"
     fi
 }
 
@@ -341,23 +346,56 @@ enable_nvidia_runtime() {
     echo -e "  ${YELLOW}⚠ NVIDIA GPU found but Docker cannot use it; the engine runs on CPU (enable the GPU once: bash scripts/bootstrap_host.sh).${NC}"
 }
 
-# Apple Silicon: the engine runs natively (Docker cannot reach the Metal GPU). vllm-metal
-# is installed with Homebrew when missing; without it the engine runs on CPU in Docker.
+# metal_vllm: path of a working vllm-metal CLI (Homebrew puts it on PATH, the official
+# installer in ~/.venv-vllm-metal)
+metal_vllm() {
+    local cli
+    for cli in "$(command -v vllm 2>/dev/null || true)" "$HOME/.venv-vllm-metal/bin/vllm" /opt/homebrew/bin/vllm; do
+        if [ -n "$cli" ] && [ -x "$cli" ] && "$cli" --version >/dev/null 2>&1; then echo "$cli"; return 0; fi
+    done
+    return 1
+}
+
+# Apple Silicon: the engine is vllm-metal, running natively (Docker cannot reach the Metal
+# GPU). It is installed when missing - Homebrew first, then the project's official installer
+# - with the output kept in reports/metal-install.log. Only if neither works does the engine
+# run on CPU (llama.cpp) in Docker.
 ensure_metal_cli() {
-    local port="8000"
+    local port="8000" macos brew log="reports/metal-install.log"
     if [ -f .env ]; then port="$(env_get METAL_ENGINE_PORT)"; port="${port:-8000}"; fi
-    if command -v vllm >/dev/null 2>&1 || curl -sf "http://localhost:${port}/health" >/dev/null 2>&1; then
+    if metal_vllm >/dev/null || curl -sf "http://localhost:${port}/health" >/dev/null 2>&1; then
         return 0
     fi
-    if command -v brew >/dev/null 2>&1; then
-        echo -e "  Installing vllm-metal with Homebrew (one time)..."
-        HOMEBREW_NO_AUTO_UPDATE=1 brew tap vllm-project/vllm-metal https://github.com/vllm-project/vllm-metal >/dev/null 2>&1 || true
-        HOMEBREW_NO_AUTO_UPDATE=1 brew install vllm-project/vllm-metal/vllm-metal >/dev/null 2>&1 || true
+    macos="$(sw_vers -productVersion 2>/dev/null || echo 0)"
+    if [ "${macos%%.*}" -lt 15 ]; then
+        fixed "vllm-metal needs macOS 15 or newer (this Mac runs ${macos}): the engine runs on CPU (llama.cpp) in Docker"
+        set_platform cpu
+        RECOMMENDED_PRESET="$CPU_PRESET"
+        return 0
     fi
-    if command -v vllm >/dev/null 2>&1; then
-        fixed "Installed vllm-metal (Homebrew) for the native Apple Silicon engine"
+    mkdir -p reports
+    : > "$log"
+    brew="$(command -v brew 2>/dev/null || true)"
+    for candidate in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+        if [ -z "$brew" ] && [ -x "$candidate" ]; then brew="$candidate"; fi
+    done
+    if [ -n "$brew" ]; then
+        echo -e "  Installing vllm-metal with Homebrew (one time; log: ${log})..."
+        HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 "$brew" tap vllm-project/vllm-metal \
+            https://github.com/vllm-project/vllm-metal >>"$log" 2>&1 || true
+        HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 "$brew" install vllm-project/vllm-metal/vllm-metal \
+            >>"$log" 2>&1 || true
+    fi
+    if ! metal_vllm >/dev/null; then
+        echo -e "  Installing vllm-metal with its official installer (one time; log: ${log})..."
+        { curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash; } >>"$log" 2>&1 || true
+    fi
+    if metal_vllm >/dev/null; then
+        fixed "Installed vllm-metal ($(metal_vllm)) for the native Apple Silicon engine"
     else
-        fixed "vllm-metal could not be installed: the engine runs on CPU in Docker instead"
+        echo -e "  ${RED}✗ vllm-metal could not be installed. Last lines of ${log}:${NC}"
+        tail -n 12 "$log" | sed 's/^/    /'
+        fixed "vllm-metal could not be installed (details in ${log}): the engine runs on CPU (llama.cpp) in Docker"
         set_platform cpu
         RECOMMENDED_PRESET="$CPU_PRESET"
     fi
@@ -400,7 +438,7 @@ start_engine() {
         # an engine you started yourself on the port is used as is
         if [ -f reports/metal-engine.pid ] || ! curl -sf "http://localhost:${VLLM_PORT}/health" >/dev/null 2>&1; then
             stop_metal_engine
-            nohup python3 scripts/serve_metal.py --otlp > reports/metal-engine.log 2>&1 &
+            nohup python3 scripts/serve_metal.py > reports/metal-engine.log 2>&1 &
             echo $! > reports/metal-engine.pid
         fi
     fi

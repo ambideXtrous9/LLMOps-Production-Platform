@@ -32,7 +32,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from configure_model import parse_env_file  # noqa: E402
-from detect_hardware import host_ram_gb  # noqa: E402
+from detect_hardware import container_capacity  # noqa: E402
 from init_env import ENV_PATH, set_env_values  # noqa: E402
 
 # (variable, default, bind-address variable) for every port the stack publishes on the host
@@ -113,9 +113,11 @@ def cmd_ports(platform_name: str) -> int:
     chosen: Dict[str, int] = {}
     persist: Dict[str, str] = {}
     exports: Dict[str, str] = {}
-    for var, default, bind_var in PORTS:
-        if var == "VLLM_PORT" and platform_name == "metal":
-            continue  # the native engine owns this port on Apple Silicon
+    ports = PORTS
+    if platform_name == "metal":  # the native engine listens on METAL_ENGINE_PORT (host loopback)
+        ports = [("METAL_ENGINE_PORT", 8000, "LOOPBACK") if p[0] == "VLLM_PORT" else p for p in PORTS]
+        cfg = {**cfg, "LOOPBACK": "127.0.0.1"}
+    for var, default, bind_var in ports:
         raw = (cfg.get(var) or "").strip()
         port = int(raw) if raw.isdigit() and 0 < int(raw) < 65536 else default
         host = (exports.get(bind_var) or cfg.get(bind_var) or "127.0.0.1").strip()
@@ -199,8 +201,9 @@ def cmd_fit(platform_name: str) -> int:
                 note(f"  ↻ GPU is shared with other processes: engine memory fraction {configured:.2f} -> {fraction:.2f}")
 
     if platform_name == "cpu":
-        # llama.cpp: one KV cache of LLAMACPP_CTX tokens shared (--kv-unified) by the slots
-        ram = host_ram_gb()
+        # llama.cpp: one KV cache of LLAMACPP_CTX tokens shared (--kv-unified) by the slots;
+        # sized from what the container gets (Docker Desktop VMs are smaller than the host)
+        ram, threads = container_capacity()
         ctx = (cfg.get("LLAMACPP_CTX") or "").strip().lower()
         if ctx in ("", "auto"):
             exports["LLAMACPP_CTX"] = str(32768 if ram >= 32 else 16384 if ram >= 16 else 8192)

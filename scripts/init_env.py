@@ -54,6 +54,26 @@ def add_missing_secrets() -> list:
     return sorted(missing)
 
 
+def dedupe_env() -> list:
+    """Keeps one assignment per key: the last (what bash `source` and compose use), placed
+    where the key first appears. A duplicated key otherwise lets a stale value win silently."""
+    with open(ENV_PATH, encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    keyed = [(i, line.split("=", 1)[0].strip()) for i, line in enumerate(lines)
+             if "=" in line and not line.lstrip().startswith("#")]
+    last = {key: i for i, key in keyed}
+    if len(last) == len(keyed):
+        return []
+    first = {}
+    for i, key in keyed:
+        first.setdefault(key, i)
+    out = [lines[last[key]] if (key := dict(keyed).get(i)) and first[key] == i else line
+           for i, line in enumerate(lines) if i not in dict(keyed) or first[dict(keyed)[i]] == i]
+    with open(ENV_PATH, "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
+    return sorted(k for k in last if sum(1 for _, kk in keyed if kk == k) > 1)
+
+
 def quote(value: str) -> str:
     """Quoting that bash `source`, docker compose and llmops_client.load_env all read back verbatim."""
     if value == "" or re.fullmatch(r"[A-Za-z0-9_./:@%+,=-]+", value):
@@ -105,6 +125,8 @@ if __name__ == "__main__":
         ensure_env()
         print("created")
     else:
+        dupes = dedupe_env()
         added = add_missing_secrets()
-        print(f"updated: added {', '.join(added)}" if added else "exists")
+        notes = ([f"added {', '.join(added)}"] if added else []) + ([f"removed duplicate {', '.join(dupes)}"] if dupes else [])
+        print(f"updated: {'; '.join(notes)}" if notes else "exists")
     sys.exit(0)

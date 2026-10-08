@@ -26,7 +26,7 @@ import platform
 import re
 import shutil
 import subprocess
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 OVERLAYS = {
     "cuda": "docker-compose.gpu.yml",
@@ -57,6 +57,22 @@ def host_ram_gb() -> float:
     except OSError:
         pass
     return 0.0
+
+
+def docker_resources() -> Tuple[float, int]:
+    """(RAM GB, CPUs) available to containers. Docker Desktop (macOS / Windows) runs them in
+    a VM that is usually smaller than the host; on Linux this equals the host."""
+    parts = run_cmd("docker info --format '{{.MemTotal}} {{.NCPU}}'").split()
+    if len(parts) == 2 and all(p.isdigit() for p in parts):
+        return int(parts[0]) / 1024 ** 3, int(parts[1])
+    return 0.0, 0
+
+
+def container_capacity() -> Tuple[float, int]:
+    """RAM GB and threads the CPU engine container can actually use."""
+    ram, threads = host_ram_gb(), os.cpu_count() or 0
+    vm_ram, vm_cpus = docker_resources()
+    return (min(ram, vm_ram) if vm_ram else ram), (min(threads, vm_cpus) if vm_cpus else threads)
 
 
 def preset_for_cpu(ram_gb: float, threads: int) -> str:
@@ -152,12 +168,13 @@ def analyze_hardware() -> Dict[str, Any]:
         (name for name, res in found.items() if res.get("supported") and res.get("docker_runtime", True)),
         "cpu",
     )
-    cores = os.cpu_count() or 0
-    ram_gb = host_ram_gb()
-    cpu_preset = preset_for_cpu(ram_gb, cores)
+    cores, ram_gb = os.cpu_count() or 0, host_ram_gb()
+    cpu_ram, cpu_threads = container_capacity()
+    cpu_preset = preset_for_cpu(cpu_ram, cpu_threads)
     unusable = [n for n, r in found.items() if r.get("supported") and not r.get("docker_runtime", True)]
     if backend == "cpu":
-        res = {"summary": f"Generic CPU ({platform.machine()}, {cores} threads, {ram_gb:.0f} GB RAM)",
+        vm = f"; containers get {cpu_ram:.0f} GB / {cpu_threads} threads" if (cpu_ram, cpu_threads) != (ram_gb, cores) else ""
+        res = {"summary": f"Generic CPU ({platform.machine()}, {cores} threads, {ram_gb:.0f} GB RAM{vm})",
                "profile": "cpu-llamacpp.yaml", "preset": cpu_preset}
         hints = [r["hint"] for r in found.values() if r.get("hint")]
         notes = (f"{', '.join(unusable)} accelerator found but not usable from Docker (NVIDIA container toolkit: "

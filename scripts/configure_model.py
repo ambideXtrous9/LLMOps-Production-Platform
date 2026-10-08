@@ -294,9 +294,22 @@ def main() -> int:
     parser.add_argument("--platform", choices=["cuda", "rocm", "cpu", "metal", "mock"],
                         help="target platform: sets latency/throughput gates for auto-profiled models")
     parser.add_argument("--dry-run", action="store_true", help="print the model block without writing .env")
+    parser.add_argument("--check-preset", action="store_true",
+                        help="exit 1 and print the preset to re-apply when .env's model block no longer matches it")
     args = parser.parse_args()
 
     presets = list_presets()
+    if args.check_preset:
+        env = parse_env_file(ENV_PATH) if os.path.exists(ENV_PATH) else {}
+        preset = env.get("MODEL_PRESET", "")
+        if preset not in presets:
+            return 0  # auto-profiled / hand-made blocks are the user's own
+        expected = load_preset(preset)
+        if all(env.get(k, "") == expected.get(k, "") for k in ("MODEL_NAME", "SERVED_MODEL_NAME")):
+            return 0
+        # mixed block (e.g. duplicated keys): the weights decide which preset it really is
+        print(next((name for name in presets if load_preset(name).get("MODEL_NAME") == env.get("MODEL_NAME")), preset))
+        return 1
     if args.list or not args.model:
         print("Curated presets (models/presets/):")
         for name, summary in presets.items():
