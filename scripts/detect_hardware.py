@@ -7,7 +7,7 @@ Detects (in priority order):
   1. Apple Silicon (M1-M4)  -> metal : native vllm-metal on macOS, bridged into compose
   2. NVIDIA CUDA GPUs        -> cuda  : vllm/vllm-openai + DCGM exporter
   3. AMD ROCm GPUs           -> rocm  : vllm/vllm-openai-rocm
-  4. Anything else           -> cpu   : vllm/vllm-openai-cpu (real inference on CPU)
+  4. Anything else           -> cpu   : llama.cpp server (GGUF, the fastest CPU engine)
 
 For each platform it recommends a compose overlay and a model preset
 (models/presets/) sized for the available accelerator memory. Any Hugging Face
@@ -26,7 +26,7 @@ import platform
 import re
 import shutil
 import subprocess
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 OVERLAYS = {
     "cuda": "docker-compose.gpu.yml",
@@ -59,10 +59,26 @@ def host_ram_gb() -> float:
     return 0.0
 
 
+def docker_resources() -> Tuple[float, int]:
+    """(RAM GB, CPUs) available to containers. Docker Desktop (macOS / Windows) runs them in
+    a VM that is usually smaller than the host; on Linux this equals the host."""
+    parts = run_cmd("docker info --format '{{.MemTotal}} {{.NCPU}}'").split()
+    if len(parts) == 2 and all(p.isdigit() for p in parts):
+        return int(parts[0]) / 1024 ** 3, int(parts[1])
+    return 0.0, 0
+
+
+def container_capacity() -> Tuple[float, int]:
+    """RAM GB and threads the CPU engine container can actually use."""
+    ram, threads = host_ram_gb(), os.cpu_count() or 0
+    vm_ram, vm_cpus = docker_resources()
+    return (min(ram, vm_ram) if vm_ram else ram), (min(threads, vm_cpus) if vm_cpus else threads)
+
+
 def preset_for_cpu(ram_gb: float, threads: int) -> str:
-    """CPU decode is memory-bandwidth bound: Qwen3-4B needs a workstation / server class
-    host (it runs ~10 tok/s/stream on 30 EPYC threads); smaller hosts get a tiny model."""
-    return "qwen3-4b" if ram_gb >= 24 and threads >= 16 else "smollm2-360m"
+    """CPU engine = llama.cpp with 4-bit GGUF weights: Qwen3-4B (2.5 GB) fits any machine
+    with 12 GB RAM and 4+ threads next to the rest of the stack; smaller hosts get a tiny model."""
+    return "qwen3-4b" if ram_gb >= 12 and threads >= 4 else "smollm2-360m"
 
 
 def preset_for_accelerator(mem_mb: int) -> str:
@@ -152,17 +168,18 @@ def analyze_hardware() -> Dict[str, Any]:
         (name for name, res in found.items() if res.get("supported") and res.get("docker_runtime", True)),
         "cpu",
     )
-    cores = os.cpu_count() or 0
-    ram_gb = host_ram_gb()
-    cpu_preset = preset_for_cpu(ram_gb, cores)
+    cores, ram_gb = os.cpu_count() or 0, host_ram_gb()
+    cpu_ram, cpu_threads = container_capacity()
+    cpu_preset = preset_for_cpu(cpu_ram, cpu_threads)
     unusable = [n for n, r in found.items() if r.get("supported") and not r.get("docker_runtime", True)]
     if backend == "cpu":
-        res = {"summary": f"Generic CPU ({platform.machine()}, {cores} threads, {ram_gb:.0f} GB RAM)",
-               "profile": "cpu-vllm.yaml", "preset": cpu_preset}
+        vm = f"; containers get {cpu_ram:.0f} GB / {cpu_threads} threads" if (cpu_ram, cpu_threads) != (ram_gb, cores) else ""
+        res = {"summary": f"Generic CPU ({platform.machine()}, {cores} threads, {ram_gb:.0f} GB RAM{vm})",
+               "profile": "cpu-llamacpp.yaml", "preset": cpu_preset}
         hints = [r["hint"] for r in found.values() if r.get("hint")]
         notes = (f"{', '.join(unusable)} accelerator found but not usable from Docker (NVIDIA container toolkit: "
                  "bash scripts/bootstrap_host.sh). " if unusable else "") + "".join(h + ". " for h in hints) + \
-                "Real inference on CPU with vLLM's CPU backend."
+                "Real inference on CPU with llama.cpp (GGUF)."
     else:
         res = found[backend]
         notes = {"metal": "Native vllm-metal engine on macOS, bridged into the compose network.",

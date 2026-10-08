@@ -14,10 +14,13 @@ Features:
 - Full streaming SSE (Server-Sent Events) pass-through with chunked streaming
 - W3C Trace Context (traceparent) propagation for OpenTelemetry & Tempo
 - Prometheus metrics exporter endpoint (/metrics) for prefix affinity hit rates
+- Engine-agnostic: vLLM (GPU, Apple Silicon) and llama.cpp (CPU) backends; for
+  llama.cpp it also exports busy/total request slots (the engine's load signal)
 """
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -39,6 +42,9 @@ HEALTH_CHECK_INTERVAL = int(os.getenv("HEALTH_CHECK_INTERVAL", "5"))
 # Max seconds between upstream bytes. Deliberately not a total-request timeout:
 # long (thinking-mode) generations legitimately stream for many minutes.
 DEFAULT_TIMEOUT = int(os.getenv("ROUTER_TIMEOUT", "600"))
+# When set (an external gateway reaches the router over the network), every proxied request
+# must carry "Authorization: Bearer <ROUTER_API_KEY>"; /health and /metrics stay open.
+ROUTER_API_KEY = os.getenv("ROUTER_API_KEY", "").strip()
 HOP_BY_HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade", "content-length", "host",
@@ -59,6 +65,7 @@ class BackendNode:
         self.is_healthy = True
         self.active_requests = 0
         self.last_check = 0.0
+        self.slots_supported: Optional[bool] = None  # llama.cpp serves /slots, vLLM does not
 
     async def check_health(self, session: ClientSession) -> bool:
         try:
@@ -68,6 +75,25 @@ class BackendNode:
             self.is_healthy = False
         self.last_check = time.time()
         return self.is_healthy
+
+    async def slot_load(self, session: ClientSession) -> Optional[Tuple[int, int]]:
+        """(busy, total) request slots of a llama.cpp backend; None for engines without /slots."""
+        if self.slots_supported is False or not self.is_healthy:
+            return None
+        try:
+            async with session.get(f"{self.url}/slots", timeout=ClientTimeout(total=2.0)) as resp:
+                if resp.status != 200:
+                    if resp.status == 404:
+                        self.slots_supported = False
+                    return None
+                slots = await resp.json(content_type=None)
+        except Exception:
+            return None
+        if not isinstance(slots, list):
+            self.slots_supported = False
+            return None
+        self.slots_supported = True
+        return sum(1 for s in slots if isinstance(s, dict) and s.get("is_processing")), len(slots)
 
 
 class KVHashRing:
@@ -154,6 +180,8 @@ def trace_id_from(headers) -> str:
 
 async def handle_proxy(request: web.Request) -> web.StreamResponse:
     """Proxies OpenAI requests with KV-cache prefix awareness and streaming SSE support."""
+    if ROUTER_API_KEY and not hmac.compare_digest(request.headers.get("Authorization", ""), f"Bearer {ROUTER_API_KEY}"):
+        return web.json_response({"error": "missing or invalid router key"}, status=401)
     METRICS["requests_total"] += 1
     path = request.match_info.get("tail", "")
     full_path = f"/{path}" if path else request.path
@@ -240,10 +268,20 @@ async def handle_metrics(request: web.Request) -> web.Response:
         "# HELP kv_router_fallback_routes Total requests routed via fallback least-busy",
         "# TYPE kv_router_fallback_routes counter",
         f"kv_router_fallback_routes {METRICS['fallback_routes']}",
-        "# HELP kv_router_active_backends Active healthy vLLM backends",
+        "# HELP kv_router_active_backends Active healthy engine backends",
         "# TYPE kv_router_active_backends gauge",
         f"kv_router_active_backends {METRICS['active_backends']}",
     ]
+    # llama.cpp backends: busy / total slots, read at scrape time so the gauge is current
+    loads = await asyncio.gather(*(n.slot_load(request.app["upstream_session"]) for n in ring.nodes))
+    slotted = [(n.url, load) for n, load in zip(ring.nodes, loads) if load]
+    if slotted:
+        lines += ["# HELP kv_router_backend_slots_total Request slots of each llama.cpp backend",
+                  "# TYPE kv_router_backend_slots_total gauge"]
+        lines += [f'kv_router_backend_slots_total{{backend="{url}"}} {total}' for url, (_, total) in slotted]
+        lines += ["# HELP kv_router_backend_slots_busy Slots processing a request on each llama.cpp backend",
+                  "# TYPE kv_router_backend_slots_busy gauge"]
+        lines += [f'kv_router_backend_slots_busy{{backend="{url}"}} {busy}' for url, (busy, _) in slotted]
     return web.Response(text="\n".join(lines) + "\n", content_type="text/plain")
 
 

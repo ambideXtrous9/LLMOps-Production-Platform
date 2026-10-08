@@ -1,0 +1,3 @@
+user default on >byo-admin-pass ~* &* +@all
+user byo_rw on >byo-rw-pass ~* &* +@all
+user byo_ro on >byo-ro-pass ~* &* -@all +@read +@connection +info +ping +select

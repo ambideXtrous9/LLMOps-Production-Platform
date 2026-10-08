@@ -7,7 +7,7 @@
 # device wiring:
 #   docker-compose.gpu.yml    NVIDIA CUDA  (vllm/vllm-openai)       + NVIDIA DCGM exporter
 #   docker-compose.rocm.yml   AMD ROCm     (vllm/vllm-openai-rocm)
-#   docker-compose.cpu.yml    x86_64/arm64 CPU (vllm/vllm-openai-cpu)
+#   docker-compose.cpu.yml    x86_64/arm64 CPU (llama.cpp server, GGUF)
 #   docker-compose.metal.yml  Apple Silicon: native vllm-metal on macOS, bridged in
 #   docker-compose.mock.yml   no inference at all: emulated engine for UI / pipeline dev
 #
@@ -85,8 +85,10 @@ services:
       - VLLM_BACKENDS=http://vllm:8000
       # Max seconds between upstream bytes (long thinking-mode generations stream for minutes).
       - ROUTER_TIMEOUT=${ROUTER_TIMEOUT:-600}
+      # set when an external gateway reaches the router: model requests need this bearer key
+      - ROUTER_API_KEY=${ROUTER_API_KEY:-}
     ports:
-      - "${BIND_ADDRESS:-127.0.0.1}:${ROUTER_PORT:-8001}:8000"
+      - "${ROUTER_BIND_ADDRESS:-${BIND_ADDRESS:-127.0.0.1}}:${ROUTER_PORT:-8001}:8000"
     # The router tracks backend health itself; it must not block on the engine
     # finishing a multi-minute model load.
     depends_on:
@@ -110,8 +112,10 @@ services:
       - ./config/pii_guardrail.py:/app/pii_guardrail.py:ro
     environment:
       - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-admin-master-sec-9a8b7c6d5e4f3a2b1c0d}
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-llmops_admin}:${POSTGRES_PASSWORD:-llmops_production_secure_pass_2026}@postgres:5432/${POSTGRES_DB:-litellm_db}
-      - REDIS_URL=redis://:${REDIS_PASSWORD:-redis_cluster_production_pass_2026}@redis:6379
+      # Bundled Postgres / Redis unless run_all.sh found usable external ones (EXTERNAL_* in .env)
+      - DATABASE_URL=${LITELLM_DATABASE_URL:-postgresql://${POSTGRES_USER:-llmops_admin}:${POSTGRES_PASSWORD:-llmops_production_secure_pass_2026}@postgres:5432/${POSTGRES_DB:-litellm_db}}
+      - REDIS_URL=${LITELLM_REDIS_URL:-redis://:${REDIS_PASSWORD:-redis_cluster_production_pass_2026}@redis:6379}
+      - ROUTER_API_KEY=${ROUTER_API_KEY:-}
       - KV_ROUTER_URL=http://kv-router:8000/v1
       - VLLM_DIRECT_URL=http://vllm:8000/v1
       # OTLP/HTTP -> Alloy -> Tempo (LiteLLM infers the otlp_http exporter from the endpoint)
@@ -121,7 +125,7 @@ services:
       # (possibly public) gateway port requires a key (require_auth_for_metrics_endpoint).
       - PROMETHEUS_METRICS_PORT=9095
       # LLM traces -> Langfuse (callback langfuse_otel -> ${LANGFUSE_HOST}/api/public/otel)
-      - LANGFUSE_HOST=http://langfuse:3000
+      - LANGFUSE_HOST=${LITELLM_LANGFUSE_HOST:-http://langfuse:3000}
       - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-pk-lf-llmops-public-key}
       - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-sk-lf-llmops-secret-key}
       # Engine model settings -> generated gateway routes (config/render_litellm_config.py)
@@ -139,6 +143,8 @@ services:
       - python3 /app/render_litellm_config.py /app/config.yaml /app/litellm.generated.yaml && exec docker/prod_entrypoint.sh "$$@"
       - litellm-entrypoint
     command: ["--config", "/app/litellm.generated.yaml", "--port", "4000", "--num_workers", "${LITELLM_NUM_WORKERS:-4}"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # external services on this host
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness', timeout=3)\""]
       interval: 10s
@@ -209,33 +215,35 @@ services:
     image: langfuse/langfuse-worker:${LANGFUSE_VERSION:-4.54.0}
     container_name: langfuse-worker
     environment: &langfuse-env
-      DATABASE_URL: postgresql://${POSTGRES_USER:-llmops_admin}:${POSTGRES_PASSWORD:-llmops_production_secure_pass_2026}@postgres:5432/langfuse
+      # connection_limit: Prisma otherwise opens ~2 x CPU cores connections per process
+      DATABASE_URL: ${LANGFUSE_DATABASE_URL:-postgresql://${POSTGRES_USER:-llmops_admin}:${POSTGRES_PASSWORD:-llmops_production_secure_pass_2026}@postgres:5432/langfuse?connection_limit=10}
       NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3000}
       SALT: ${LANGFUSE_SALT:-sec-salt-83920194857291048572910485}
       ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}
       TELEMETRY_ENABLED: "false"
-      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
-      CLICKHOUSE_URL: http://clickhouse:8123
-      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse_production_pass_2026}
+      CLICKHOUSE_MIGRATION_URL: ${LANGFUSE_CLICKHOUSE_MIGRATION_URL:-clickhouse://clickhouse:9000}
+      CLICKHOUSE_URL: ${LANGFUSE_CLICKHOUSE_URL:-http://clickhouse:8123}
+      CLICKHOUSE_USER: ${LANGFUSE_CLICKHOUSE_USER:-${CLICKHOUSE_USER:-clickhouse}}
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:-${CLICKHOUSE_PASSWORD:-clickhouse_production_pass_2026}}
+      CLICKHOUSE_DB: ${LANGFUSE_CLICKHOUSE_DB:-default}
       CLICKHOUSE_CLUSTER_ENABLED: "false"
-      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
-      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
-      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minio}
-      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioproductionpass2026}
-      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
-      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: ${LANGFUSE_S3_BUCKET:-langfuse}
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: ${LANGFUSE_S3_REGION:-auto}
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_ACCESS_KEY_ID:-${MINIO_ROOT_USER:-minio}}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_SECRET_ACCESS_KEY:-${MINIO_ROOT_PASSWORD:-minioproductionpass2026}}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: ${LANGFUSE_S3_ENDPOINT:-http://minio:9000}
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: ${LANGFUSE_S3_FORCE_PATH_STYLE:-true}
       LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
-      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
-      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
-      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minio}
-      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioproductionpass2026}
-      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
-      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: ${LANGFUSE_S3_BUCKET:-langfuse}
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: ${LANGFUSE_S3_REGION:-auto}
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_ACCESS_KEY_ID:-${MINIO_ROOT_USER:-minio}}
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_SECRET_ACCESS_KEY:-${MINIO_ROOT_PASSWORD:-minioproductionpass2026}}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: ${LANGFUSE_S3_ENDPOINT:-http://minio:9000}
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: ${LANGFUSE_S3_FORCE_PATH_STYLE:-true}
       LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
-      REDIS_HOST: redis
-      REDIS_PORT: "6379"
-      REDIS_AUTH: ${REDIS_PASSWORD:-redis_cluster_production_pass_2026}
+      REDIS_CONNECTION_STRING: ${LANGFUSE_REDIS_CONNECTION_STRING:-redis://:${REDIS_PASSWORD:-redis_cluster_production_pass_2026}@redis:6379}
+    extra_hosts: &langfuse-extra-hosts
+      - "host.docker.internal:host-gateway"  # external services on this host
     depends_on: &langfuse-depends-on
       postgres:
         condition: service_healthy
@@ -266,6 +274,7 @@ services:
       LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_ADMIN_EMAIL:-admin@llmops.local}
       LANGFUSE_INIT_USER_NAME: admin
       LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_ADMIN_PASSWORD:-llmops-admin-password}
+    extra_hosts: *langfuse-extra-hosts
     depends_on: *langfuse-depends-on
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://$$(hostname -i):3000/api/public/health || exit 1"]

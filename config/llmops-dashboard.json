@@ -538,7 +538,7 @@
             "type": "prometheus",
             "uid": "Prometheus"
           },
-          "expr": "max(histogram_quantile(0.95, sum(rate(vllm:e2e_request_latency_seconds_bucket[5m])) by (le)) > 0) or vector(0)",
+          "expr": "max(histogram_quantile(0.95, sum(rate(vllm:e2e_request_latency_seconds_bucket[5m])) by (le)) > 0) or max(histogram_quantile(0.95, sum(rate(litellm_llm_api_latency_metric_bucket[5m])) by (le)) > 0) or vector(0)",
           "refId": "A",
           "legendFormat": " "
         }
@@ -614,7 +614,7 @@
             "type": "prometheus",
             "uid": "Prometheus"
           },
-          "expr": "histogram_quantile(0.50, sum(rate(vllm:e2e_request_latency_seconds_bucket[5m])) by (le))",
+          "expr": "histogram_quantile(0.50, sum(rate(vllm:e2e_request_latency_seconds_bucket[5m])) by (le)) or histogram_quantile(0.50, sum(rate(litellm_llm_api_latency_metric_bucket[5m])) by (le))",
           "legendFormat": "P50 Latency (Median)",
           "refId": "A"
         },
@@ -623,7 +623,7 @@
             "type": "prometheus",
             "uid": "Prometheus"
           },
-          "expr": "histogram_quantile(0.95, sum(rate(vllm:e2e_request_latency_seconds_bucket[5m])) by (le))",
+          "expr": "histogram_quantile(0.95, sum(rate(vllm:e2e_request_latency_seconds_bucket[5m])) by (le)) or histogram_quantile(0.95, sum(rate(litellm_llm_api_latency_metric_bucket[5m])) by (le))",
           "legendFormat": "P95 Latency (Tail)",
           "refId": "B"
         },
@@ -632,7 +632,7 @@
             "type": "prometheus",
             "uid": "Prometheus"
           },
-          "expr": "histogram_quantile(0.99, sum(rate(vllm:e2e_request_latency_seconds_bucket[5m])) by (le))",
+          "expr": "histogram_quantile(0.99, sum(rate(vllm:e2e_request_latency_seconds_bucket[5m])) by (le)) or histogram_quantile(0.99, sum(rate(litellm_llm_api_latency_metric_bucket[5m])) by (le))",
           "legendFormat": "P99 Latency (Worst)",
           "refId": "C"
         }
@@ -660,7 +660,7 @@
         "y": 23
       },
       "id": 7,
-      "title": "\ud83e\udde0 Large Language Model (vLLM Engine)",
+      "title": "\ud83e\udde0 Inference Engine (vLLM on GPU \u00b7 llama.cpp on CPU)",
       "type": "row"
     },
     {
@@ -679,7 +679,7 @@
             "type": "prometheus",
             "uid": "Prometheus"
           },
-          "expr": "max((rate(vllm:time_to_first_token_seconds_sum[1m]) / (rate(vllm:time_to_first_token_seconds_count[1m]) > 0)) > 0) or vector(0)",
+          "expr": "max((rate(vllm:time_to_first_token_seconds_sum[1m]) / (rate(vllm:time_to_first_token_seconds_count[1m]) > 0)) > 0) or vector(0) or max(rate(litellm_llm_api_time_to_first_token_metric_sum[1m]) / (rate(litellm_llm_api_time_to_first_token_metric_count[1m]) > 0))",
           "refId": "A",
           "legendFormat": " "
         }
@@ -2445,7 +2445,7 @@
     },
     {
       "id": 39,
-      "title": "\u26a1 vLLM Engine Inference Logs",
+      "title": "\u26a1 Inference Engine Logs",
       "type": "logs",
       "gridPos": {
         "h": 10,

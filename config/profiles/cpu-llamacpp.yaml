@@ -1,0 +1,22 @@
+# ==============================================================================
+# Hardware Serving Profile: CPU (x86_64 / arm64, no accelerator)
+# ==============================================================================
+# Engine: llama.cpp server (ghcr.io/ggml-org/llama.cpp:server-*, docker-compose.cpu.yml)
+# with 4-bit GGUF weights - the fastest CPU inference path.
+# Default preset: qwen3-4b (Qwen/Qwen3-4B-GGUF, Q4_K_M) on >= 12 GB RAM and >= 4 threads,
+# smollm2-360m below that (models/presets/).
+# Informational: the engine is configured by the .env model block.
+# ==============================================================================
+
+engine: llama.cpp
+profile_name: cpu-llamacpp
+target_hardware:
+  isa: ["avx2", "avx512 (faster)", "arm64 neon"]
+  memory: "GGUF weights (Q4_K_M ~ 0.6 bytes/param) + KV cache for LLAMACPP_CTX tokens"
+
+serving_parameters:
+  preset: qwen3-4b
+  weights: Q4_K_M GGUF          # GGUF_REPO / GGUF_FILE / GGUF_REVISION (pinned)
+  context: auto                 # LLAMACPP_CTX: 8K (< 16 GB RAM), 16K, 32K (>= 32 GB)
+  slots: auto                   # LLAMACPP_PARALLEL: 4, or 8 with >= 16 threads
+  kv_cache: unified             # one cache shared by all slots (--kv-unified)

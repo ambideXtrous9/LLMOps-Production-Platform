@@ -14,8 +14,9 @@ ports  A port held by another program moves to the next free one and is saved in
        an address of this machine falls back to 127.0.0.1 for this run.
 fit    Gateway workers follow the CPU count (LITELLM_NUM_WORKERS empty = auto). On GPUs the
        engine memory fraction follows the memory that is free right now (GPUs shared with
-       other processes); on CPU hosts the KV cache follows RAM (VLLM_CPU_KVCACHE_SPACE
-       empty = auto). Exported for this run only: .env keeps the configured values.
+       other processes); on CPU hosts llama.cpp's context and request slots follow RAM and
+       threads (LLAMACPP_CTX / LLAMACPP_PARALLEL empty = auto). Exported for this run only:
+       .env keeps the configured values.
 """
 
 import argparse
@@ -31,13 +32,13 @@ from typing import Dict, List, Optional, Set, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from configure_model import parse_env_file  # noqa: E402
-from detect_hardware import host_ram_gb  # noqa: E402
+from detect_hardware import container_capacity  # noqa: E402
 from init_env import ENV_PATH, set_env_values  # noqa: E402
 
 # (variable, default, bind-address variable) for every port the stack publishes on the host
 PORTS: List[Tuple[str, int, str]] = [
     ("VLLM_PORT", 8000, "BIND_ADDRESS"),
-    ("ROUTER_PORT", 8001, "BIND_ADDRESS"),
+    ("ROUTER_PORT", 8001, "ROUTER_BIND_ADDRESS"),  # falls back to BIND_ADDRESS
     ("LITELLM_PORT", 4000, "GATEWAY_BIND_ADDRESS"),
     ("LANGFUSE_PORT", 3000, "UI_BIND_ADDRESS"),
     ("GRAFANA_PORT", 3001, "UI_BIND_ADDRESS"),
@@ -112,12 +113,14 @@ def cmd_ports(platform_name: str) -> int:
     chosen: Dict[str, int] = {}
     persist: Dict[str, str] = {}
     exports: Dict[str, str] = {}
-    for var, default, bind_var in PORTS:
-        if var == "VLLM_PORT" and platform_name == "metal":
-            continue  # the native engine owns this port on Apple Silicon
+    ports = PORTS
+    if platform_name == "metal":  # the native engine listens on METAL_ENGINE_PORT (host loopback)
+        ports = [("METAL_ENGINE_PORT", 8000, "LOOPBACK") if p[0] == "VLLM_PORT" else p for p in PORTS]
+        cfg = {**cfg, "LOOPBACK": "127.0.0.1"}
+    for var, default, bind_var in ports:
         raw = (cfg.get(var) or "").strip()
         port = int(raw) if raw.isdigit() and 0 < int(raw) < 65536 else default
-        host = (exports.get(bind_var) or cfg.get(bind_var) or "127.0.0.1").strip()
+        host = (exports.get(bind_var) or cfg.get(bind_var) or cfg.get("BIND_ADDRESS") or "127.0.0.1").strip()
         state = "free" if port in own else port_state(host, port)
         if state == "badaddr":
             note(f"  ↻ {bind_var}={host} is not an address of this machine: publishing on 127.0.0.1 this run")
@@ -198,12 +201,20 @@ def cmd_fit(platform_name: str) -> int:
                 note(f"  ↻ GPU is shared with other processes: engine memory fraction {configured:.2f} -> {fraction:.2f}")
 
     if platform_name == "cpu":
-        kv = (cfg.get("VLLM_CPU_KVCACHE_SPACE") or "").strip().lower()
-        if kv in ("", "auto"):
-            ram = host_ram_gb()
-            n = 8 if ram >= 64 else 4 if ram >= 32 else 2 if ram >= 16 else 1
-            exports["VLLM_CPU_KVCACHE_SPACE"] = str(n)
-            note(f"  • CPU KV cache      : {n} GiB (auto, {ram:.0f} GB RAM)")
+        # llama.cpp: one KV cache of LLAMACPP_CTX tokens shared (--kv-unified) by the slots;
+        # sized from what the container gets (Docker Desktop VMs are smaller than the host)
+        ram, threads = container_capacity()
+        ctx = (cfg.get("LLAMACPP_CTX") or "").strip().lower()
+        if ctx in ("", "auto"):
+            exports["LLAMACPP_CTX"] = str(32768 if ram >= 32 else 16384 if ram >= 16 else 8192)
+        slots = (cfg.get("LLAMACPP_PARALLEL") or "").strip().lower()
+        if slots in ("", "auto"):
+            exports["LLAMACPP_PARALLEL"] = str(8 if threads >= 16 else 4)
+        # a preset with a fixed context (e.g. 2048 for SmolLM2) caps every request at it
+        max_len = (cfg.get("MAX_MODEL_LEN") or "").strip()
+        exports["LLAMACPP_SLOT_ARGS"] = f"--kv-unified-per-slot {max_len}" if max_len.isdigit() else ""
+        note(f"  • llama.cpp context : {exports.get('LLAMACPP_CTX', ctx)} tokens shared by "
+             f"{exports.get('LLAMACPP_PARALLEL', slots)} slots ({ram:.0f} GB RAM, {threads} threads)")
 
     for key, value in exports.items():
         print(f"export {key}={shlex.quote(value)}")

@@ -4,10 +4,34 @@
 # Pre-calculates golden signals every 15s to optimize KEDA autoscaler polling
 # and speed up Grafana dashboard rendering.
 # Metric names follow the vLLM V1 engine (v0.10+): kv_cache_usage_perc,
-# inter_token_latency_seconds, prefix_cache_{hits,queries}_total.
+# inter_token_latency_seconds, prefix_cache_{hits,queries}_total. The llama.cpp CPU
+# engine is published under the same names (llmops_engine_compat), and latency SLOs
+# fall back to the gateway's histograms for engines without them.
 # ==============================================================================
 
 groups:
+  # llama.cpp (CPU platform) exports llamacpp:* metrics. These rules publish them under
+  # the vLLM names so dashboards, alerts, KEDA and tests work on every engine; with a
+  # vLLM engine their sources do not exist and they record nothing.
+  - name: llmops_engine_compat
+    rules:
+      - record: vllm:num_requests_running
+        expr: sum by (instance) (llamacpp:requests_processing)
+      - record: vllm:num_requests_waiting
+        expr: sum by (instance) (llamacpp:requests_deferred)
+      - record: vllm:prompt_tokens_total
+        expr: sum by (instance) (llamacpp:prompt_tokens_total + llamacpp:prompt_tokens_cached_total)
+      - record: vllm:generation_tokens_total
+        expr: sum by (instance) (llamacpp:tokens_predicted_total)
+      - record: vllm:prefix_cache_hits_total
+        expr: sum by (instance) (llamacpp:prompt_tokens_cached_total)
+      - record: vllm:prefix_cache_queries_total
+        expr: sum by (instance) (llamacpp:prompt_tokens_total + llamacpp:prompt_tokens_cached_total)
+      # llama.cpp has no KV-cache gauge: its load signal is busy / total request slots
+      # (read from /slots by the KV router)
+      - record: vllm:kv_cache_usage_perc
+        expr: sum(kv_router_backend_slots_busy) / clamp_min(sum(kv_router_backend_slots_total), 1)
+
   - name: llmops_golden_signals
     rules:
       # 1. Normalized Queue Backlog per Active Replica (KEDA Autoscaler Metric)
@@ -41,14 +65,19 @@ groups:
           ) * 100
 
       # 5. P95 Time-To-First-Token (TTFT)
+      #    (engines without a TTFT histogram, e.g. llama.cpp: as measured by the gateway)
       - record: job:vllm_time_to_first_token_seconds_p95
         expr: >-
           histogram_quantile(0.95, sum(rate(vllm:time_to_first_token_seconds_bucket[5m])) by (le))
+          or
+          histogram_quantile(0.95, sum(rate(litellm_llm_api_time_to_first_token_metric_bucket[5m])) by (le))
 
       # 6. P95 Inter-Token Latency (ITL)
       - record: job:vllm_inter_token_latency_seconds_p95
         expr: >-
           histogram_quantile(0.95, sum(rate(vllm:inter_token_latency_seconds_bucket[5m])) by (le))
+          or
+          histogram_quantile(0.95, sum(rate(litellm_deployment_latency_per_output_token_bucket[5m])) by (le))
 
       # 7. Cluster Token Throughput (TPS): decode output and prefill input separately
       - record: job:vllm_tokens_generated_per_second
