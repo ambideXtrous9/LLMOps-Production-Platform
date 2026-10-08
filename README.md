@@ -1,12 +1,12 @@
 # Enterprise LLMOps Production Platform (Maturity Level 4/5)
 
-An enterprise-grade, **air-gapped, self-hosted LLMOps production platform** engineered for real-time Large Language Model serving, KV-cache-aware routing, distributed OpenTelemetry tracing, SLO burn-rate alerting, event-driven autoscaling, and end-to-end model lifecycle governance.
+An enterprise-grade, **air-gapped, 100% self-hosted LLMOps production platform** engineered for real-time Large Language Model serving, KV-cache-aware routing, distributed OpenTelemetry tracing, SLO burn-rate alerting, event-driven autoscaling, and end-to-end model lifecycle governance.
 
 ---
 
 ## 1. Executive Summary & Architectural Maturity
 
-Following an in-depth LLMOps Maturity Review, the platform has been hardened from an observability-only proof-of-concept (Level 2) into a production-grade inference and platform ecosystem (Level 4/5).
+Following an in-depth LLMOps Maturity Review, the platform has been hardened from an observability-only proof-of-concept (Level 2) into an enterprise-ready serving and platform ecosystem (Level 4/5).
 
 ### Key Architectural Correctives & Upgrades:
 1. **Decoupled Control Plane (Grafana Removed from Control Loop):** Grafana is strictly a telemetry viewer. KEDA polls **Prometheus directly** for scaling decisions.
@@ -28,14 +28,14 @@ Following an in-depth LLMOps Maturity Review, the platform has been hardened fro
                     ┌────────────────────────────────────────────────────────┐
                     │       ENTERPRISE USER / API CLIENT / MICROSERVICE      │
                     └───────────────────────────┬────────────────────────────┘
-                                                │ HTTP / POST /v1/chat/completions (stream: true)
+                                                │ POST /v1/chat/completions (stream: true)
                                                 │ Bearer sk-team-engineering-... (Virtual Key)
                                                 ▼
 ┌────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ 1. INGRESS & ROUTING PLANE                                                                             │
 │    LiteLLM AI Gateway (:4000, 2+ Replicas)                                                             │
 │    • Per-Team Virtual Keys         • Spend Limits & Budgets       • Moderation & PII Redaction         │
-│    • Redis Rate-Limit Sync         • Redis Response Cache         • W3C traceparent Propagation        │
+│    • Redis Rate-Limit Sync         • Redis Exact Response Cache   • W3C traceparent Propagation        │
 │                                                                                                        │
 │    KV-Cache-Aware Intelligent Router (:8001)                                                           │
 │    • Prefix Hash Affinity          • Cache Hit Optimization       • Least-Busy Healthy Fallback        │
@@ -47,7 +47,7 @@ Following an in-depth LLMOps Maturity Review, the platform has been hardened fro
 │    • Continuous Batching & PagedAttention        │ │    • ClickHouse Columnar Analytics Engine         │
 │    • Automatic Prefix Caching Enabled            │ │    • MinIO / S3 Raw Trace Blob Storage            │
 │    • Native OTLP Distributed Trace Export        │ │    • PII Redaction & 14-Day Retention Policy      │
-│    • Pluggable Engines (SGLang, TRT-LLM, GGUF)   │ │    • Online Evaluation & Feedback Scores          │
+│    • Pluggable Profiles (Dev 4GB vs Prod DC GPU) │ │    • Online Evaluation & Feedback Scores          │
 └──────────┬───────────────────────────┬───────────┘ └──────────────────────────────────────────────────┘
            │                           │
            │ Logs & OTLP Traces        │ /metrics (:8000)
@@ -118,25 +118,25 @@ Following an in-depth LLMOps Maturity Review, the platform has been hardened fro
 
 ## 4. Hardware Profiles & Quantization Matrix
 
-The platform decouples serving configuration by hardware tier:
+The platform formally decouples serving configurations by hardware tier in `config/profiles/`:
 
-| Parameter | Dev / Edge Tier (`dev-edge-4gb.yaml`) | Production Datacenter (`prod-datacenter-gpu.yaml`) |
-| :--- | :--- | :--- |
-| **Target GPU** | NVIDIA GeForce GTX 1650 (4GB VRAM) | NVIDIA L4 / A10G / L40S / A100 / H100 |
-| **Compute Capability** | Turing SM 7.5 | Ada Lovelace / Hopper SM 8.9+ |
-| **Execution Precision** | FP16 (`--dtype half`) | Native BF16 / FP8 / AWQ |
-| **GPU Memory Util** | `0.60` (1,952 MiB pool, 2GB OS headroom) | `0.90` (22GB+ dedicated KV cache pool) |
-| **CUDA Graph Capture** | Disabled (`--enforce-eager` saves 800MB) | Enabled (microsecond kernel dispatch) |
-| **Prefix Caching** | Enabled (`--enable-prefix-caching`) | Enabled (`--enable-prefix-caching`) |
-| **Chunked Prefill** | Off | Enabled (`--enable-chunked-prefill`) |
-| **DCGM Profiling** | Utilization, Temp, Power (Bandwidth N/A) | Full Profiling (Memory Bandwidth, SM Occupancy) |
+| Parameter | Dev / Edge Tier (`dev-edge-4gb.yaml`) | Production Datacenter (`prod-datacenter-gpu.yaml`) | Edge CPU Fallback (`edge-cpu-llamacpp.yaml`) |
+| :--- | :--- | :--- | :--- |
+| **Target Hardware** | NVIDIA GeForce GTX 1650 (4GB VRAM) | NVIDIA L4 / A10G / L40S / A100 / H100 | x86_64 / ARM64 CPU (4 Threads) |
+| **Compute Capability**| Turing SM 7.5 | Ada Lovelace / Hopper SM 8.9+ | CPU / NEON / AVX2 |
+| **Execution Precision**| FP16 (`--dtype half`) | Native BF16 / FP8 / AWQ | 4-bit GGUF (`Q4_K_M`) |
+| **GPU Memory Util** | `0.60` (1,952 MiB pool, 2GB OS buffer)| `0.90` (22GB+ dedicated KV cache pool)| N/A (2GB Host RAM bounded) |
+| **CUDA Graph Capture**| Disabled (`--enforce-eager` saves 800MB)| Enabled (microsecond kernel dispatch)| N/A |
+| **Prefix Caching** | Enabled (`--enable-prefix-caching`) | Enabled (`--enable-prefix-caching`) | Continuous batching cache |
+| **Chunked Prefill** | Disabled | Enabled (`--enable-chunked-prefill`) | Disabled |
+| **DCGM Profiling** | Core Util, VRAM, Temp, Power (Bandwidth N/A)| Full Profiling (Memory Bandwidth, SM %)| N/A |
 
 ---
 
 ## 5. Security & Virtual Key Management
 
-### Master Key Rotation
-The master key is strictly administrative and stored in `.env` / Kubernetes Secrets. Rotate it anytime using the automated cryptographic utility:
+### Master Key Isolation & Cryptographic Rotation
+The master key grants root proxy administration and is stored strictly in `.env` / Kubernetes Secrets. Rotate it anytime without downtime using the automated script:
 
 ```bash
 bash scripts/rotate_master_key.sh
@@ -146,7 +146,7 @@ bash scripts/rotate_master_key.sh
 Client applications and microservices **never** receive the master key. Issue scoped virtual keys with budget caps and rate limits:
 
 ```bash
-# Generate key for platform engineering
+# 1. Generate key for platform engineering
 python3 scripts/manage_keys.py generate \
   --team engineering \
   --alias core-backend-service \
@@ -155,11 +155,14 @@ python3 scripts/manage_keys.py generate \
   --tpm 80000 \
   --models smollm2
 
-# Inspect virtual key metadata and spend
+# 2. Inspect virtual key metadata and spend
 python3 scripts/manage_keys.py info --key sk-eng-team-a1b2c3d4e5f6g7h8i9j0
 
-# Calculate aggregate spend across all teams
+# 3. Calculate aggregate spend across all teams
 python3 scripts/manage_keys.py spend
+
+# 4. Bootstrap seed keys for dev/testing
+python3 scripts/manage_keys.py seed
 ```
 
 ---
@@ -219,6 +222,12 @@ python3 scripts/load_test.py
 python3 scripts/eval_gate.py --model smollm2 --max-ttft 1.5 --min-tps 25.0 --min-accuracy 0.80
 ```
 
+### 7. Optional: Launch Langfuse v3 Enterprise Stack Overlay
+```bash
+docker compose -f docker-compose.yml -f docker-compose.langfuse-v3.yml up -d
+```
+*(Enables ClickHouse columnar storage, MinIO S3 blob storage, and Redis queues for Langfuse v3).*
+
 ---
 
 ## 8. Kubernetes & Event-Driven Autoscaling (KEDA)
@@ -226,30 +235,44 @@ python3 scripts/eval_gate.py --model smollm2 --max-ttft 1.5 --min-tps 25.0 --min
 In Kubernetes production clusters, KEDA scales vLLM inference pods directly off Prometheus metrics:
 
 ```yaml
-triggers:
-  # Trigger 1: Normalized Queue Backlog Per Replica (>4 requests/replica)
-  - type: prometheus
-    metadata:
-      serverAddress: http://prometheus-service.llmops.svc.cluster.local:9090
-      metricName: vllm_queue_backlog_per_replica
-      query: >-
-        sum(vllm:num_requests_waiting)
-        /
-        clamp_min(count(count by (instance) (vllm:num_requests_running)), 1)
-      threshold: '4'
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: vllm-inference-scaler
+  namespace: llmops
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: vllm-deployment
+  minReplicaCount: 1
+  maxReplicaCount: 8
+  cooldownPeriod: 300 # 5-minute stabilization prevents cold-start thrashing
+  pollingInterval: 15
+  triggers:
+    # Trigger 1: Normalized Queue Backlog Per Replica (>4 requests/replica)
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus-service.llmops.svc.cluster.local:9090
+        metricName: vllm_queue_backlog_per_replica
+        query: >-
+          sum(vllm:num_requests_waiting)
+          /
+          clamp_min(count(count by (instance) (vllm:num_requests_running)), 1)
+        threshold: '4'
 
-  # Trigger 2: KV-Cache Memory Saturation (>80%)
-  - type: prometheus
-    metadata:
-      serverAddress: http://prometheus-service.llmops.svc.cluster.local:9090
-      metricName: vllm_kv_cache_saturation_percent
-      query: >-
-        avg(vllm:gpu_cache_usage_factor) * 100
-      threshold: '80'
+    # Trigger 2: KV-Cache Memory Saturation (>80%)
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus-service.llmops.svc.cluster.local:9090
+        metricName: vllm_kv_cache_saturation_percent
+        query: >-
+          avg(vllm:gpu_cache_usage_factor) * 100
+        threshold: '80'
 ```
 
-### Scale-Down Stabilization
-Model weights take seconds to minutes to load into GPU VRAM. The KEDA configuration enforces a **300-second stabilization window** (`cooldownPeriod: 300`), eliminating pod thrashing during transient traffic fluctuations.
+### Scale-Down Stabilization Window
+Model weights take seconds to minutes to load into GPU VRAM. The KEDA configuration enforces a **300-second stabilization window** (`cooldownPeriod: 300`), eliminating pod thrashing during transient traffic dips.
 
 ### Deploying to Kubernetes:
 ```bash
@@ -276,3 +299,70 @@ bash scripts/deploy_k8s_keda.sh
 2. Run CI evaluation gate: `python3 scripts/eval_gate.py`.
 3. Apply canary rollout: `kubectl apply -f k8s/argo-rollouts-vllm.yaml`.
 4. Argo Rollouts routes 10% traffic, evaluating Prometheus TTFT and error rates for 5 minutes before auto-promoting.
+
+---
+
+## 10. Repository Taxonomy & File Index
+
+```text
+LLMOps-Production-Platform/
+├── docker-compose.yml              # Unified multi-service deployment specification (14 services, all 9 planes)
+├── docker-compose.langfuse-v3.yml  # Langfuse v3 enterprise overlay (ClickHouse + MinIO S3 + Redis + Postgres)
+├── .env.example                    # Environment secrets template (no hardcoded credentials)
+├── README.md                       # Complete production architecture, runbooks & documentation
+│
+├── config/                         # Unified configuration plane
+│   ├── litellm.yaml                # LiteLLM: Postgres virtual keys, Redis cache, PII guardrails, OTel
+│   ├── prometheus.yaml             # 15s scrape interval, recording rules & Alertmanager links
+│   ├── prometheus-rules.yaml       # Recording rules for Golden Signals (TTFT, TPS, KV-Cache %, Queue Backlog)
+│   ├── prometheus-alerts.yaml      # Multi-window SLO burn-rate alerts (TTFT, Errors, Availability, Thermals)
+│   ├── alertmanager.yaml           # Alertmanager routing, receivers & inhibition rules
+│   ├── alloy.config                # Grafana Alloy agent (replaces Promtail: logs, metrics, OTel traces)
+│   ├── loki.yaml                   # Grafana Loki storage & indexing configuration
+│   ├── tempo.yaml                  # Grafana Tempo distributed tracing configuration
+│   ├── grafana-datasources.yaml    # Provisioned Prometheus, Loki, Tempo (trace-to-logs), Alertmanager
+│   ├── grafana-dashboards.yaml     # Provisioned dashboard provider definition
+│   ├── llmops-dashboard.json       # 48-panel production dashboard with SLOs, KV Cache, and Cost rows
+│   └── profiles/                   # Multi-tier hardware serving profiles
+│       ├── dev-edge-4gb.yaml       # GTX 1650 4GB dev profile (FP16, 60% VRAM, eager execution)
+│       ├── prod-datacenter-gpu.yaml# L4/A10/A100/H100 prod profile (FP8/AWQ, 90% VRAM, FlashAttention)
+│       └── edge-cpu-llamacpp.yaml  # CPU fallback profile with llama.cpp GGUF quantization
+│
+├── router/                         # Planes 1 & 2: KV-Cache-Aware Routing Layer
+│   ├── kv_router.py                # Asynchronous prefix-hashing KV affinity router
+│   ├── Dockerfile                  # Router container build specification
+│   └── requirements.txt            # Lightweight aiohttp dependencies
+│
+├── k8s/                            # Production Kubernetes & KEDA manifests
+│   ├── keda-scaledobject.yaml      # Decoupled KEDA ScaledObject: dual triggers (Queue + KV cache) + stabilization
+│   ├── vllm-deployment.yaml        # GPU inference deployment with prefix caching & OTLP export
+│   ├── litellm-deployment.yaml     # LiteLLM deployment (2 replicas) with Redis rate-limit sync
+│   ├── kv-router-deployment.yaml   # In-cluster KV-aware router deployment & service
+│   ├── prometheus-k8s.yaml         # Kubernetes Prometheus scraper with recording rules
+│   ├── alertmanager-k8s.yaml       # Kubernetes Alertmanager deployment & service
+│   ├── tempo-k8s.yaml              # Kubernetes Tempo distributed tracing deployment
+│   ├── alloy-daemonset.yaml        # Grafana Alloy DaemonSet for Kubernetes (replaces Promtail)
+│   ├── karpenter-nodepool.yaml     # Karpenter GPU NodePool & EC2NodeClass configuration
+│   ├── model-weight-cache-pvc.yaml # Shared ReadWriteMany PVC caching model weights
+│   ├── gateway-inference-ext.yaml  # Kubernetes Gateway API Inference Extension HTTPRoute
+│   ├── argo-rollouts-vllm.yaml     # Argo Rollouts canary promotion with automated SLO metric analysis
+│   └── kind-config.yaml            # Local KinD cluster configuration with GPU enablement
+│
+├── models/                         # Plane 9: Model Lifecycle & Governance
+│   ├── catalog.yaml                # Model registry catalog (pinned commit revisions, quant, hardware targets)
+│   ├── golden_dataset.jsonl        # Evaluation golden test dataset for CI eval gate
+│   └── retention_policy.yaml       # Data governance & prompt/trace retention policy
+│
+├── scripts/                        # Operational verification & automation tooling
+│   ├── test_stack.py               # 7-point health check (virtual keys, SSE streaming, Alloy, Tempo, alerts)
+│   ├── load_test.py                # Multi-threaded streaming load tester with TTFT/ITL breakdown
+│   ├── manage_keys.py              # CLI for virtual key generation, budget tracking, team provisioning
+│   ├── eval_gate.py                # Model qualification CI evaluation gate (SLO & accuracy verification)
+│   ├── online_eval_judge.py        # Langfuse LLM-as-judge online evaluation worker
+│   ├── deploy_k8s_keda.sh          # Hardened Kubernetes deployment automation script
+│   ├── rotate_master_key.sh        # Secure cryptographic master key rotation utility
+│   └── init-postgres.sh            # PostgreSQL initialization script for LiteLLM DB and Langfuse
+│
+└── .github/workflows/
+    └── model-ci-eval.yaml          # GitHub Actions CI workflow for model evaluation gate on PRs
+```
