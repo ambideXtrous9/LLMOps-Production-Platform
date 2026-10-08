@@ -535,6 +535,19 @@ bash scripts/deploy_k8s_keda.sh
 3. Apply canary rollout: `kubectl apply -f k8s/argo-rollouts-vllm.yaml`.
 4. Argo Rollouts routes 10% traffic, evaluating Prometheus TTFT and error rates for 5 minutes before auto-promoting.
 
+### Runbook 4: Real-Time Multi-Stream Logs & Trace Deep-Links (Grafana + Loki + Tempo)
+1. **Datasource UID Alignment:** Ensure datasources in `config/grafana-datasources.yaml` declare explicit UIDs matching dashboard JSON schemas (`uid: Loki`, `uid: Prometheus`, `uid: Alertmanager`, `uid: tempo`). Mismatched or auto-generated UIDs cause panel "Datasource not found" errors.
+2. **ECMAScript-Compliant Derived Fields:** In Grafana Loki datasource settings, trace-to-log deep-linking must use standard JavaScript RegExp without inline `(?i)` flag modifiers (which crash browser panel rendering with a `SyntaxError`):
+   ```yaml
+   matcherRegex: '(?:trace_id[=:\s"]+|traceparent[=:\s"]+00-)([a-fA-F0-9]{16,32})'
+   ```
+3. **Validating Log Ingestion:** Verify Loki is receiving container streams from Grafana Alloy:
+   ```bash
+   curl -s -G "http://localhost:3100/loki/api/v1/query_range" \
+     --data-urlencode 'query={container="vllm-inference"}' --data-urlencode 'limit=5'
+   ```
+4. **Browser Hard Refresh:** If Grafana panels ever show a red `[!]` badge after a datasource or schema update, clear client-side browser caches via `Cmd + Shift + R` (macOS) or `Ctrl + F5` (Windows/Linux).
+
 ---
 
 ## 12. Repository Taxonomy & File Index
@@ -553,11 +566,11 @@ LLMOps-Production-Platform/
 │   ├── prometheus.yaml             # 15s scrape interval, recording rules & Alertmanager links (9 active targets)
 │   ├── prometheus-rules.yaml       # Recording rules for Golden Signals (TTFT, TPS, KV-Cache %, Queue Backlog)
 │   ├── prometheus-alerts.yaml      # Multi-window SLO burn-rate alerts (TTFT, Errors, Availability, Thermals)
-│   ├── alertmanager.yaml           # Alertmanager routing, receivers & inhibition rules
+│   ├── alertmanager.yaml           # Alertmanager routing, receivers & inhibition rules (clean null dispatch)
 │   ├── alloy.config                # Grafana Alloy agent (replaces Promtail: logs, metrics, OTel HTTP/gRPC traces)
 │   ├── loki.yaml                   # Grafana Loki storage & indexing configuration
-│   ├── tempo.yaml                  # Grafana Tempo distributed tracing configuration
-│   ├── grafana-datasources.yaml    # Provisioned Prometheus, Loki, Tempo (trace-to-logs), Alertmanager
+│   ├── tempo.yaml                  # Grafana Tempo distributed tracing configuration (single-binary mode)
+│   ├── grafana-datasources.yaml    # Provisioned Prometheus, Loki (ECMAScript derivedFields), Tempo, Alertmanager
 │   ├── grafana-dashboards.yaml     # Provisioned dashboard provider definition
 │   ├── llmops-dashboard.json       # 48-panel production dashboard with SLOs, KV Cache, and Cost rows
 │   └── profiles/                   # Multi-tier hardware serving profiles
