@@ -250,6 +250,7 @@ Per-request controls: `"cache": {"no-cache": true}` bypasses the Redis response 
 | A100-SXM4-40GB, openai/gpt-oss-20b (auto-profiled, zero manual config) | 11/11 | 87.5 % (passes), 213 tok/s | 32/32, 1912 tok/s, P95 TTFT 0.34 s | MXFP4 MoE, reasoning by default |
 | 30-core AMD EPYC (CPU only), Qwen3-4B (preset) | 13/13 | 8/8, P95 TTFT 1.67 s, 9.9 tok/s | 8/8, 23 tok/s | one-time CPU JIT absorbed by warm-up |
 | 30-core AMD EPYC (CPU only), Qwen3-0.6B / 1.7B | 12/12 | rejected (50 %) | — | gate correctly blocks: "FRANCE", 5×3=15 |
+| k3s v1.37 on the A100 host, Qwen3.5-9B (`deploy_k8s.sh cuda --verify`) | 10/10 (k8s subset) | — | saturation: KEDA scaled vLLM 1 → 8 | queue backlog 267/replica, KV 98.5 %; extra replicas Pending (1 GPU) |
 
 (gpt-oss ran before the Langfuse/Tempo checks were added; Qwen3.5-9B `vllm bench serve` at concurrency 64: median TTFT 312 ms, 1800 tok/s.)
 
@@ -267,6 +268,7 @@ The same architecture deploys to any conformant cluster from the same `.env`:
 * `k8s/overlays/{cuda,cuda-runtimeclass,rocm,cpu}` — engine image + accelerator resource; `cuda-runtimeclass` is chosen automatically on clusters exposing the NVIDIA runtime as a RuntimeClass (k3s), and the script installs the NVIDIA device plugin there when no GPU is allocatable.
 * `k8s/extras/` — environment-specific add-ons: Argo Rollouts canary with SLO analysis, Karpenter GPU NodePool (EKS), Gateway API inference extension, Alloy DaemonSet, kind config.
 * Logs (Alloy/Loki), Langfuse and Grafana are typically cluster-wide services on Kubernetes; point LiteLLM at a Langfuse with `LANGFUSE_HOST` / keys (the callback is dropped when unset).
+* Single-node test cluster on a GPU host: `curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable traefik --write-kubeconfig-mode 644" sh -` then `KUBECONFIG=/etc/rancher/k3s/k3s.yaml ./scripts/deploy_k8s.sh cuda --verify` (k3s auto-registers the NVIDIA runtime; the script adds the device plugin). Remove with `/usr/local/bin/k3s-uninstall.sh`.
 
 ---
 
