@@ -73,11 +73,14 @@ def detect_nvidia_gpu() -> Dict[str, Any]:
     # Check Docker GPU container runtime
     docker_gpu_ok = bool(run_cmd("docker run --rm --gpus all alpine echo 'ok'"))
 
-    # Determine dev vs datacenter profile
+    # Determine dev vs datacenter profile. Qwen3.5-9B needs ~18 GB of BF16 weights plus
+    # KV cache, so small consumer GPUs keep the SmolLM2 dev model.
     if mem_total_mb <= 8192:
         profile = "dev-edge-4gb.yaml"
+        default_model = "HuggingFaceTB/SmolLM2-360M-Instruct"
     else:
         profile = "prod-datacenter-gpu.yaml"
+        default_model = "Qwen/Qwen3.5-9B"
 
     return {
         "supported": True,
@@ -89,7 +92,7 @@ def detect_nvidia_gpu() -> Dict[str, Any]:
         "backend": "cuda",
         "framework": "vllm-cuda",
         "profile": profile,
-        "default_model": "HuggingFaceTB/SmolLM2-360M-Instruct",
+        "default_model": default_model,
     }
 
 

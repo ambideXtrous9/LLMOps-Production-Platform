@@ -1,275 +1,271 @@
 #!/usr/bin/env python3
 """
 scripts/test_stack.py
-Production 7-Point Health & Operational Verification Suite.
+Production End-to-End Health & Operational Verification Suite.
 
-Tests all 9 planes with zero external dependencies (Python standard library):
-  1. Direct vLLM Engine Health (:8000/health) & Prefix Caching
-  2. KV-Cache-Aware Router Verification (:8001/health & :8001/metrics)
-  3. AI Gateway Inference via Virtual Key (:4000) with End-to-End SSE Streaming & TTFT
-  4. Guardrails & PII Redaction Verification
-  5. Prometheus Golden Signals & Recording Rules (:9090)
-  6. Alertmanager SLO Alerting Engine (:9093)
-  7. Telemetry & Tracing: Grafana Alloy (:12345), Tempo (:3200), and Loki (:3100)
+Every check asserts real behaviour (no "always pass" probes) and the script exits
+non-zero when any check fails, so it can gate deployments and CI:
+
+  1. vLLM engine health + served model registration          (Plane 2)
+  2. KV-cache-aware router health, backends & metrics          (Plane 1/2)
+  3. Gateway SSE streaming through a team virtual key + TTFT   (Plane 1)
+  4. Thinking alias returns reasoning separately from answer   (Plane 1/2)
+  5. Auth: invalid virtual keys are rejected                   (Plane 1)
+  6. Guardrail: PII is masked before it reaches the model      (Plane 1)
+  7. Prometheus targets, recording rules & engine metrics      (Plane 3/4)
+  8. Alertmanager readiness                                    (Plane 3)
+  9. Alloy / Tempo / Loki + W3C trace-id round trip into Tempo  (Plane 5)
+ 10. Grafana health & provisioned datasources                  (Plane 7)
 """
 
+import base64
 import json
 import os
 import sys
 import time
-import urllib.error
-import urllib.request
-from typing import Any, Dict, Optional, Tuple
+import urllib.parse
+from typing import Callable, List, Tuple
 
+from llmops_client import GATEWAY_MODEL, MASTER_KEY, VIRTUAL_KEY, chat, http_json
 
-# Endpoints
 VLLM_URL = os.getenv("VLLM_URL", "http://localhost:8000")
 KV_ROUTER_URL = os.getenv("KV_ROUTER_URL", "http://localhost:8001")
-LITELLM_URL = os.getenv("LITELLM_URL", "http://localhost:4000")
 PROMETHEUS_URL = os.getenv("PROMETHEUS_URL", "http://localhost:9090")
 ALERTMANAGER_URL = os.getenv("ALERTMANAGER_URL", "http://localhost:9093")
 TEMPO_URL = os.getenv("TEMPO_URL", "http://localhost:3200")
 ALLOY_URL = os.getenv("ALLOY_URL", "http://localhost:12345")
 LOKI_URL = os.getenv("LOKI_URL", "http://localhost:3100")
 GRAFANA_URL = os.getenv("GRAFANA_URL", "http://localhost:3001")
+SERVED_MODEL = os.getenv("SERVED_MODEL_NAME", GATEWAY_MODEL)
 
-# Virtual key (never use master key for client traffic)
-VIRTUAL_KEY = os.getenv("TEAM_ENGINEERING_KEY", "sk-eng-team-a1b2c3d4e5f6g7h8i9j0")
-MASTER_KEY = os.getenv("LITELLM_MASTER_KEY", "sk-admin-master-sec-9a8b7c6d5e4f3a2b1c0d")
+TRACE_ID = os.urandom(16).hex()
+TRACEPARENT = f"00-{TRACE_ID}-{os.urandom(8).hex()}-01"
 
 
-def http_get(url: str, headers: Optional[Dict[str, str]] = None, timeout: float = 5.0) -> Tuple[int, str]:
-    req = urllib.request.Request(url, headers=headers or {})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, resp.read().decode("utf-8")
-    except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8")
-    except Exception as e:
-        return 0, str(e)
+def ok(msg: str) -> None:
+    print(f"  ✓ {msg}")
+
+
+def fail(msg: str) -> bool:
+    print(f"  ✗ {msg}")
+    return False
 
 
 def test_vllm_engine() -> bool:
-    print("[1/7] Testing Plane 2: vLLM GPU Inference Engine (:8000)...")
-    status, body = http_get(f"{VLLM_URL}/health")
-    if status == 200:
-        print("  ✓ vLLM Worker is HEALTHY (GPU worker ready with PagedAttention & prefix cache)")
-        return True
-    print(f"  ✗ vLLM returned status {status}: {body[:80]}")
-    return False
+    status, body = http_json(f"{VLLM_URL}/health")
+    if status != 200:
+        return fail(f"vLLM /health returned {status}: {str(body)[:120]}")
+    ok("vLLM engine is HEALTHY")
+    status, body = http_json(f"{VLLM_URL}/v1/models")
+    served = [m.get("id") for m in body.get("data", [])] if isinstance(body, dict) else []
+    if SERVED_MODEL not in served:
+        return fail(f"served model '{SERVED_MODEL}' not registered (engine reports {served})")
+    ok(f"Serving model '{SERVED_MODEL}'")
+    return True
 
 
 def test_kv_router() -> bool:
-    print("\n[2/7] Testing Plane 1 & 2: KV-Cache-Aware Intelligent Router (:8001)...")
-    status, body = http_get(f"{KV_ROUTER_URL}/health")
-    if status == 200:
-        data = json.loads(body)
-        print(f"  ✓ KV Router is ONLINE. Active Backends: {data.get('healthy_backends')}")
-        return True
-    print(f"  ✗ KV Router unreachable or degraded: {body[:80]}")
-    return False
+    status, body = http_json(f"{KV_ROUTER_URL}/health")
+    if status != 200 or not isinstance(body, dict):
+        return fail(f"KV router unreachable ({status}): {str(body)[:120]}")
+    healthy = body.get("healthy_backends") or []
+    if not healthy:
+        return fail(f"KV router has no healthy backends: {body}")
+    ok(f"KV router ONLINE with healthy backends {healthy}")
+    status, metrics = http_json(f"{KV_ROUTER_URL}/metrics")
+    if status != 200 or "kv_router_requests_total" not in str(metrics):
+        return fail("KV router /metrics missing kv_router_requests_total")
+    ok("KV router exports Prometheus metrics")
+    return True
 
 
 def test_streaming_inference() -> bool:
-    print("\n[3/7] Testing Plane 1: LiteLLM Gateway via Team Virtual Key (:4000)...")
-    print(f"  • Using Virtual Key: {VIRTUAL_KEY[:15]}... (Master key isolated)")
-    print("  • Streaming: true (Server-Sent Events) to measure real Time-To-First-Token (TTFT)...")
-
-    # W3C traceparent header: 00-<32 hex trace-id>-<16 hex span-id>-01
-    trace_id = "4bf92f3577b34da6a3ce929d0e0e4736"
-    traceparent = f"00-{trace_id}-00f067aa0ba902b7-01"
-
-    payload = json.dumps({
-        "model": "smollm2",
-        "messages": [
+    print(f"  • Virtual key {VIRTUAL_KEY[:12]}... | model '{GATEWAY_MODEL}' | traceparent {TRACEPARENT[:20]}...")
+    res = chat(
+        [
             {"role": "system", "content": "You are a concise production LLMOps assistant."},
-            {"role": "user", "content": "Explain KV-cache prefix affinity in 1 concise sentence."}
+            {"role": "user", "content": "Explain KV-cache prefix affinity in one sentence."},
         ],
-        "temperature": 0.1,
-        "max_tokens": 40,
-        "stream": True,
-    }).encode("utf-8")
-
-    req = urllib.request.Request(
-        f"{LITELLM_URL}/v1/chat/completions",
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {VIRTUAL_KEY}",
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-            "traceparent": traceparent,
-        }
+        max_tokens=96,
+        extra={"cache": {"no-cache": True}},
+        headers={"traceparent": TRACEPARENT},
     )
+    if not res.ok or not res.content.strip():
+        return fail(f"streaming inference failed (HTTP {res.status}): {res.error or 'empty answer'}")
+    ok(f"TTFT {res.ttft:.3f}s | total {res.total:.2f}s | {res.completion_tokens} tokens ({res.tps:.1f} tok/s)")
+    ok(f"Answer: \"{res.content.strip()[:110]}\"")
+    if res.reasoning:
+        return fail("default alias leaked reasoning tokens (expected instruct / non-thinking mode)")
+    return True
 
-    start = time.time()
-    ttft = None
-    chunks = []
 
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            for line in resp:
-                line_str = line.decode("utf-8").strip()
-                if not line_str.startswith("data:"):
-                    continue
-                data_part = line_str[5:].strip()
-                if data_part == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data_part)
-                    delta = chunk["choices"][0].get("delta", {}).get("content", "")
-                    if delta:
-                        if ttft is None:
-                            ttft = time.time() - start
-                        chunks.append(delta)
-                except Exception:
-                    continue
+def test_thinking_alias() -> bool:
+    model = f"{GATEWAY_MODEL}-thinking"
+    res = chat(
+        [{"role": "user", "content": "What is 17 * 23? Reply with just the number."}],
+        model=model,
+        max_tokens=2048,
+        temperature=0.6,
+        extra={"cache": {"no-cache": True}},
+    )
+    if not res.ok:
+        return fail(f"'{model}' failed (HTTP {res.status}): {res.error[:160]}")
+    if not res.reasoning.strip():
+        return fail(f"'{model}' returned no reasoning content")
+    if "391" not in res.content:
+        return fail(f"'{model}' answer wrong or truncated: {res.content.strip()[:80]!r}")
+    ok(f"'{model}': {len(res.reasoning)} chars of reasoning, answer {res.content.strip()!r}")
+    return True
 
-        total_time = time.time() - start
-        content = "".join(chunks).strip()
-        print(f"  ✓ TTFT (Time-To-First-Token): {ttft:.3f}s")
-        print(f"  ✓ Total Generation Latency   : {total_time:.3f}s")
-        print(f"  ✓ Gateway Response           : \"{content}\"")
-        print(f"  ✓ Trace Context Injected     : traceparent={traceparent[:25]}...")
-        return True
-    except urllib.error.HTTPError as e:
-        print(f"  ⚠️ Virtual key returned HTTP {e.code}. Attempting fallback with Master Key...")
-        try:
-            req_master = urllib.request.Request(
-                f"{LITELLM_URL}/v1/chat/completions",
-                data=payload,
-                headers={
-                    "Authorization": f"Bearer {MASTER_KEY}",
-                    "Content-Type": "application/json",
-                    "Accept": "text/event-stream",
-                    "traceparent": traceparent,
-                }
-            )
-            start_m = time.time()
-            ttft_m = None
-            chunks_m = []
-            with urllib.request.urlopen(req_master, timeout=30) as resp:
-                for line in resp:
-                    line_str = line.decode("utf-8").strip()
-                    if not line_str.startswith("data:"):
-                        continue
-                    data_part = line_str[5:].strip()
-                    if data_part == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data_part)
-                        delta = chunk["choices"][0].get("delta", {}).get("content", "")
-                        if delta:
-                            if ttft_m is None:
-                                ttft_m = time.time() - start_m
-                            chunks_m.append(delta)
-                    except Exception:
-                        continue
-            print(f"  ✓ (Admin Key) TTFT: {ttft_m:.3f}s | Gateway Response: {''.join(chunks_m).strip()}")
-            return True
-        except Exception as fallback_err:
-            print(f"  ✗ Inference fallback also failed: {fallback_err}")
-            return False
-    except Exception as e:
-        print(f"  ✗ Inference check failed: {e}")
-        return False
+
+def test_auth_rejects_invalid_key() -> bool:
+    res = chat([{"role": "user", "content": "ping"}], api_key="sk-invalid-key-000000000000", stream=False, max_tokens=4)
+    if res.status not in (400, 401, 403):
+        return fail(f"invalid key was not rejected (HTTP {res.status})")
+    ok(f"Invalid virtual key rejected with HTTP {res.status}")
+    return True
 
 
 def test_guardrails_pii() -> bool:
-    print("\n[4/7] Testing Plane 1 Guardrails: PII Redaction & Prompt Injection Filter...")
-    payload = json.dumps({
-        "model": "smollm2",
-        "messages": [
-            {"role": "user", "content": "My contact is test@example.com and card is 4532-1234-5678-9012."}
-        ],
-        "max_tokens": 30
-    }).encode("utf-8")
-
-    req = urllib.request.Request(
-        f"{LITELLM_URL}/v1/chat/completions",
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {VIRTUAL_KEY}",
-            "Content-Type": "application/json",
-        }
+    email, card = "john.doe@example.com", "4532-1234-5678-9012"
+    res = chat(
+        [{"role": "user", "content": f"Repeat the following text exactly, character for character: My email is {email} and my card is {card}."}],
+        stream=False,
+        max_tokens=96,
+        temperature=0.0,
+        extra={"cache": {"no-cache": True}},
     )
-
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            content = data["choices"][0]["message"]["content"]
-            print(f"  ✓ Guardrail Ingest Verification: Completed without unredacted leakage")
-            return True
-    except Exception as e:
-        print(f"  ✓ Guardrail active / filtered: {e}")
-        return True
+    if not res.ok:
+        return fail(f"PII probe request failed (HTTP {res.status}): {res.error[:160]}")
+    leaked = [v for v in (email, card) if v in res.content]
+    if leaked:
+        return fail(f"PII reached the model and leaked back: {leaked}")
+    ok(f"PII masked before inference. Model echoed: \"{res.content.strip()[:110]}\"")
+    return True
 
 
 def test_prometheus_signals() -> bool:
-    print("\n[5/7] Testing Plane 3: Prometheus Scraper & Recording Rules (:9090)...")
-    status, body = http_get(f"{PROMETHEUS_URL}/api/v1/targets")
-    if status == 200:
-        data = json.loads(body)
-        active = data.get("data", {}).get("activeTargets", [])
-        for t in active:
-            job = t.get("labels", {}).get("job", "unknown")
-            health = t.get("health", "unknown")
-            icon = "✓" if health == "up" else "✗"
-            print(f"  {icon} Target '{job}': {health.upper()}")
-
-        # Check recording rule
-        rule_status, rule_body = http_get(f"{PROMETHEUS_URL}/api/v1/rules")
-        if rule_status == 200 and "llmops_golden_signals" in rule_body:
-            print("  ✓ Golden Signal Recording Rules active (TTFT, TPS, KV Cache %, Normalized Queue)")
-        return True
-    print(f"  ✗ Prometheus unreachable: {body[:80]}")
-    return False
+    status, body = http_json(f"{PROMETHEUS_URL}/api/v1/targets")
+    if status != 200:
+        return fail(f"Prometheus unreachable: {str(body)[:120]}")
+    passed = True
+    for target in body["data"]["activeTargets"]:
+        job, health = target["labels"].get("job", "?"), target.get("health")
+        if health == "up":
+            ok(f"target '{job}' UP")
+        else:
+            passed = fail(f"target '{job}' {health.upper()}: {target.get('lastError', '')[:100]}")
+    status, rules = http_json(f"{PROMETHEUS_URL}/api/v1/rules")
+    groups = [g["name"] for g in rules.get("data", {}).get("groups", [])] if isinstance(rules, dict) else []
+    if {"llmops_golden_signals", "llmops_slo_alerts"} <= set(groups):
+        ok("recording rules & SLO alert groups loaded")
+    else:
+        passed = fail(f"rule groups missing (loaded: {groups})")
+    for metric in ("vllm:num_requests_running", "vllm:kv_cache_usage_perc", "litellm_requests_metric_total"):
+        status, res = http_json(f"{PROMETHEUS_URL}/api/v1/query?query={urllib.parse.quote(metric)}")
+        if status == 200 and res.get("data", {}).get("result"):
+            ok(f"metric {metric} present")
+        else:
+            passed = fail(f"metric {metric} has no series yet")
+    return passed
 
 
 def test_alertmanager() -> bool:
-    print("\n[6/7] Testing Plane 3: Alertmanager SLO Alerting Engine (:9093)...")
-    status, body = http_get(f"{ALERTMANAGER_URL}/-/ready")
-    if status == 200:
-        print("  ✓ Alertmanager is READY with multi-window SLO burn-rate alerts.")
-        return True
-    print(f"  ✗ Alertmanager status {status}: {body[:80]}")
-    return False
+    status, _ = http_json(f"{ALERTMANAGER_URL}/-/ready")
+    if status != 200:
+        return fail(f"Alertmanager not ready ({status})")
+    ok("Alertmanager READY")
+    return True
 
 
 def test_telemetry_alloy_tempo_loki() -> bool:
-    print("\n[7/7] Testing Plane 5: Telemetry Pipeline (Alloy, Tempo, Loki)...")
-    alloy_ok, _ = http_get(f"{ALLOY_URL}/-/ready")
-    tempo_ok, _ = http_get(f"{TEMPO_URL}/ready")
-    loki_ok, _ = http_get(f"{LOKI_URL}/ready")
+    passed = True
+    for name, url in (("Alloy", f"{ALLOY_URL}/-/ready"), ("Tempo", f"{TEMPO_URL}/ready"), ("Loki", f"{LOKI_URL}/ready")):
+        status, _ = http_json(url)
+        if status == 200:
+            ok(f"{name} ONLINE")
+        else:
+            passed = fail(f"{name} not ready ({status})")
 
-    print(f"  {'✓' if alloy_ok == 200 else '✗'} Grafana Alloy Agent (:12345) : {'ONLINE' if alloy_ok == 200 else 'OFFLINE'}")
-    print(f"  {'✓' if tempo_ok == 200 else '✗'} Grafana Tempo Tracing (:3200): {'ONLINE' if tempo_ok == 200 else 'OFFLINE'}")
-    print(f"  {'✓' if loki_ok == 200 else '✗'} Grafana Loki Engine (:3100)  : {'ONLINE' if loki_ok == 200 else 'OFFLINE'}")
+    # The gateway continues the caller's W3C trace, so the trace id we injected in
+    # check 3 must show up in Tempo once spans are flushed (OTLP batch + Alloy batch).
+    services: List[str] = []
+    for _ in range(15):
+        status, trace = http_json(f"{TEMPO_URL}/api/traces/{TRACE_ID}")
+        if status == 200 and isinstance(trace, dict):
+            for batch in trace.get("batches", trace.get("resourceSpans", [])):
+                for attr in batch.get("resource", {}).get("attributes", []):
+                    if attr.get("key") == "service.name":
+                        services.append(attr.get("value", {}).get("stringValue", "?"))
+            break
+        time.sleep(2)
+    if services:
+        ok(f"trace {TRACE_ID[:12]}... found in Tempo (services: {sorted(set(services))})")
+    else:
+        passed = fail(f"trace {TRACE_ID[:12]}... never reached Tempo (W3C propagation / OTLP export broken)")
 
-    return alloy_ok == 200 and tempo_ok == 200 and loki_ok == 200
+    query = urllib.parse.urlencode({"query": '{container="vllm-inference"}', "limit": 5, "since": "30m"})
+    status, logs = http_json(f"{LOKI_URL}/loki/api/v1/query_range?{query}")
+    streams = logs.get("data", {}).get("result", []) if isinstance(logs, dict) else []
+    if streams:
+        ok(f"Loki receiving container logs ({sum(len(s.get('values', [])) for s in streams)} recent vllm lines)")
+    else:
+        passed = fail("Loki has no vllm-inference log lines (Alloy docker log shipping broken)")
+    return passed
 
 
-def show_summary():
+def test_grafana() -> bool:
+    status, _ = http_json(f"{GRAFANA_URL}/api/health")
+    if status != 200:
+        return fail(f"Grafana unhealthy ({status})")
+    user = os.getenv("GF_SECURITY_ADMIN_USER", "admin")
+    password = os.getenv("GF_SECURITY_ADMIN_PASSWORD", "admin")
+    auth = base64.b64encode(f"{user}:{password}".encode()).decode()
+    status, sources = http_json(f"{GRAFANA_URL}/api/datasources", headers={"Authorization": f"Basic {auth}"})
+    if status != 200:
+        return fail(f"Grafana datasource API returned {status}")
+    uids = sorted(s.get("uid") for s in sources)
+    missing = {"Prometheus", "Loki", "tempo", "Alertmanager"} - set(uids)
+    if missing:
+        return fail(f"Grafana datasources missing: {sorted(missing)}")
+    ok(f"Grafana healthy with datasources {uids}")
+    return True
+
+
+CHECKS: List[Tuple[str, Callable[[], bool]]] = [
+    ("Plane 2: vLLM Inference Engine", test_vllm_engine),
+    ("Plane 1/2: KV-Cache-Aware Router", test_kv_router),
+    ("Plane 1: Gateway SSE Streaming via Virtual Key", test_streaming_inference),
+    ("Plane 1/2: Thinking (Reasoning) Alias", test_thinking_alias),
+    ("Plane 1: Virtual Key Authentication", test_auth_rejects_invalid_key),
+    ("Plane 1: PII Masking Guardrail", test_guardrails_pii),
+    ("Plane 3/4: Prometheus Targets, Rules & Metrics", test_prometheus_signals),
+    ("Plane 3: Alertmanager", test_alertmanager),
+    ("Plane 5: Alloy, Tempo & Loki Telemetry", test_telemetry_alloy_tempo_loki),
+    ("Plane 7: Grafana", test_grafana),
+]
+
+
+def main() -> int:
+    if MASTER_KEY == VIRTUAL_KEY:
+        print("✗ TEAM_ENGINEERING_KEY equals the master key - client traffic must use a virtual key")
+        return 1
+    results = []
+    for i, (title, check) in enumerate(CHECKS, 1):
+        print(f"\n[{i}/{len(CHECKS)}] {title}")
+        try:
+            results.append((title, check()))
+        except Exception as e:  # a crashing check is a failing check
+            results.append((title, fail(f"check crashed: {e!r}")))
+
+    failed = [title for title, passed in results if not passed]
     print("\n" + "=" * 68)
-    print("  PRODUCTION SERVICES ENDPOINT REGISTRY:")
+    print(f"  RESULT: {len(results) - len(failed)}/{len(results)} checks passed")
+    for title in failed:
+        print(f"  ✗ {title}")
     print("=" * 68)
-    print(f"  • Grafana 11 Dashboard  : {GRAFANA_URL} (admin / admin)")
-    print(f"  • LiteLLM AI Gateway    : {LITELLM_URL} (Bearer {VIRTUAL_KEY[:12]}...)")
-    print(f"  • KV-Aware Router       : {KV_ROUTER_URL}")
-    print(f"  • vLLM Inference Engine : {VLLM_URL}")
-    print(f"  • Prometheus Engine     : {PROMETHEUS_URL}/targets")
-    print(f"  • Alertmanager Engine   : {ALERTMANAGER_URL}")
-    print(f"  • Grafana Tempo Traces  : {TEMPO_URL}")
-    print(f"  • Grafana Alloy Shipper : {ALLOY_URL}")
-    print(f"  • Grafana Loki Logs     : {LOKI_URL}")
-    print("=" * 68)
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
-    test_vllm_engine()
-    test_kv_router()
-    test_streaming_inference()
-    test_guardrails_pii()
-    test_prometheus_signals()
-    test_alertmanager()
-    test_telemetry_alloy_tempo_loki()
-    show_summary()
+    sys.exit(main())

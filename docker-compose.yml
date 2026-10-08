@@ -1,3 +1,20 @@
+# ==============================================================================
+# LLMOps Production Platform - Base Service Topology
+# ==============================================================================
+# Overlays:
+#   docker-compose.gpu.yml          NVIDIA CUDA: native vLLM + DCGM exporter
+#   docker-compose.cpu.yml          CPU / laptop: emulated engine + mock DCGM
+#   docker-compose.langfuse-v3.yml  Langfuse v3 (ClickHouse + MinIO + worker)
+#
+# Network exposure: every host port binds to BIND_ADDRESS (default 127.0.0.1) so
+# a cloud VM never exposes Postgres/Redis/vLLM/admin UIs to the internet. Reach
+# the UIs through an SSH tunnel, or set GATEWAY_BIND_ADDRESS=0.0.0.0 to publish
+# only the authenticated LiteLLM gateway.
+# ==============================================================================
+
+# Fixed project name -> deterministic volume names (llmops_postgres_data, ...) on any checkout path.
+name: llmops
+
 services:
   # ============================================================================
   # 1. INFERENCE ENGINE (Plane 2: GPU Inference Plane)
@@ -10,12 +27,13 @@ services:
     container_name: vllm-inference
     ipc: host
     ports:
-      - "${VLLM_PORT:-8000}:8000"
+      - "${BIND_ADDRESS:-127.0.0.1}:${VLLM_PORT:-8000}:8000"
     volumes:
-      - ~/.cache/huggingface:/root/.cache/huggingface
+      - ${HF_CACHE_DIR:-~/.cache/huggingface}:/root/.cache/huggingface
     environment:
       - HF_HUB_ENABLE_HF_TRANSFER=0
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4318
+      - MODEL_NAME=${SERVED_MODEL_NAME:-qwen3.5-9b}
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
@@ -33,16 +51,20 @@ services:
     build:
       context: ./router
       dockerfile: Dockerfile
+    image: llmops-kv-router:latest
     container_name: kv-router
     environment:
       - ROUTER_PORT=8000
       - VLLM_BACKENDS=http://vllm:8000
-      - ROUTER_TIMEOUT=60
+      # Max seconds between upstream bytes (long thinking-mode generations stream for minutes).
+      - ROUTER_TIMEOUT=${ROUTER_TIMEOUT:-600}
     ports:
-      - "8001:8000"
+      - "${BIND_ADDRESS:-127.0.0.1}:8001:8000"
+    # The router tracks backend health itself; it must not block on the engine
+    # finishing a multi-minute model load.
     depends_on:
       vllm:
-        condition: service_healthy
+        condition: service_started
     restart: unless-stopped
     networks:
       - llmops-net
@@ -51,24 +73,32 @@ services:
   # 3. AI GATEWAY (Plane 1: Ingress & Routing Plane)
   # ============================================================================
   litellm:
-    image: ghcr.io/berriai/litellm:main-latest
+    image: ghcr.io/berriai/litellm:${LITELLM_IMAGE_TAG:-v1.104.1}
     container_name: litellm-gateway
     ports:
-      - "${LITELLM_PORT:-4000}:4000"
+      - "${GATEWAY_BIND_ADDRESS:-127.0.0.1}:${LITELLM_PORT:-4000}:4000"
     volumes:
       - ./config/litellm.yaml:/app/config.yaml:ro
+      - ./config/pii_guardrail.py:/app/pii_guardrail.py:ro
     environment:
       - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-admin-master-sec-9a8b7c6d5e4f3a2b1c0d}
       - DATABASE_URL=postgresql://${POSTGRES_USER:-llmops_admin}:${POSTGRES_PASSWORD:-llmops_production_secure_pass_2026}@postgres:5432/${POSTGRES_DB:-litellm_db}
       - REDIS_URL=redis://:${REDIS_PASSWORD:-redis_cluster_production_pass_2026}@redis:6379
       - KV_ROUTER_URL=http://kv-router:8000/v1
       - VLLM_DIRECT_URL=http://vllm:8000/v1
-      - EDGE_FALLBACK_URL=http://vllm:8000/v1
+      # OTLP/HTTP -> Alloy -> Tempo (LiteLLM infers the otlp_http exporter from the endpoint)
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4318
+      - OTEL_SERVICE_NAME=litellm-gateway
     command: >
       --config /app/config.yaml
       --port 4000
       --num_workers ${LITELLM_NUM_WORKERS:-2}
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness', timeout=3)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 60s
     depends_on:
       postgres:
         condition: service_healthy
@@ -87,7 +117,7 @@ services:
     image: redis:7-alpine
     container_name: llmops-redis
     ports:
-      - "6379:6379"
+      - "${BIND_ADDRESS:-127.0.0.1}:6379:6379"
     command: redis-server --requirepass ${REDIS_PASSWORD:-redis_cluster_production_pass_2026}
     healthcheck:
       test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-redis_cluster_production_pass_2026}", "ping"]
@@ -112,7 +142,7 @@ services:
       - postgres_data:/var/lib/postgresql/data
       - ./scripts/init-postgres.sh:/docker-entrypoint-initdb.d/init-databases.sh:ro
     ports:
-      - "5432:5432"
+      - "${BIND_ADDRESS:-127.0.0.1}:5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-llmops_admin} -d ${POSTGRES_DB:-litellm_db}"]
       interval: 5s
@@ -129,7 +159,7 @@ services:
     image: langfuse/langfuse:2
     container_name: langfuse-server
     ports:
-      - "${LANGFUSE_PORT:-3000}:3000"
+      - "${BIND_ADDRESS:-127.0.0.1}:${LANGFUSE_PORT:-3000}:3000"
     environment:
       - DATABASE_URL=postgresql://${POSTGRES_USER:-llmops_admin}:${POSTGRES_PASSWORD:-llmops_production_secure_pass_2026}@postgres:5432/langfuse
       - NEXTAUTH_SECRET=${NEXTAUTH_SECRET:-sec-nextauth-token-984729104827104928}
@@ -147,17 +177,19 @@ services:
   # 7. METRICS ENGINE (Plane 3: Prometheus with Recording & Alerting Rules)
   # ============================================================================
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:${PROMETHEUS_IMAGE_TAG:-v3.15.0}
     container_name: prometheus-scraper
     ports:
-      - "${PROMETHEUS_PORT:-9090}:9090"
+      - "${BIND_ADDRESS:-127.0.0.1}:${PROMETHEUS_PORT:-9090}:9090"
     volumes:
       - ./config/prometheus.yaml:/etc/prometheus/prometheus.yml:ro
       - ./config/prometheus-rules.yaml:/etc/prometheus/rules/prometheus-rules.yaml:ro
       - ./config/prometheus-alerts.yaml:/etc/prometheus/rules/prometheus-alerts.yaml:ro
+      - prometheus_data:/prometheus
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-30d}
       - --web.enable-lifecycle
     restart: unless-stopped
     networks:
@@ -167,10 +199,10 @@ services:
   # 8. ALERTING ENGINE (Plane 3: Alertmanager for SLO Burn-Rate Alerts)
   # ============================================================================
   alertmanager:
-    image: prom/alertmanager:latest
+    image: prom/alertmanager:${ALERTMANAGER_IMAGE_TAG:-v0.34.1}
     container_name: alertmanager-engine
     ports:
-      - "${ALERTMANAGER_PORT:-9093}:9093"
+      - "${BIND_ADDRESS:-127.0.0.1}:${ALERTMANAGER_PORT:-9093}:9093"
     volumes:
       - ./config/alertmanager.yaml:/etc/alertmanager/alertmanager.yml:ro
     command:
@@ -187,9 +219,9 @@ services:
     image: grafana/alloy:v1.1.0
     container_name: alloy-telemetry-agent
     ports:
-      - "12345:12345"
-      - "4317:4317"
-      - "4318:4318"
+      - "${BIND_ADDRESS:-127.0.0.1}:12345:12345"
+      - "${BIND_ADDRESS:-127.0.0.1}:4317:4317"
+      - "${BIND_ADDRESS:-127.0.0.1}:4318:4318"
     volumes:
       - ./config/alloy.config:/etc/alloy/config.alloy:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -212,7 +244,7 @@ services:
     image: grafana/tempo:2.4.1
     container_name: tempo-tracing-engine
     ports:
-      - "3200:3200"
+      - "${BIND_ADDRESS:-127.0.0.1}:3200:3200"
     volumes:
       - ./config/tempo.yaml:/etc/tempo/tempo.yaml:ro
     command:
@@ -228,7 +260,7 @@ services:
     image: grafana/loki:3.0.0
     container_name: loki-engine
     ports:
-      - "${LOKI_PORT:-3100}:3100"
+      - "${BIND_ADDRESS:-127.0.0.1}:${LOKI_PORT:-3100}:3100"
     volumes:
       - ./config/loki.yaml:/etc/loki/local-config.yaml:ro
     command: -config.file=/etc/loki/local-config.yaml
@@ -246,7 +278,7 @@ services:
     image: llmops-dcgm-exporter:latest
     container_name: dcgm-hardware-exporter
     ports:
-      - "9400:9400"
+      - "${BIND_ADDRESS:-127.0.0.1}:9400:9400"
     restart: unless-stopped
     networks:
       - llmops-net
@@ -258,7 +290,7 @@ services:
     image: prom/node-exporter:v1.8.0
     container_name: node-exporter
     ports:
-      - "9100:9100"
+      - "${BIND_ADDRESS:-127.0.0.1}:9100:9100"
     command:
       - '--path.procfs=/host/proc'
       - '--path.sysfs=/host/sys'
@@ -272,13 +304,13 @@ services:
       - llmops-net
 
   # ============================================================================
-  # 14. PRODUCTION VISUALIZATION (Plane 7: Grafana 11)
+  # 14. PRODUCTION VISUALIZATION (Plane 7: Grafana)
   # ============================================================================
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:${GRAFANA_IMAGE_TAG:-13.2.3}
     container_name: grafana-dashboard
     ports:
-      - "${GRAFANA_PORT:-3001}:3000"
+      - "${BIND_ADDRESS:-127.0.0.1}:${GRAFANA_PORT:-3001}:3000"
     volumes:
       - ./config/grafana-datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml:ro
       - ./config/grafana-dashboards.yaml:/etc/grafana/provisioning/dashboards/dashboards.yaml:ro

@@ -16,8 +16,9 @@ import os
 import sys
 import urllib.error
 import urllib.request
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
+from llmops_client import GATEWAY_MODEL  # also loads the repo .env
 
 DEFAULT_GATEWAY_URL = os.getenv("LITELLM_URL", "http://localhost:4000")
 MASTER_KEY = os.getenv("LITELLM_MASTER_KEY", "sk-admin-master-sec-9a8b7c6d5e4f3a2b1c0d")
@@ -69,6 +70,7 @@ def generate_key(
     models: list,
     metadata: Optional[Dict[str, Any]] = None,
     key: Optional[str] = None,
+    duration: Optional[str] = "30d",
 ) -> Dict[str, Any]:
     payload = {
         "team_id": team_id,
@@ -78,7 +80,7 @@ def generate_key(
         "tpm_limit": tpm_limit,
         "models": models,
         "metadata": metadata or {"created_by": "manage_keys_cli", "env": "production"},
-        "duration": "30d",
+        "duration": duration,  # None = never expires
     }
     if key:
         payload["key"] = key
@@ -113,20 +115,17 @@ def list_spend() -> None:
     print(json.dumps(res, indent=2))
 
 
-def bootstrap_seed_keys() -> None:
-    print("============================================================")
-    print("  Bootstrapping Production Per-Team Virtual Keys")
-    print("============================================================")
-
-    seeds = [
+def seed_definitions() -> List[Dict[str, Any]]:
+    model = GATEWAY_MODEL
+    return [
         {
             "team_id": "engineering",
             "key_alias": "platform-engineering-prod",
             "key": os.getenv("TEAM_ENGINEERING_KEY", "sk-eng-team-a1b2c3d4e5f6g7h8i9j0"),
             "max_budget": 500.0,
-            "rpm_limit": 300,
-            "tpm_limit": 100000,
-            "models": ["smollm2", "smollm2-direct"],
+            "rpm_limit": 600,
+            "tpm_limit": 2000000,
+            "models": [model, f"{model}-direct", f"{model}-thinking"],
             "metadata": {"dept": "core-eng", "sla": "tier-1"},
         },
         {
@@ -134,9 +133,9 @@ def bootstrap_seed_keys() -> None:
             "key_alias": "applied-research-experiments",
             "key": os.getenv("TEAM_RESEARCH_KEY", "sk-res-team-k1l2m3n4o5p6q7r8s9t0"),
             "max_budget": 200.0,
-            "rpm_limit": 60,
-            "tpm_limit": 60000,
-            "models": ["smollm2", "smollm2-edge-fallback"],
+            "rpm_limit": 120,
+            "tpm_limit": 500000,
+            "models": [model, f"{model}-thinking"],
             "metadata": {"dept": "ai-research", "sla": "tier-2"},
         },
         {
@@ -144,28 +143,33 @@ def bootstrap_seed_keys() -> None:
             "key_alias": "ci-cd-model-eval-gate",
             "key": os.getenv("TEAM_CI_KEY", "sk-ci-pipeline-gate-eval-key-1234"),
             "max_budget": 100.0,
-            "rpm_limit": 120,
-            "tpm_limit": 50000,
-            "models": ["smollm2"],
+            "rpm_limit": 300,
+            "tpm_limit": 500000,
+            "models": [model, f"{model}-thinking"],
             "metadata": {"dept": "devops", "purpose": "eval-gate"},
         },
     ]
 
-    for item in seeds:
+
+def bootstrap_seed_keys() -> None:
+    """Idempotent: creates teams/keys, or re-syncs limits & allowed models of existing keys
+    (e.g. after a model swap), then verifies every key exists. Exits 1 on any failure."""
+    print("============================================================")
+    print("  Bootstrapping Production Per-Team Virtual Keys")
+    print("============================================================")
+
+    failures = []
+    for item in seed_definitions():
         try:
             # Register team first to ensure foreign key constraint in LiteLLM
             api_request(
                 "/team/new",
                 method="POST",
-                data={
-                    "team_id": item["team_id"],
-                    "team_alias": item["key_alias"],
-                    "max_budget": item["max_budget"],
-                },
+                data={"team_id": item["team_id"], "team_alias": item["key_alias"], "max_budget": item["max_budget"]},
                 fail_silently=True,
             )
-        except Exception:
-            pass
+        except urllib.error.HTTPError:
+            pass  # team already exists
 
         try:
             generate_key(
@@ -176,12 +180,46 @@ def bootstrap_seed_keys() -> None:
                 tpm_limit=item["tpm_limit"],
                 models=item["models"],
                 metadata=item["metadata"],
-                key=item.get("key"),
+                key=item["key"],
+                duration=None,  # long-lived service keys; rotate deliberately, never by surprise
             )
+        except urllib.error.HTTPError:
+            # Key already present: bring its limits and allowed models in line with this seed.
+            try:
+                api_request(
+                    "/key/update",
+                    method="POST",
+                    data={
+                        "key": item["key"],
+                        "models": item["models"],
+                        "max_budget": item["max_budget"],
+                        "rpm_limit": item["rpm_limit"],
+                        "tpm_limit": item["tpm_limit"],
+                        "metadata": item["metadata"],
+                    },
+                    fail_silently=True,
+                )
+                print(f"\n🔄 Existing key '{item['key_alias']}' re-synced (models: {', '.join(item['models'])})")
+            except Exception as e:
+                failures.append(f"{item['key_alias']}: update failed: {e}")
+                continue
         except Exception as e:
-            print(f"ℹ Pre-existing or active key for {item['key_alias']}: {e}")
+            failures.append(f"{item['key_alias']}: {e}")
+            continue
 
-    print("\n✅ Seed virtual keys initialized in PostgreSQL.")
+        try:
+            info = api_request(f"/key/info?key={item['key']}", fail_silently=True).get("info", {})
+            if sorted(info.get("models") or []) != sorted(item["models"]):
+                failures.append(f"{item['key_alias']}: models are {info.get('models')}, expected {item['models']}")
+        except Exception as e:
+            failures.append(f"{item['key_alias']}: verification failed: {e}")
+
+    if failures:
+        print("\n❌ Virtual key seeding failed:")
+        for failure in failures:
+            print(f"  • {failure}")
+        sys.exit(1)
+    print("\n✅ Seed virtual keys initialized & verified in PostgreSQL.")
 
 
 def main():
@@ -195,7 +233,7 @@ def main():
     gen_parser.add_argument("--budget", type=float, default=50.0, help="Max budget in USD (default 50.0)")
     gen_parser.add_argument("--rpm", type=int, default=120, help="Requests per minute limit (default 120)")
     gen_parser.add_argument("--tpm", type=int, default=50000, help="Tokens per minute limit (default 50000)")
-    gen_parser.add_argument("--models", nargs="+", default=["smollm2"], help="Allowed models")
+    gen_parser.add_argument("--models", nargs="+", default=[GATEWAY_MODEL], help="Allowed model aliases")
 
     # Info
     info_parser = subparsers.add_parser("info", help="Query virtual key details and budget")

@@ -4,74 +4,88 @@
 # Enforces:
 #  - Virtual key authentication via PostgreSQL persistence
 #  - Redis distributed rate-limiting & response caching
-#  - Input/Output Guardrails (PII redaction, prompt injection heuristics)
-#  - OpenTelemetry W3C traceparent propagation to Tempo
+#  - Input guardrail: PII masking before the model sees the prompt (pii_guardrail.py)
+#  - OpenTelemetry W3C traceparent propagation to Tempo (OTEL_* env, see compose)
 #  - Prometheus golden signal callbacks
 #  - Dynamic fallback routing & retries
+#
+# Served model: Qwen/Qwen3.5-9B on vLLM (served name "qwen3.5-9b").
+# vLLM starts with enable_thinking=false, so the default alias answers directly;
+# the "-thinking" alias opts into reasoning (returned as `reasoning_content`).
+# To serve a different model: change MODEL_* / SERVED_MODEL_NAME / VLLM_MODEL_ARGS
+# in .env and rename the aliases + upstream model below.
 # ==============================================================================
 
 model_list:
   # Primary Serving Route: KV-Cache-Aware Router -> vLLM Workers
-  - model_name: smollm2
-    litellm_params:
-      model: openai/HuggingFaceTB/SmolLM2-360M-Instruct
+  - model_name: qwen3.5-9b
+    litellm_params: &qwen_router_params
+      model: hosted_vllm/qwen3.5-9b
       api_base: os.environ/KV_ROUTER_URL
       api_key: "none"
-      timeout: 30
-      max_retries: 3
-      stream: true
+      timeout: 600            # whole request; long generations stream for minutes
+      stream_timeout: 120     # max wait for the first streamed chunk
+      max_retries: 2
+    model_info: &qwen_model_info
+      max_input_tokens: 131072
+      max_output_tokens: 32768
+      supports_vision: true
+      supports_function_calling: true
+      supports_reasoning: true
+      # Internal chargeback rates (USD/token) so per-team budgets & spend tracking
+      # are meaningful for a self-hosted model. Tune to your GPU cost.
+      input_cost_per_token: 0.0000001
+      output_cost_per_token: 0.0000004
 
   # Direct vLLM Engine Route (Bypasses Router for debugging / fallback)
-  - model_name: smollm2-direct
+  - model_name: qwen3.5-9b-direct
     litellm_params:
-      model: openai/HuggingFaceTB/SmolLM2-360M-Instruct
+      <<: *qwen_router_params
       api_base: os.environ/VLLM_DIRECT_URL
-      api_key: "none"
-      timeout: 30
-      max_retries: 2
-      stream: true
+    model_info:
+      <<: *qwen_model_info
 
-  # Alternate Engine Heterogeneity Route (Pluggable CPU/Edge engine fallback)
-  - model_name: smollm2-edge-fallback
+  # Thinking / Reasoning Route (chain-of-thought in `reasoning_content`)
+  - model_name: qwen3.5-9b-thinking
     litellm_params:
-      model: openai/SmolLM2-360M-Instruct
-      api_base: os.environ/EDGE_FALLBACK_URL
-      api_key: "none"
-      timeout: 45
-      max_retries: 1
+      <<: *qwen_router_params
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: true
+    model_info:
+      <<: *qwen_model_info
 
 router_settings:
   routing_strategy: "least-busy"
   enable_pre_call_checks: true
-  num_retries: 3
-  timeout: 30
+  num_retries: 2
+  timeout: 600
   fallbacks:
-    - smollm2: ["smollm2-direct"]
+    - qwen3.5-9b: ["qwen3.5-9b-direct"]
+
+guardrails:
+  - guardrail_name: "pii-masking"
+    litellm_params:
+      guardrail: pii_guardrail.PIIMaskingGuardrail
+      mode: "pre_call"
+      default_on: true
 
 litellm_settings:
   # Internal Prometheus scraper access within docker network
   require_auth_for_metrics_endpoint: false
 
-  # Multi-telemetry egress (Prometheus golden signals + Tempo OTel)
+  # Multi-telemetry egress (Prometheus golden signals + OTLP traces via Alloy -> Tempo)
   # To enable Langfuse application tracing, set LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, and add "langfuse"
-  success_callback: ["prometheus", "otel"]
-  failure_callback: ["prometheus", "otel"]
+  callbacks: ["prometheus", "otel"]
 
-  # Distributed Redis Caching (Exact response cache & prefix hits)
+  # Distributed Redis exact-response cache (connection from REDIS_URL).
+  # Clients bypass it per request with {"cache": {"no-cache": true}}.
   cache: true
-  cache_type: "redis"
-  redis_url: os.environ/REDIS_URL
   cache_params:
+    type: "redis"
     namespace: "litellm.cache"
     ttl: 3600
     supported_call_types: ["acompletion", "completion"]
-
-  # OpenTelemetry Distributed Tracing
-  otel:
-    endpoint: os.environ/OTEL_EXPORTER_OTLP_ENDPOINT
-    service_name: "litellm-gateway"
-    export_interval_millis: 500
-
 
 general_settings:
   # Master key loaded strictly from environment secret (ADMIN ONLY)
@@ -80,7 +94,4 @@ general_settings:
   # Relational Database for per-team virtual keys, spend budgets, & audit log
   database_url: os.environ/DATABASE_URL
   store_model_in_db: true
-  proxy_budget_resets: "monthly"
   store_prompts_in_spend_logs: false  # PII protection: don't store raw prompts in DB logs
-  enable_proxy_cache: true
-  trusted_proxy_ranges: []

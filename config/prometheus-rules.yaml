@@ -3,6 +3,8 @@
 # ==============================================================================
 # Pre-calculates golden signals every 15s to optimize KEDA autoscaler polling
 # and speed up Grafana dashboard rendering.
+# Metric names follow the vLLM V1 engine (v0.10+): kv_cache_usage_perc,
+# inter_token_latency_seconds, prefix_cache_{hits,queries}_total.
 # ==============================================================================
 
 groups:
@@ -15,14 +17,14 @@ groups:
           /
           clamp_min(count(count by (instance) (vllm:num_requests_running)), 1)
 
-      # 2. KV-Cache Utilization Factor (Saturation Signal)
+      # 2. KV-Cache Utilization (Saturation Signal; the gauge is a 0-1 ratio)
       - record: job:vllm_kv_cache_usage_ratio
         expr: >-
-          avg(vllm:gpu_cache_usage_factor)
+          avg(vllm:kv_cache_usage_perc)
 
       - record: job:vllm_kv_cache_usage_percent
         expr: >-
-          avg(vllm:gpu_cache_usage_factor) * 100
+          avg(vllm:kv_cache_usage_perc) * 100
 
       # 3. Ingress Request Rate (Gateway RPS)
       - record: job:litellm_requests_per_second
@@ -44,14 +46,18 @@ groups:
           histogram_quantile(0.95, sum(rate(vllm:time_to_first_token_seconds_bucket[5m])) by (le))
 
       # 6. P95 Inter-Token Latency (ITL)
-      - record: job:vllm_time_per_output_token_seconds_p95
+      - record: job:vllm_inter_token_latency_seconds_p95
         expr: >-
-          histogram_quantile(0.95, sum(rate(vllm:time_per_output_token_seconds_bucket[5m])) by (le))
+          histogram_quantile(0.95, sum(rate(vllm:inter_token_latency_seconds_bucket[5m])) by (le))
 
-      # 7. Cluster Token Generation Throughput (TPS)
+      # 7. Cluster Token Throughput (TPS): decode output and prefill input separately
       - record: job:vllm_tokens_generated_per_second
         expr: >-
-          sum(rate(vllm:prompt_tokens_total[1m])) + sum(rate(vllm:generation_tokens_total[1m]))
+          sum(rate(vllm:generation_tokens_total[1m]))
+
+      - record: job:vllm_prompt_tokens_per_second
+        expr: >-
+          sum(rate(vllm:prompt_tokens_total[1m]))
 
       # 8. KV Router Cache Affinity Hit Rate Percentage
       - record: job:kv_router_affinity_hit_percent
@@ -60,4 +66,13 @@ groups:
             sum(rate(kv_router_prefix_affinity_routes[2m]))
             /
             clamp_min(sum(rate(kv_router_requests_total[2m])), 0.001)
+          ) * 100
+
+      # 9. Engine Prefix-Cache Hit Rate (tokens served from cached KV blocks)
+      - record: job:vllm_prefix_cache_hit_percent
+        expr: >-
+          (
+            sum(rate(vllm:prefix_cache_hits_total[5m]))
+            /
+            clamp_min(sum(rate(vllm:prefix_cache_queries_total[5m])), 1)
           ) * 100

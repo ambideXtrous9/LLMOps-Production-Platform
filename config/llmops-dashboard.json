@@ -70,7 +70,7 @@
       "type": "stat",
       "targets": [
         {
-          "expr": "job:vllm_time_to_first_token_seconds_p95 or vector(0.42)",
+          "expr": "job:vllm_time_to_first_token_seconds_p95",
           "legendFormat": "P95 TTFT"
         }
       ]
@@ -124,7 +124,7 @@
       "type": "gauge",
       "targets": [
         {
-          "expr": "job:vllm_kv_cache_usage_percent or avg(vllm:gpu_cache_usage_factor) * 100 or vector(28.5)",
+          "expr": "job:vllm_kv_cache_usage_percent or avg(vllm:kv_cache_usage_perc) * 100",
           "legendFormat": "KV Cache Saturation"
         }
       ]
@@ -215,7 +215,7 @@
       "type": "stat",
       "targets": [
         {
-          "expr": "job:kv_router_affinity_hit_percent or vector(82.4)",
+          "expr": "job:kv_router_affinity_hit_percent",
           "legendFormat": "Affinity Hit Rate"
         }
       ]
@@ -659,7 +659,7 @@
         "y": 23
       },
       "id": 7,
-      "title": "\ud83e\udde0 Large Language Model (vLLM Engine & SmolLM2)",
+      "title": "\ud83e\udde0 Large Language Model (vLLM Engine)",
       "type": "row"
     },
     {
@@ -830,7 +830,7 @@
             "type": "prometheus",
             "uid": "Prometheus"
           },
-          "expr": "max(sum(vllm:avg_generation_throughput_tok_per_s)) or vector(0)",
+          "expr": "sum(rate(vllm:generation_tokens_total[1m])) or vector(0)",
           "refId": "A",
           "legendFormat": " "
         }

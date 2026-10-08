@@ -4,234 +4,160 @@ scripts/load_test.py
 Production Load Simulator & Saturation Stress Tester.
 
 Features:
-  - Concurrent multi-threaded traffic generator (50+ concurrent requests)
-  - True End-to-End Streaming (Server-Sent Events) to measure:
-      * Time-To-First-Token (TTFT)
-      * Inter-Token Latency (ITL)
-      * Generation Tokens-Per-Second (TPS)
-  - Telemetry sampling of:
-      * Normalized queue depth backlog (waiting / active replicas)
-      * KV-cache saturation factor (gpu_cache_usage_factor)
-      * KEDA ScaledObject trigger saturation verification
-  - Per-team virtual key attribution (not master key!)
+  - Concurrent multi-process streaming traffic through the full path
+    (LiteLLM gateway -> KV-cache-aware router -> vLLM), Redis response cache bypassed
+  - Per request: Time-To-First-Token (TTFT), end-to-end latency, decode tokens/s
+    (token counts come from the engine's usage report, not chunk counting)
+  - Continuous engine telemetry sampling during the burst:
+      * running / waiting requests (queue backlog)
+      * KV-cache utilisation (vllm:kv_cache_usage_perc)
+      * KEDA ScaledObject trigger evaluation (backlog > 4/replica or KV > 80%)
+  - Per-team virtual key attribution (never the master key)
+
+Env: CONCURRENCY (default 32), REQUESTS (default = CONCURRENCY), MAX_TOKENS (default 256)
 """
 
 import concurrent.futures
-import json
+import multiprocessing
 import os
 import sys
+import threading
 import time
-import urllib.error
 import urllib.request
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List
 
+from llmops_client import GATEWAY_MODEL, NO_CACHE, VIRTUAL_KEY, ChatResult, chat
 
-_raw_gateway = os.getenv("LITELLM_URL", "http://localhost:4000/v1/chat/completions")
-if not _raw_gateway.endswith("/chat/completions"):
-    GATEWAY_URL = f"{_raw_gateway.rstrip('/')}/v1/chat/completions" if not _raw_gateway.endswith("/v1") else f"{_raw_gateway}/chat/completions"
-else:
-    GATEWAY_URL = _raw_gateway
 VLLM_METRICS_URL = os.getenv("VLLM_METRICS_URL", "http://localhost:8000/metrics")
-API_KEY = os.getenv("TEAM_ENGINEERING_KEY", "sk-eng-team-a1b2c3d4e5f6g7h8i9j0")
-CONCURRENT_REQUESTS = int(os.getenv("CONCURRENCY", "40"))
-TOKENS_TO_GENERATE = int(os.getenv("MAX_TOKENS", "64"))
+CONCURRENT_REQUESTS = int(os.getenv("CONCURRENCY", "32"))
+TOTAL_REQUESTS = int(os.getenv("REQUESTS", str(CONCURRENT_REQUESTS)))
+TOKENS_TO_GENERATE = int(os.getenv("MAX_TOKENS", "256"))
 
 PROMPTS = [
     "Explain how PagedAttention solves physical memory fragmentation in continuous batching.",
     "Describe how a KV-cache-aware router routes requests based on prompt prefix affinity.",
     "Why is inference queue depth combined with KV-cache usage superior to CPU for autoscaling?",
     "Detail how OpenTelemetry W3C traceparent headers propagate from gateway down to CUDA execution.",
-    "How does Grafana Alloy collect logs and OpenTelemetry traces without root Docker socket access?",
+    "How does Grafana Alloy collect container logs and OpenTelemetry traces?",
 ]
 
 
-def send_streaming_request(req_id: int) -> Tuple[bool, float, float, int]:
-    """
-    Sends streaming request to Gateway and measures:
-    - ttft: Time from send until first SSE token chunk arrived
-    - total_time: Total time from send until stream completed
-    - tokens: Count of generated tokens
-    """
-    prompt = PROMPTS[req_id % len(PROMPTS)]
-    payload = json.dumps({
-        "model": "smollm2",
-        "messages": [
+def send_streaming_request(req_id: int) -> ChatResult:
+    res = chat(
+        [
             {"role": "system", "content": "You are a concise production systems assistant."},
-            {"role": "user", "content": prompt}
+            {"role": "user", "content": PROMPTS[req_id % len(PROMPTS)]},
         ],
-        "temperature": 0.7,
-        "max_tokens": TOKENS_TO_GENERATE,
-        "stream": True,
-    }).encode("utf-8")
-
-    traceparent = f"00-{req_id:032x}-00f067aa0ba902b7-01"
-    req = urllib.request.Request(
-        GATEWAY_URL,
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {API_KEY}",
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-            "traceparent": traceparent,
-        }
+        max_tokens=TOKENS_TO_GENERATE,
+        temperature=0.7,
+        extra=NO_CACHE,
+        headers={"traceparent": f"00-{os.urandom(16).hex()}-{os.urandom(8).hex()}-01"},
+        timeout=300,
     )
-
-    start = time.time()
-    ttft = None
-    token_count = 0
-
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            for line in resp:
-                line_str = line.decode("utf-8").strip()
-                if not line_str.startswith("data:"):
-                    continue
-                data_part = line_str[5:].strip()
-                if data_part == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data_part)
-                    delta = chunk["choices"][0].get("delta", {}).get("content", "")
-                    if delta:
-                        if ttft is None:
-                            ttft = time.time() - start
-                        token_count += 1
-                except Exception:
-                    continue
-
-        total_time = time.time() - start
-        ttft = ttft if ttft is not None else total_time
-        gen_time = max(0.01, total_time - ttft)
-        tps = token_count / gen_time if gen_time > 0 else 0.0
-
-        print(f"  [Req {req_id:02d}] ✓ TTFT: {ttft:5.3f}s | Total: {total_time:5.2f}s | {token_count:2d} tok ({tps:4.1f} tps)")
-        return True, ttft, total_time, token_count
-    except urllib.error.HTTPError as e:
-        if e.code in (401, 403):
-            master_key = os.getenv("LITELLM_MASTER_KEY", "sk-admin-master-sec-9a8b7c6d5e4f3a2b1c0d")
-            req_m = urllib.request.Request(
-                GATEWAY_URL,
-                data=payload,
-                headers={
-                    "Authorization": f"Bearer {master_key}",
-                    "Content-Type": "application/json",
-                    "Accept": "text/event-stream",
-                }
-            )
-            try:
-                start_m = time.time()
-                ttft_m = None
-                token_count_m = 0
-                with urllib.request.urlopen(req_m, timeout=60) as resp:
-                    for line in resp:
-                        line_str = line.decode("utf-8").strip()
-                        if not line_str.startswith("data:"):
-                            continue
-                        data_part = line_str[5:].strip()
-                        if data_part == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(data_part)
-                            delta = chunk["choices"][0].get("delta", {}).get("content", "")
-                            if delta:
-                                if ttft_m is None:
-                                    ttft_m = time.time() - start_m
-                                token_count_m += 1
-                        except Exception:
-                            continue
-                total_time_m = time.time() - start_m
-                ttft_m = ttft_m if ttft_m is not None else total_time_m
-                gen_time_m = max(0.01, total_time_m - ttft_m)
-                tps_m = token_count_m / gen_time_m if gen_time_m > 0 else 0.0
-                print(f"  [Req {req_id:02d}] ✓ (Admin) TTFT: {ttft_m:5.3f}s | Total: {total_time_m:5.2f}s | {token_count_m:2d} tok ({tps_m:4.1f} tps)")
-                return True, ttft_m, total_time_m, token_count_m
-            except Exception:
-                pass
-        total_time = time.time() - start
-        print(f"  [Req {req_id:02d}] ✗ Failed after {total_time:5.2f}s: {e}")
-        return False, total_time, total_time, 0
-    except Exception as e:
-        total_time = time.time() - start
-        print(f"  [Req {req_id:02d}] ✗ Failed after {total_time:5.2f}s: {e}")
-        return False, total_time, total_time, 0
+    if res.ok:
+        print(f"  [Req {req_id:03d}] ✓ TTFT: {res.ttft or 0:5.3f}s | Total: {res.total:5.2f}s | "
+              f"{res.completion_tokens:4d} tok ({res.tps:5.1f} tok/s)")
+    else:
+        print(f"  [Req {req_id:03d}] ✗ HTTP {res.status} after {res.total:5.2f}s: {res.error[:120]}")
+    return res
 
 
-def sample_engine_telemetry() -> Tuple[float, float, float]:
-    """Queries vLLM /metrics for running, waiting, and KV cache usage."""
+def scrape_engine() -> Dict[str, float]:
+    """Sums the engine gauges we care about (labels vary by vLLM version)."""
+    wanted = {"vllm:num_requests_running": 0.0, "vllm:num_requests_waiting": 0.0, "vllm:kv_cache_usage_perc": 0.0}
     try:
         with urllib.request.urlopen(VLLM_METRICS_URL, timeout=3) as resp:
-            lines = resp.read().decode("utf-8").splitlines()
-            running = 0.0
-            waiting = 0.0
-            kv_cache = 0.0
-            for line in lines:
-                if line.startswith("vllm:num_requests_running{"):
-                    running = float(line.split()[-1])
-                elif line.startswith("vllm:num_requests_waiting{"):
-                    waiting = float(line.split()[-1])
-                elif line.startswith("vllm:gpu_cache_usage_factor{"):
-                    kv_cache = float(line.split()[-1])
-            return running, waiting, kv_cache
+            for line in resp.read().decode("utf-8").splitlines():
+                name = line.split("{", 1)[0].split(" ", 1)[0]
+                if name in wanted:
+                    wanted[name] += float(line.rsplit(" ", 1)[-1])
     except Exception:
-        return 0.0, 0.0, 0.0
+        pass
+    return wanted
+
+
+class TelemetrySampler(threading.Thread):
+    def __init__(self) -> None:
+        super().__init__(daemon=True)
+        self.stop_event = threading.Event()
+        self.peak = {"running": 0.0, "waiting": 0.0, "kv": 0.0}
+
+    def run(self) -> None:
+        while not self.stop_event.is_set():
+            m = scrape_engine()
+            self.peak["running"] = max(self.peak["running"], m["vllm:num_requests_running"])
+            self.peak["waiting"] = max(self.peak["waiting"], m["vllm:num_requests_waiting"])
+            self.peak["kv"] = max(self.peak["kv"], m["vllm:kv_cache_usage_perc"])
+            self.stop_event.wait(0.5)
 
 
 def percentile(data: List[float], p: float) -> float:
     if not data:
         return 0.0
+    data = sorted(data)
     k = (len(data) - 1) * p
     f = int(k)
     c = min(f + 1, len(data) - 1)
-    d = k - f
-    return data[f] + d * (data[c] - data[f])
+    return data[f] + (k - f) * (data[c] - data[f])
 
 
-def main():
-    print("=" * 68)
-    print(f"  LLMOps STRESS & SATURATION TEST: {CONCURRENT_REQUESTS} CONCURRENT STREAMING REQS")
-    print(f"  Target Gateway : LiteLLM (:4000) -> KV Router (:8001) -> vLLM (:8000)")
-    print(f"  Auth Context   : Team Virtual Key ({API_KEY[:15]}...)")
-    print("=" * 68)
+def main() -> int:
+    print("=" * 72)
+    print(f"  LLMOps STRESS & SATURATION TEST: {TOTAL_REQUESTS} STREAMING REQS @ CONCURRENCY {CONCURRENT_REQUESTS}")
+    print(f"  Path        : LiteLLM (:4000) -> KV Router (:8001) -> vLLM (:8000) | model '{GATEWAY_MODEL}'")
+    print(f"  Auth        : Team Virtual Key ({VIRTUAL_KEY[:12]}...) | response cache bypassed")
+    print(f"  Max tokens  : {TOKENS_TO_GENERATE}")
+    print("=" * 72)
 
+    sampler = TelemetrySampler()
+    sampler.start()
     start_all = time.time()
+    # Worker processes, not threads: with dozens of SSE streams parsed in one interpreter,
+    # GIL contention inflates client-side TTFT several-fold versus what the server delivers
+    # (64 streams: ~1.3s with threads vs ~0.3s measured by `vllm bench serve`).
+    # "spawn": forking while the telemetry thread holds a lock deadlocks the children.
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=CONCURRENT_REQUESTS, mp_context=multiprocessing.get_context("spawn")
+    ) as executor:
+        results = list(executor.map(send_streaming_request, range(1, TOTAL_REQUESTS + 1)))
+    wall = time.time() - start_all
+    sampler.stop_event.set()
+    sampler.join(timeout=2)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=CONCURRENT_REQUESTS) as executor:
-        futures = [executor.submit(send_streaming_request, i + 1) for i in range(CONCURRENT_REQUESTS)]
+    ok = [r for r in results if r.ok]
+    ttfts = [r.ttft or r.total for r in ok]
+    latencies = [r.total for r in ok]
+    tokens = sum(r.completion_tokens for r in ok)
+    peak = sampler.peak
+    keda = "🚨 BREACHED (backlog > 4/replica or KV > 80%)" if (peak["waiting"] > 4 or peak["kv"] > 0.80) else "NORMAL"
 
-        # Sample metrics mid-burst
-        time.sleep(1.2)
-        running, waiting, kv_cache = sample_engine_telemetry()
-        keda_trigger_state = "🚨 BREACHED (>4 req/rep or >80% KV)" if (waiting > 4 or kv_cache > 0.80) else "NORMAL"
-        print(f"\n  >>> [TELEMETRY IN-FLIGHT] Running: {running:.0f} | Waiting: {waiting:.0f} | KV-Cache: {kv_cache*100:.1f}% [{keda_trigger_state}]\n")
-
-        results = [f.result() for f in futures]
-
-    total_wall_time = time.time() - start_all
-    successes = [r for r in results if r[0]]
-    ttfts = sorted([r[1] for r in successes])
-    total_latencies = sorted([r[2] for r in successes])
-    tokens_total = sum(r[3] for r in successes)
-
-    print("\n" + "=" * 68)
+    print("\n" + "=" * 72)
     print("  PRODUCTION BENCHMARK SUMMARY & LATENCY DISTRIBUTION:")
-    print("=" * 68)
-    print(f"  • Total Duration          : {total_wall_time:.2f}s")
-    print(f"  • Success Rate            : {len(successes)}/{CONCURRENT_REQUESTS} ({len(successes)/CONCURRENT_REQUESTS*100:.1f}%)")
-    print(f"  • Total Tokens Generated  : {tokens_total} tokens")
-    print(f"  • Cluster Throughput      : {tokens_total/total_wall_time:.1f} tokens/second")
-    print("-" * 68)
-    print(f"  TIME-TO-FIRST-TOKEN (TTFT) DISTRIBUTION:")
+    print("=" * 72)
+    print(f"  • Total Duration          : {wall:.2f}s")
+    print(f"  • Success Rate            : {len(ok)}/{TOTAL_REQUESTS} ({len(ok) / TOTAL_REQUESTS * 100:.1f}%)")
+    print(f"  • Total Tokens Generated  : {tokens} tokens")
+    print(f"  • Cluster Throughput      : {tokens / wall:.1f} tokens/second")
+    print(f"  • Mean Per-Stream Decode  : {sum(r.tps for r in ok) / max(len(ok), 1):.1f} tokens/second")
+    print("-" * 72)
+    print("  TIME-TO-FIRST-TOKEN (TTFT) DISTRIBUTION:")
     print(f"  • TTFT P50 (Median)       : {percentile(ttfts, 0.50):.3f}s")
     print(f"  • TTFT P90                : {percentile(ttfts, 0.90):.3f}s")
     print(f"  • TTFT P95 (SLO Target)   : {percentile(ttfts, 0.95):.3f}s (SLO: <=1.500s)")
     print(f"  • TTFT P99                : {percentile(ttfts, 0.99):.3f}s")
-    print("-" * 68)
-    print(f"  END-TO-END LATENCY DISTRIBUTION:")
-    print(f"  • Latency P50             : {percentile(total_latencies, 0.50):.2f}s")
-    print(f"  • Latency P95             : {percentile(total_latencies, 0.95):.2f}s")
-    print(f"  • Latency P99             : {percentile(total_latencies, 0.99):.2f}s")
-    print("=" * 68)
+    print("-" * 72)
+    print("  END-TO-END LATENCY DISTRIBUTION:")
+    print(f"  • Latency P50             : {percentile(latencies, 0.50):.2f}s")
+    print(f"  • Latency P95             : {percentile(latencies, 0.95):.2f}s")
+    print(f"  • Latency P99             : {percentile(latencies, 0.99):.2f}s")
+    print("-" * 72)
+    print("  ENGINE SATURATION (peak during burst):")
+    print(f"  • Running / Waiting       : {peak['running']:.0f} / {peak['waiting']:.0f}")
+    print(f"  • KV-Cache Utilisation    : {peak['kv'] * 100:.1f}%")
+    print(f"  • KEDA Trigger State      : {keda}")
+    print("=" * 72)
+    return 0 if len(ok) == TOTAL_REQUESTS else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
