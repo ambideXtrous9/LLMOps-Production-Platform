@@ -1,0 +1,22 @@
+# ==============================================================================
+# Mock / Emulation Overlay (no inference)
+# ==============================================================================
+# Replaces the engine with engine/mock_vllm.py: an OpenAI-compatible emulator with
+# vLLM V1 metric names, SSE streaming and canned answers. Useful for dashboard,
+# alerting and pipeline development on machines that cannot run a model at all.
+# `./run_all.sh --mock` selects it explicitly; it is never chosen automatically.
+# ==============================================================================
+
+services:
+  vllm:
+    image: llmops-mock-vllm:latest
+    build:
+      context: ./engine
+      dockerfile: Dockerfile
+    command: !reset []
+    healthcheck:
+      start_period: 5s
+
+  dcgm-exporter:
+    environment:
+      - GPU_TELEMETRY_MODE=mock

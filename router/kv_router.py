@@ -36,7 +36,13 @@ logger = logging.getLogger("kv-router")
 PORT = int(os.getenv("ROUTER_PORT", "8000"))
 BACKEND_HOSTS = os.getenv("VLLM_BACKENDS", "http://vllm:8000").split(",")
 HEALTH_CHECK_INTERVAL = int(os.getenv("HEALTH_CHECK_INTERVAL", "5"))
-DEFAULT_TIMEOUT = int(os.getenv("ROUTER_TIMEOUT", "60"))
+# Max seconds between upstream bytes. Deliberately not a total-request timeout:
+# long (thinking-mode) generations legitimately stream for many minutes.
+DEFAULT_TIMEOUT = int(os.getenv("ROUTER_TIMEOUT", "600"))
+HOP_BY_HOP_HEADERS = {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade", "content-length", "host",
+}
 
 # Metrics counters
 METRICS = {
@@ -85,10 +91,9 @@ class KVHashRing:
             # Check for system message first
             for m in messages:
                 if m.get("role") == "system":
-                    return m.get("content", "").strip()[:512]
+                    return self._message_text(m)[:512]
             # Otherwise use the first user message
-            if len(messages) > 0:
-                return messages[0].get("content", "").strip()[:256]
+            return self._message_text(messages[0])[:256]
 
         prompt = payload.get("prompt", "")
         if isinstance(prompt, str):
@@ -97,6 +102,16 @@ class KVHashRing:
             return str(prompt[0])[:256]
 
         return ""
+
+    @staticmethod
+    def _message_text(message: dict) -> str:
+        """Text of a chat message; vision requests send content as a list of typed parts."""
+        content = message.get("content") or ""
+        if isinstance(content, list):
+            content = " ".join(
+                part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") == "text"
+            )
+        return str(content).strip()
 
     def select_node(self, prefix: str) -> Tuple[BackendNode, bool]:
         healthy = self.get_healthy_nodes()
@@ -131,6 +146,12 @@ async def health_check_loop():
             await asyncio.sleep(HEALTH_CHECK_INTERVAL)
 
 
+def trace_id_from(headers) -> str:
+    """Trace id of an incoming W3C traceparent (version-traceid-spanid-flags), or ''."""
+    parts = headers.get("traceparent", "").split("-")
+    return parts[1] if len(parts) == 4 and len(parts[1]) == 32 else ""
+
+
 async def handle_proxy(request: web.Request) -> web.StreamResponse:
     """Proxies OpenAI requests with KV-cache prefix awareness and streaming SSE support."""
     METRICS["requests_total"] += 1
@@ -147,51 +168,50 @@ async def handle_proxy(request: web.Request) -> web.StreamResponse:
 
     prefix = ring.extract_prefix_key(payload)
     node, is_affinity = ring.select_node(prefix)
+    # trace_id=<id> lets Grafana link the log line to the request's trace in Tempo
+    trace_id = trace_id_from(request.headers)
+    trace = f" trace_id={trace_id}" if trace_id else ""
 
     if is_affinity:
         METRICS["prefix_affinity_routes"] += 1
-        logger.info(f"Routed prefix hash [{hashlib.md5(prefix.encode('utf-8')).hexdigest()[:8]}] -> {node.url} (Affinity hit)")
+        logger.info(f"Routed prefix hash [{hashlib.md5(prefix.encode('utf-8')).hexdigest()[:8]}] -> {node.url} (Affinity hit){trace}")
     else:
         METRICS["fallback_routes"] += 1
-        logger.info(f"Routed request (least-busy) -> {node.url}")
+        logger.info(f"Routed request (least-busy) -> {node.url}{trace}")
 
     target_url = f"{node.url}{full_path}"
 
     # Forward headers including OpenTelemetry traceparent
-    headers = {}
-    for k, v in request.headers.items():
-        if k.lower() not in ("host", "content-length"):
-            headers[k] = v
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP_HEADERS}
 
     node.active_requests += 1
-    timeout = ClientTimeout(total=DEFAULT_TIMEOUT)
+    session: ClientSession = request.app["upstream_session"]
 
     try:
-        async with ClientSession(timeout=timeout) as session:
-            async with session.request(
-                method=request.method,
-                url=target_url,
-                data=body_bytes,
-                headers=headers,
-                params=request.query,
-            ) as upstream_resp:
+        async with session.request(
+            method=request.method,
+            url=target_url,
+            data=body_bytes,
+            headers=headers,
+            params=request.query,
+        ) as upstream_resp:
 
-                # Create streaming response
-                response = web.StreamResponse(
-                    status=upstream_resp.status,
-                    headers={
-                        k: v for k, v in upstream_resp.headers.items()
-                        if k.lower() not in ("content-length", "transfer-encoding")
-                    }
-                )
-                await response.prepare(request)
+            # Create streaming response
+            response = web.StreamResponse(
+                status=upstream_resp.status,
+                headers={
+                    k: v for k, v in upstream_resp.headers.items()
+                    if k.lower() not in HOP_BY_HOP_HEADERS
+                }
+            )
+            await response.prepare(request)
 
-                # Stream chunks directly back to LiteLLM / client
-                async for chunk in upstream_resp.content.iter_any():
-                    await response.write(chunk)
+            # Stream chunks directly back to LiteLLM / client
+            async for chunk in upstream_resp.content.iter_any():
+                await response.write(chunk)
 
-                await response.write_eof()
-                return response
+            await response.write_eof()
+            return response
     except Exception as e:
         logger.error(f"Error proxying to {target_url}: {e}")
         return web.json_response({"error": f"KV Router upstream failure: {str(e)}"}, status=502)
@@ -227,15 +247,25 @@ async def handle_metrics(request: web.Request) -> web.Response:
     return web.Response(text="\n".join(lines) + "\n", content_type="text/plain")
 
 
+async def upstream_session_ctx(app: web.Application):
+    """One pooled upstream session for the app lifetime (keep-alive to every backend)."""
+    app["upstream_session"] = ClientSession(
+        timeout=ClientTimeout(total=None, sock_connect=10, sock_read=DEFAULT_TIMEOUT),
+        auto_decompress=False,  # relay bytes untouched so Content-Encoding stays truthful
+    )
+    health_task = asyncio.create_task(health_check_loop())
+    yield
+    health_task.cancel()
+    await app["upstream_session"].close()
+
+
 async def init_app():
-    app = web.Application()
+    app = web.Application(client_max_size=64 * 1024 ** 2)  # vision requests carry base64 images
     app.router.add_get("/health", handle_health)
     app.router.add_get("/metrics", handle_metrics)
     # Catch-all proxy route
     app.router.add_route("*", "/{tail:.*}", handle_proxy)
-
-    # Start background health checker
-    asyncio.create_task(health_check_loop())
+    app.cleanup_ctx.append(upstream_session_ctx)
     return app
 
 

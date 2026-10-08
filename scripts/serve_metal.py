@@ -1,96 +1,73 @@
 #!/usr/bin/env python3
 """
 scripts/serve_metal.py
-Native Apple Silicon vLLM-Metal Serving Runner (Plane 2).
+Native Apple Silicon engine for the metal platform (Plane 2).
 
-Leverages:
-  - Apple MLX Framework & Metal GPU Acceleration
-  - Mac Unified Memory architecture for zero-copy tensor execution
-  - vLLM PagedAttention continuous batching & scheduler
-  - Quantized .safetensors from mlx-community
-  - OpenAI-compatible HTTP server on port 8000
+Docker on macOS cannot reach the Metal GPU, so the engine runs natively with
+vllm-metal (the community vLLM hardware plugin for Apple Silicon: MLX + Metal
+kernels, unified memory) and docker-compose.metal.yml bridges it into the stack as
+vllm:8000. It serves the same model block from .env as every other platform.
+
+Install vllm-metal once (macOS 15+, Apple Silicon):
+  brew tap vllm-project/vllm-metal https://github.com/vllm-project/vllm-metal
+  brew install vllm-project/vllm-metal/vllm-metal
+
+Then:
+  python3 scripts/serve_metal.py            # serves MODEL_NAME from .env on :METAL_ENGINE_PORT
+  ./run_all.sh --metal                      # in a second terminal
 """
 
 import argparse
 import os
 import platform
-import subprocess
+import shlex
+import shutil
 import sys
 
+from llmops_client import load_env
 
-DEFAULT_MODEL = "mlx-community/SmolLM2-360M-Instruct-4bit"
-PORT = int(os.getenv("PORT", "8000"))
-
-
-def verify_apple_silicon():
-    if platform.system() != "Darwin" or platform.machine() != "arm64":
-        print(f"❌ Error: serve_metal.py requires macOS on Apple Silicon (found {platform.system()} {platform.machine()}).", file=sys.stderr)
-        sys.exit(1)
+load_env()
 
 
-def check_mlx_available() -> bool:
-    try:
-        import mlx.core as mx
-        return True
-    except ImportError:
-        return False
+def build_command(args: argparse.Namespace) -> list:
+    cmd = [
+        "vllm", "serve", os.getenv("MODEL_NAME", "Qwen/Qwen3-4B"),
+        "--revision", os.getenv("MODEL_REVISION", "main"),
+        "--served-model-name", os.getenv("SERVED_MODEL_NAME", "qwen3-4b"),
+        "--max-model-len", os.getenv("MAX_MODEL_LEN", "auto"),
+        "--host", args.host,
+        "--port", str(args.port),
+    ]
+    if args.otlp:
+        # Alloy publishes OTLP gRPC on the host loopback (docker-compose.yml)
+        cmd += ["--otlp-traces-endpoint", f"http://localhost:{os.getenv('OTLP_GRPC_PORT') or 4317}"]
+    cmd += shlex.split(os.getenv("VLLM_MODEL_ARGS", "")) + shlex.split(os.getenv("VLLM_EXTRA_ARGS", ""))
+    return cmd
 
 
-def check_vllm_metal_binary() -> bool:
-    try:
-        res = subprocess.run(["which", "vllm-metal"], capture_output=True, text=True)
-        return res.returncode == 0
-    except Exception:
-        return False
-
-
-def main():
-    verify_apple_silicon()
-
-    parser = argparse.ArgumentParser(description="vLLM-Metal Apple Silicon Runner")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="Model from mlx-community or Hugging Face")
-    parser.add_argument("--port", type=int, default=PORT, help="Port to serve on (default: 8000)")
-    parser.add_argument("--max-tokens", type=int, default=2048, help="Max context window")
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Native vllm-metal engine for the LLMOps metal platform")
+    parser.add_argument("--port", type=int, default=int(os.getenv("METAL_ENGINE_PORT", "8000")))
+    parser.add_argument("--host", default="127.0.0.1", help="bind address (Docker Desktop reaches host loopback)")
+    parser.add_argument("--otlp", action="store_true", help="export OpenTelemetry traces to Alloy")
+    parser.add_argument("--dry-run", action="store_true", help="print the command only")
     args = parser.parse_args()
 
-    print("=" * 68)
-    print("  🍏 vLLM-Metal: Native Apple Silicon Serving Engine")
-    print("=" * 68)
-    print(f"  • Model Target      : {args.model}")
-    print(f"  • Compute Backend   : Apple MLX + Metal Shaders")
-    print(f"  • Memory Strategy   : Unified Memory (Zero-Copy Tensors)")
-    print(f"  • Listening Port    : http://0.0.0.0:{args.port}")
-    print("=" * 68)
-
-    # Check for native vllm-metal binary
-    if check_vllm_metal_binary():
-        print("🚀 Launching native vllm-metal binary...")
-        cmd = ["vllm-metal", "serve", args.model, "--port", str(args.port)]
-        subprocess.run(cmd)
-        return
-
-    # Check for mlx-lm module
-    try:
-        import mlx_lm
-        print("🚀 Launching mlx_lm OpenAI-compatible API server...")
-        cmd = [sys.executable, "-m", "mlx_lm.server", "--model", args.model, "--port", str(args.port)]
-        subprocess.run(cmd)
-        return
-    except ImportError:
-        pass
-
-    # Neither is installed yet: provide guidance
-    print("\n⚠️ Neither 'vllm-metal' nor 'mlx-lm' is installed in the current environment.")
-    print("To install native vLLM-Metal on your Mac:")
-    print("  1. Via Homebrew:")
-    print("     brew tap vllm-project/vllm-metal")
-    print("     brew install vllm-project/vllm-metal/vllm-metal")
-    print("  2. Via pip:")
-    print("     pip install mlx mlx-lm")
-    print("\nFalling back to lightweight local engine emulation...")
-    emulator_path = os.path.join(os.path.dirname(__file__), "..", "engine", "mock_vllm.py")
-    subprocess.run([sys.executable, emulator_path])
+    if platform.system() != "Darwin" or platform.machine() != "arm64":
+        print(f"❌ serve_metal.py requires macOS on Apple Silicon (found {platform.system()} {platform.machine()}).")
+        return 1
+    cmd = build_command(args)
+    print("🍏 vllm-metal:", " ".join(shlex.quote(c) for c in cmd))
+    if args.dry_run:
+        return 0
+    if not shutil.which("vllm"):
+        print("❌ The `vllm` CLI is not installed. Install vllm-metal:\n"
+              "   brew tap vllm-project/vllm-metal https://github.com/vllm-project/vllm-metal\n"
+              "   brew install vllm-project/vllm-metal/vllm-metal")
+        return 1
+    os.execvp(cmd[0], cmd)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -1,0 +1,62 @@
+# ==============================================================================
+# KV-Cache-Aware Router (Plane 1/2): router/kv_router.py, mounted from a ConfigMap
+# ==============================================================================
+# VLLM_BACKENDS lists engine endpoints; with several vLLM replicas point it at a
+# headless Service or per-replica Services so prefix affinity can pin a replica.
+# ==============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kv-router
+  labels:
+    app: kv-router
+    plane: routing
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: kv-router
+  template:
+    metadata:
+      labels:
+        app: kv-router
+        plane: routing
+    spec:
+      containers:
+        - name: kv-router
+          image: python:3.11-slim
+          command: ["sh", "-c", "pip install --quiet --no-cache-dir 'aiohttp>=3.9,<4' && exec python /app/kv_router.py"]
+          env:
+            - name: ROUTER_PORT
+              value: "8000"
+            - name: VLLM_BACKENDS
+              value: http://vllm:8000
+            - name: ROUTER_TIMEOUT
+              value: "600"
+          ports:
+            - containerPort: 8000
+              name: http
+          readinessProbe:
+            httpGet: {path: /health, port: 8000}
+            periodSeconds: 5
+          volumeMounts:
+            - name: code
+              mountPath: /app
+      volumes:
+        - name: code
+          configMap:
+            name: kv-router-code
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kv-router
+  labels:
+    app: kv-router
+spec:
+  selector:
+    app: kv-router
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000

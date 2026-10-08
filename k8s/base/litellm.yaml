@@ -1,0 +1,97 @@
+# ==============================================================================
+# AI Gateway (Plane 1): LiteLLM with routes rendered from the model block at start
+# ==============================================================================
+# Same entrypoint as docker-compose: config/render_litellm_config.py turns the
+# gateway policy (config/litellm.yaml) + model block into the final config.
+# Set LANGFUSE_HOST / LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY (e.g. a cluster-wide
+# Langfuse) to enable LLM tracing; without LANGFUSE_HOST the callback is dropped.
+# ==============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm
+  labels:
+    app: litellm
+    plane: ingress-gateway
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: litellm
+  template:
+    metadata:
+      labels:
+        app: litellm
+        plane: ingress-gateway
+    spec:
+      containers:
+        - name: litellm
+          image: ghcr.io/berriai/litellm:v1.104.1
+          command:
+            - /bin/sh
+            - -c
+            - python3 /app/policy/render_litellm_config.py /app/policy/config.yaml /app/litellm.generated.yaml && exec docker/prod_entrypoint.sh --config /app/litellm.generated.yaml --port 4000 --num_workers 2
+          envFrom:
+            - configMapRef:
+                name: llmops-model
+          env:
+            - name: LITELLM_MASTER_KEY
+              valueFrom: {secretKeyRef: {name: llmops-secrets, key: LITELLM_MASTER_KEY}}
+            - name: POSTGRES_USER
+              valueFrom: {secretKeyRef: {name: llmops-secrets, key: POSTGRES_USER}}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: llmops-secrets, key: POSTGRES_PASSWORD}}
+            - name: REDIS_PASSWORD
+              valueFrom: {secretKeyRef: {name: llmops-secrets, key: REDIS_PASSWORD}}
+            - name: DATABASE_URL
+              value: postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@postgres:5432/litellm_db
+            - name: REDIS_URL
+              value: redis://:$(REDIS_PASSWORD)@redis:6379
+            - name: KV_ROUTER_URL
+              value: http://kv-router:8000/v1
+            - name: VLLM_DIRECT_URL
+              value: http://vllm:8000/v1
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://tempo:4318
+            - name: OTEL_SERVICE_NAME
+              value: litellm-gateway
+            # Unauthenticated metrics for Prometheus on a separate port (gateway /metrics needs a key)
+            - name: PROMETHEUS_METRICS_PORT
+              value: "9095"
+          ports:
+            - containerPort: 4000
+              name: http
+            - containerPort: 9095
+              name: metrics
+          readinessProbe:
+            httpGet: {path: /health/liveliness, port: 4000}
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          volumeMounts:
+            - name: policy
+              mountPath: /app/policy
+            # The guardrail module is resolved next to the generated config (/app).
+            - name: policy
+              mountPath: /app/pii_guardrail.py
+              subPath: pii_guardrail.py
+      volumes:
+        - name: policy
+          configMap:
+            name: litellm-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: litellm
+  labels:
+    app: litellm
+spec:
+  selector:
+    app: litellm
+  ports:
+    - name: http
+      port: 4000
+      targetPort: 4000
+    - name: metrics
+      port: 9095
+      targetPort: 9095

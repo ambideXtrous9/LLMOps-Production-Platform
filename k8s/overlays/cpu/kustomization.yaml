@@ -1,0 +1,17 @@
+# CPU: vllm/vllm-openai-cpu (x86_64 / arm64 nodes, no accelerator)
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+images:
+  - name: vllm/vllm-openai
+    newName: vllm/vllm-openai-cpu
+patches:
+  - target: {kind: Deployment, name: vllm}
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: "4"
+            memory: 16Gi

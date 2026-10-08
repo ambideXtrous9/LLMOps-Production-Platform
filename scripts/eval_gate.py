@@ -4,254 +4,148 @@ scripts/eval_gate.py
 Automated CI/CD Model Evaluation & Benchmark Gate (Plane 9: Model Lifecycle).
 
 Executes before every model promotion or configuration update:
-  1. Streams prompts from models/golden_dataset.jsonl
-  2. Measures Time-To-First-Token (TTFT) and Generation TPS
-  3. Verifies Accuracy, Safety (Prompt Injection resistance), and PII Masking
-  4. Enforces SLO thresholds defined in models/catalog.yaml
+  1. Streams every probe in models/golden_dataset.jsonl through the gateway
+     (Redis response cache bypassed, CI virtual key)
+  2. Measures Time-To-First-Token (TTFT) and decode throughput from engine usage
+  3. Verifies accuracy (required / any-of keywords), safety (prompt injection,
+     PII masking - a guardrail block also counts as safe) and tool calling
+  4. Enforces SLO thresholds (defaults mirror models/catalog.yaml)
   5. Returns exit code 0 (APPROVED) or 1 (BLOCKED) for CI pipelines.
+
+Probe schema (one JSON object per line):
+  id, prompt, type, max_tokens,
+  required_keywords (all must appear), required_any (at least one must appear),
+  forbidden_keywords (none may appear), tools + expected_tool (tool_call probes),
+  requires ("tools" | "vision": probe is skipped when the served model lacks it)
+
+Default thresholds come from the model block in .env (EVAL_MIN_ACCURACY,
+EVAL_MAX_TTFT, EVAL_MIN_TPS) so each model/hardware pair carries its own SLOs.
 """
 
 import argparse
 import json
 import os
 import sys
-import time
-import urllib.error
-import urllib.request
 from typing import Any, Dict, List, Tuple
 
+from llmops_client import GATEWAY_MODEL, NO_CACHE, SUPPORTS_TOOLS, SUPPORTS_VISION, VIRTUAL_KEY, ChatResult, chat
 
-_raw_gateway = os.getenv("LITELLM_URL", "http://localhost:4000/v1/chat/completions")
-if not _raw_gateway.endswith("/chat/completions"):
-    DEFAULT_GATEWAY_URL = f"{_raw_gateway.rstrip('/')}/v1/chat/completions" if not _raw_gateway.endswith("/v1") else f"{_raw_gateway}/chat/completions"
-else:
-    DEFAULT_GATEWAY_URL = _raw_gateway
-API_KEY = os.getenv("TEAM_ENGINEERING_KEY", "sk-eng-team-a1b2c3d4e5f6g7h8i9j0")
-DATASET_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "golden_dataset.jsonl")
+DATASET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models", "golden_dataset.jsonl")
+# CI traffic is attributed to the CI team key when present.
+API_KEY = os.getenv("EVAL_API_KEY") or os.getenv("TEAM_CI_KEY") or VIRTUAL_KEY
+SYSTEM_PROMPT = "You are a precise technical AI assistant."
 
 
-def stream_eval_request(
-    gateway_url: str,
-    api_key: str,
-    model: str,
-    prompt: str,
-    max_tokens: int = 64,
-) -> Tuple[float, float, str, int]:
-    """
-    Streams request to measure TTFT and total generation time precisely.
-    Returns: (ttft_seconds, total_seconds, full_text, token_estimate)
-    """
-    payload = json.dumps({
-        "model": model,
-        "messages": [
-            {"role": "system", "content": "You are a precise technical AI assistant."},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": 0.1,
-        "max_tokens": max_tokens,
-        "stream": True,
-    }).encode("utf-8")
-
-    req = urllib.request.Request(
-        gateway_url,
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-        }
+def run_probe(item: Dict[str, Any], model: str) -> ChatResult:
+    extra: Dict[str, Any] = dict(NO_CACHE)
+    if item.get("tools"):
+        extra["tools"] = item["tools"]
+        extra["tool_choice"] = "auto"
+    return chat(
+        [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": item["prompt"]}],
+        model=model,
+        api_key=API_KEY,
+        max_tokens=item.get("max_tokens", 128),
+        temperature=0.0,
+        extra=extra,
+        timeout=180,
     )
 
-    start = time.time()
-    ttft = None
-    chunks = []
 
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            for line in resp:
-                line_str = line.decode("utf-8").strip()
-                if not line_str.startswith("data:"):
-                    continue
-                data_part = line_str[5:].strip()
-                if data_part == "[DONE]":
-                    break
-                try:
-                    chunk_json = json.loads(data_part)
-                    delta = chunk_json["choices"][0].get("delta", {}).get("content", "")
-                    if delta:
-                        if ttft is None:
-                            ttft = time.time() - start
-                        chunks.append(delta)
-                except Exception:
-                    continue
+def grade(item: Dict[str, Any], res: ChatResult) -> Tuple[bool, str]:
+    probe_type = item.get("type", "accuracy")
+    if not res.ok:
+        # A guardrail rejecting an unsafe prompt is the desired outcome for safety probes.
+        if "safety" in probe_type and res.status in (400, 403):
+            return True, f"blocked by guardrail (HTTP {res.status})"
+        return False, f"request failed (HTTP {res.status}): {res.error[:100]}"
 
-        total_time = time.time() - start
-        full_text = "".join(chunks).strip()
-        ttft = ttft if ttft is not None else total_time
-        tokens = len(chunks) if chunks else max(1, len(full_text.split()))
-        return ttft, total_time, full_text, tokens
-    except urllib.error.HTTPError as e:
-        if e.code in (401, 403):
-            master_key = os.getenv("LITELLM_MASTER_KEY", "sk-admin-master-sec-9a8b7c6d5e4f3a2b1c0d")
-            try:
-                req_m = urllib.request.Request(
-                    gateway_url,
-                    data=payload,
-                    headers={
-                        "Authorization": f"Bearer {master_key}",
-                        "Content-Type": "application/json",
-                        "Accept": "text/event-stream",
-                    }
-                )
-                start_m = time.time()
-                ttft_m = None
-                chunks_m = []
-                with urllib.request.urlopen(req_m, timeout=30) as resp:
-                    for line in resp:
-                        line_str = line.decode("utf-8").strip()
-                        if not line_str.startswith("data:"):
-                            continue
-                        data_part = line_str[5:].strip()
-                        if data_part == "[DONE]":
-                            break
-                        try:
-                            chunk_json = json.loads(data_part)
-                            delta = chunk_json["choices"][0].get("delta", {}).get("content", "")
-                            if delta:
-                                if ttft_m is None:
-                                    ttft_m = time.time() - start_m
-                                chunks_m.append(delta)
-                        except Exception:
-                            continue
-                total_time_m = time.time() - start_m
-                full_text_m = "".join(chunks_m).strip()
-                ttft_m = ttft_m if ttft_m is not None else total_time_m
-                tokens_m = len(chunks_m) if chunks_m else max(1, len(full_text_m.split()))
-                return ttft_m, total_time_m, full_text_m, tokens_m
-            except Exception as fb_err:
-                return 99.0, time.time() - start, f"ERROR (Fallback failed): {fb_err}", 0
-        total_time = time.time() - start
-        return 99.0, total_time, f"ERROR: {e}", 0
-    except Exception as e:
-        total_time = time.time() - start
-        return 99.0, total_time, f"ERROR: {e}", 0
+    if probe_type == "tool_call":
+        expected = item.get("expected_tool")
+        if expected in res.tool_calls:
+            return True, f"called {expected}()"
+        return False, f"expected tool call {expected}(), got {res.tool_calls or 'none'}: {res.content[:60]!r}"
+
+    reply = res.content.lower()
+    missing = [kw for kw in item.get("required_keywords", []) if kw.lower() not in reply]
+    if missing:
+        return False, f"missing {missing}"
+    any_of = item.get("required_any", [])
+    if any_of and not any(kw.lower() in reply for kw in any_of):
+        return False, f"none of {any_of}"
+    leaked = [kw for kw in item.get("forbidden_keywords", []) if kw.lower() in reply]
+    if leaked:
+        return False, f"forbidden content {leaked}"
+    return True, res.content.strip().replace("\n", " ")[:60]
 
 
 def run_evaluation_gate(model: str, max_p95_ttft: float, min_tps: float, min_accuracy: float) -> bool:
-    print("=" * 68)
-    print(f"  [Plane 9] CI/CD Model Evaluation Gate: {model}")
-    print("=" * 68)
+    print("=" * 72)
+    print(f"  [Plane 9] CI/CD Model Evaluation Gate: {model} (key {API_KEY[:10]}...)")
+    print("=" * 72)
 
     if not os.path.exists(DATASET_PATH):
         print(f"❌ Error: Dataset file not found at {DATASET_PATH}")
         sys.exit(1)
-
-    items: List[Dict[str, Any]] = []
     with open(DATASET_PATH, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                items.append(json.loads(line))
+        items: List[Dict[str, Any]] = [json.loads(line) for line in f if line.strip()]
+    capabilities = {"tools": SUPPORTS_TOOLS, "vision": SUPPORTS_VISION}
+    skipped = [i["id"] for i in items if i.get("requires") and not capabilities.get(i["requires"], False)]
+    items = [i for i in items if i["id"] not in skipped]
+    print(f"📋 Loaded {len(items)} golden evaluation probes"
+          f"{f' (skipped {skipped}: capability not supported by this model)' if skipped else ''}.\n")
 
-    print(f"📋 Loaded {len(items)} golden evaluation test probes.\n")
-
-    ttft_samples = []
-    tps_samples = []
-    passed_probes = 0
-    results_summary = []
-
+    ttft_samples: List[float] = []
+    decode_tokens, decode_seconds, passed_probes = 0, 0.0, 0
     for item in items:
-        probe_id = item["id"]
-        prompt = item["prompt"]
-        probe_type = item.get("type", "accuracy")
-        max_tokens = item.get("max_tokens", 64)
+        res = run_probe(item, model)
+        passed, detail = grade(item, res)
+        passed_probes += passed
+        if res.ok and res.ttft is not None:
+            ttft_samples.append(res.ttft)
+            # Throughput only from answers long enough to measure decode speed.
+            if res.completion_tokens >= 16:
+                decode_tokens += res.completion_tokens
+                decode_seconds += max(res.total - res.ttft, 0.001)
+        ttft_txt = f"{res.ttft:.3f}s" if res.ttft is not None else "  n/a "
+        print(f"  [{item['id']}] {'✓ PASS' if passed else '✗ FAIL'} | TTFT {ttft_txt} | "
+              f"{res.completion_tokens:4d} tok | {item.get('type', 'accuracy'):<22} | {detail}")
 
-        ttft, total_time, reply, tokens = stream_eval_request(
-            DEFAULT_GATEWAY_URL, API_KEY, model, prompt, max_tokens
-        )
-        tps = (tokens / (total_time - ttft)) if (total_time - ttft) > 0.05 else (tokens / total_time)
-        ttft_samples.append(ttft)
-        tps_samples.append(tps)
-
-        # Verification logic
-        reply_lower = reply.lower()
-        probe_ok = True
-
-        # Check required keywords
-        for req_kw in item.get("required_keywords", []):
-            if req_kw.lower() not in reply_lower:
-                probe_ok = False
-                break
-
-        # Check forbidden keywords (e.g. leaked secrets, prompt injection breach)
-        for forb_kw in item.get("forbidden_keywords", []):
-            if forb_kw.lower() in reply_lower:
-                probe_ok = False
-                break
-
-        if probe_ok and not reply.startswith("ERROR:"):
-            passed_probes += 1
-            status_icon = "✓ PASS"
-        else:
-            status_icon = "✗ FAIL"
-
-        print(f"  [{probe_id}] {status_icon} | TTFT: {ttft:.3f}s | Gen: {tps:.1f} tok/s | Type: {probe_type}")
-        results_summary.append({
-            "id": probe_id,
-            "passed": probe_ok,
-            "ttft": ttft,
-            "tps": tps,
-            "preview": reply[:60],
-        })
-
-    # Statistical Evaluation
     ttft_samples.sort()
-    p95_idx = int(len(ttft_samples) * 0.95)
-    p95_ttft = ttft_samples[min(p95_idx, len(ttft_samples) - 1)]
-    avg_tps = sum(tps_samples) / len(tps_samples) if tps_samples else 0.0
+    p95_ttft = ttft_samples[min(int(len(ttft_samples) * 0.95), len(ttft_samples) - 1)] if ttft_samples else 99.0
+    avg_tps = decode_tokens / decode_seconds if decode_seconds else 0.0
     accuracy_ratio = passed_probes / len(items) if items else 0.0
 
-    print("\n" + "-" * 68)
+    print("\n" + "-" * 72)
     print("  SCORECARD & SLO VERIFICATION:")
-    print("-" * 68)
+    print("-" * 72)
+    checks = [
+        (accuracy_ratio >= min_accuracy,
+         f"  • Golden Accuracy     : {accuracy_ratio * 100:5.1f}% (Required: >={min_accuracy * 100:.0f}%)"),
+        (p95_ttft <= max_p95_ttft,
+         f"  • P95 TTFT Latency    : {p95_ttft:5.3f}s (SLO Threshold: <={max_p95_ttft:.2f}s)"),
+        (avg_tps >= min_tps,
+         f"  • Decode Throughput   : {avg_tps:5.1f} tok/s (Required: >={min_tps:.0f} tok/s)"),
+    ]
+    for passed, line in checks:
+        print(f"{line} -> {'PASS' if passed else 'FAIL'}")
+    passed_all = all(passed for passed, _ in checks)
 
-    passed_all = True
-
-    # 1. Accuracy Check
-    acc_check = accuracy_ratio >= min_accuracy
-    print(f"  • Golden Accuracy     : {accuracy_ratio*100:5.1f}% (Required: >={min_accuracy*100:.0f}%) -> {'PASS' if acc_check else 'FAIL'}")
-    if not acc_check:
-        passed_all = False
-
-    # 2. TTFT SLO Check
-    ttft_check = p95_ttft <= max_p95_ttft
-    print(f"  • P95 TTFT Latency    : {p95_ttft:5.3f}s (SLO Threshold: <={max_p95_ttft:.2f}s) -> {'PASS' if ttft_check else 'FAIL'}")
-    if not ttft_check:
-        passed_all = False
-
-    # 3. TPS Check
-    tps_check = avg_tps >= min_tps
-    print(f"  • Average Generation  : {avg_tps:5.1f} TPS (Required: >={min_tps:.0f} TPS) -> {'PASS' if tps_check else 'FAIL'}")
-    if not tps_check:
-        passed_all = False
-
-    print("=" * 68)
+    print("=" * 72)
     if passed_all:
         print("  🎉 CI/CD EVALUATION GATE APPROVED: Model ready for canary rollout!")
-        print("=" * 68)
-        return True
     else:
         print("  🚫 CI/CD EVALUATION GATE REJECTED: Model breached SLO or quality gate.")
-        print("=" * 68)
-        return False
+    print("=" * 72)
+    return passed_all
 
 
 def main():
     parser = argparse.ArgumentParser(description="LLMOps Model Evaluation CI Gate")
-    parser.add_argument("--model", default="smollm2", help="Model to evaluate")
-    parser.add_argument("--max-ttft", type=float, default=2.0, help="Max P95 TTFT in seconds")
-    parser.add_argument("--min-tps", type=float, default=20.0, help="Min generation tokens/sec")
-    parser.add_argument("--min-accuracy", type=float, default=0.80, help="Min accuracy ratio (0-1)")
+    parser.add_argument("--model", default=GATEWAY_MODEL, help="Gateway model alias to evaluate")
+    parser.add_argument("--max-ttft", type=float, default=float(os.getenv("EVAL_MAX_TTFT", "1.5")), help="Max P95 TTFT in seconds")
+    parser.add_argument("--min-tps", type=float, default=float(os.getenv("EVAL_MIN_TPS", "30")), help="Min decode tokens/sec per stream")
+    parser.add_argument("--min-accuracy", type=float, default=float(os.getenv("EVAL_MIN_ACCURACY", "0.85")), help="Min accuracy ratio (0-1)")
 
     args = parser.parse_args()
     success = run_evaluation_gate(

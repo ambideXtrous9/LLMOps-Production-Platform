@@ -15,6 +15,42 @@ registry_metadata:
 
 models:
   # ----------------------------------------------------------------------------
+  # Model 0: Qwen3.5-9B (Default Production Tier - CUDA BF16, vision-language)
+  # ----------------------------------------------------------------------------
+  # Served by docker-compose.gpu.yml (MODEL_NAME / MODEL_REVISION in .env).
+  # Verified on 1x A100-SXM4-40GB, vLLM v0.31.0: 17.7 GiB weights, 12.9 GiB KV cache
+  # (~410K tokens => 3.1 concurrent 128K-token requests), cold boot ~4 min.
+  - id: "qwen3.5-9b"
+    alias: "qwen3.5-9b"
+    gateway_aliases: ["qwen3.5-9b", "qwen3.5-9b-thinking", "qwen3.5-9b-direct"]
+    source:
+      repository: "Qwen/Qwen3.5-9B"
+      pinned_revision: "c202236235762e1c871ad0ccb60c8ee5ba337b9a" # Pinned Git commit SHA (2026-03-02)
+      tokenizer: "Qwen/Qwen3.5-9B"
+      license: "apache-2.0"
+    architecture:
+      family: "qwen3_5"
+      parameter_count: "9.65B"
+      layout: "8 x (3 x Gated DeltaNet + 1 x Gated Attention), vision encoder"
+      max_context_length: 262144
+      served_context_length: 131072
+    serving:
+      engine: "vllm"
+      engine_version: "v0.31.0"
+      precision: "bf16"
+      quantization: "none"
+      gpu_target_profile: "prod-datacenter-gpu"
+      min_vram_gb: 24.0
+      tensor_parallel: 1
+      reasoning_parser: "qwen3"
+      tool_call_parser: "qwen3_coder"
+      default_mode: "instruct (enable_thinking=false); thinking via the -thinking alias"
+    eval_thresholds:
+      min_golden_accuracy: 0.85
+      max_ttft_p95_seconds: 1.5
+      min_generation_tps: 30.0
+
+  # ----------------------------------------------------------------------------
   # Model 1: SmolLM2-360M-Instruct (Edge & Dev Tier - CUDA FP16)
   # ----------------------------------------------------------------------------
   - id: "smollm2-360m-instruct"

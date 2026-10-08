@@ -1,33 +1,31 @@
 # ==============================================================================
-# Hardware Serving Profile: Production Datacenter Tier (NVIDIA L4 / A10 / A100 / H100)
+# Hardware Serving Profile: Datacenter GPU (NVIDIA A100 / L40S / H100, AMD MI-series)
 # ==============================================================================
-# Target Hardware: Dedicated Enterprise GPUs (24GB - 80GB VRAM)
-# Models: Llama-3.1-8B-Instruct, Mistral-7B, Qwen2.5, DeepSeek-R1-Distill
+# Engine: vLLM (vllm/vllm-openai, docker-compose.gpu.yml; ROCm: docker-compose.rocm.yml)
+# Default preset: qwen3.5-9b for >= 24 GB, qwen3-4b for 10-24 GB
+# Verified: 1x A100-SXM4-40GB, vLLM v0.31.0
+# Informational: the engine is configured by the .env model block.
 # ==============================================================================
 
 engine: vllm
 profile_name: prod-datacenter-gpu
 target_hardware:
-  gpu_family: "NVIDIA L4 / A10 / L40S / A100 / H100"
-  vram_total_mib: 24576                   # Base 24GB+ (e.g. L4/A10G)
-  compute_capability: "8.9+"              # Ada Lovelace / Hopper
-  supported_precision: ["bfloat16", "fp8", "awq", "gptq"]
+  gpu_family: "NVIDIA A100 / L40S / H100 (AMD Instinct via ROCm overlay)"
+  vram_total_mib: ">= 24576"
+  supported_precision: ["bfloat16", "fp8", "mxfp4", "awq", "gptq"]
 
 serving_parameters:
-  model: "meta-llama/Llama-3.1-8B-Instruct"
-  quantization: "fp8"                     # or "awq" for 4-bit weights
-  dtype: "bfloat16"                       # Native Ampere/Ada/Hopper execution
-  gpu_memory_utilization: 0.90            # 90% dedicated to PagedAttention KV cache & weights
-  max_model_len: 8192                     # Production enterprise context length
-  enforce_eager: false                    # Full CUDA Graph capture enabled for microsecond latency
-  enable_prefix_caching: true             # Maximum KV-cache prefix reuse
-  enable_chunked_prefill: true            # Interleaves prompt prefill and token decode for flat TTFT
-  tensor_parallel_size: 1                 # Scale to 2, 4, 8 via LeaderWorkerSet for 70B+ models
-  pipeline_parallel_size: 1
-  max_num_seqs: 256
-  max_num_batched_tokens: 8192
+  preset: qwen3.5-9b
+  dtype: auto                    # BF16 on Ampere+
+  gpu_memory_utilization: 0.90
+  max_model_len: 131072          # Qwen recommends >= 128K for thinking quality
+  enforce_eager: false           # CUDA graphs + torch.compile (cache persisted in volumes)
+  enable_prefix_caching: true    # hybrid models use mamba cache mode "align"
+
+observed_performance:            # A100-SXM4-40GB
+  qwen3.5-9b: {weights_gib: 17.7, kv_cache_tokens: 410692, decode_tokens_per_s_per_stream: 74, burst32_tokens_per_s: 1452, cold_boot_s: 205, warm_boot_s: 80}
+  gpt-oss-20b: {decode_tokens_per_s_per_stream: 84, burst32_tokens_per_s: 1912}
 
 telemetry:
-  otlp_traces_endpoint: "http://tempo:4317"
-  metrics_interval: 15s
-  dcgm_profiling_supported: true          # Full enterprise DCGM profiling (SM occupancy, memory bandwidth)
+  otlp_traces_endpoint: "http://alloy:4317"
+  dcgm_profiling_supported: true

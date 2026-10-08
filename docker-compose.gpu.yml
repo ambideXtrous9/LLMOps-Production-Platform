@@ -1,41 +1,41 @@
 # ==============================================================================
-# NVIDIA CUDA GPU Acceleration Compose Overlay
+# NVIDIA CUDA Platform Overlay
 # ==============================================================================
-# Applied automatically when an NVIDIA GPU with container runtime is detected.
-# Overrides inference engine with native vLLM CUDA container and NVIDIA DCGM.
+# Applied automatically by run_all.sh when an NVIDIA GPU with container runtime is
+# detected (fresh host: run scripts/bootstrap_host.sh first). The engine command and
+# model come from docker-compose.yml + .env; this overlay only adds the CUDA image,
+# the GPU reservation and NVIDIA's DCGM exporter.
+#
+# First boot downloads the weights and compiles CUDA graphs (several minutes);
+# torch.compile / Triton caches live in named volumes so restarts are fast.
 # ==============================================================================
 
 services:
   vllm:
-    image: vllm/vllm-openai:v0.6.6
-    build: !reset null
-    command: >
-      --model ${MODEL_NAME:-HuggingFaceTB/SmolLM2-360M-Instruct}
-      --dtype half
-      --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION:-0.60}
-      --max-model-len ${MAX_MODEL_LEN:-2048}
-      --enforce-eager
-      --enable-prefix-caching
-      --otlp-traces-endpoint http://alloy:4317
-      --host 0.0.0.0
-      --port 8000
+    image: vllm/vllm-openai:${VLLM_VERSION:-v0.31.0}
+    environment:
+      # Every GPU is visible; the engine uses the one(s) run_all.sh picked: the GPU_COUNT
+      # GPUs with the most free memory (nvidia-smi order)
+      - CUDA_DEVICE_ORDER=PCI_BUS_ID
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              count: all
               capabilities: [gpu]
 
   dcgm-exporter:
-    image: nvcr.io/nvidia/k8s/dcgm-exporter:latest
+    image: nvcr.io/nvidia/k8s/dcgm-exporter:${DCGM_EXPORTER_TAG:-4.5.2-4.8.1-ubuntu22.04}
     build: !reset null
+    environment: !reset []
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              count: all
               capabilities: [gpu]
     cap_add:
       - SYS_ADMIN

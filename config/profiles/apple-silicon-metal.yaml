@@ -4,6 +4,7 @@
 # Target Hardware: Apple Silicon (M1, M2, M3, M4) Unified Memory Architecture
 # Compute Backend: Apple MLX Framework + Metal GPU Shaders (vllm-metal plugin)
 # Repository: https://github.com/vllm-project/vllm-metal
+# Not verified on hardware in this repository yet.
 # ==============================================================================
 
 engine: vllm-metal
@@ -17,10 +18,10 @@ target_hardware:
   supported_precision: ["4bit", "8bit", "fp16", "bfloat16"]
 
 serving_parameters:
-  model: "mlx-community/SmolLM2-360M-Instruct-4bit"
-  framework: "mlx-lm"
-  quantization: "4bit"
-  max_model_len: 4096
+  # Native engine: python3 scripts/serve_metal.py (vllm-metal serves MODEL_NAME from .env)
+  preset: qwen3-4b
+  framework: "vllm-metal"
+  max_model_len: auto
   continuous_batching: true
   paged_attention: true
   # Unified Memory headroom reserved for macOS window server and apps

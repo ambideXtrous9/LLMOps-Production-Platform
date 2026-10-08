@@ -1,28 +1,73 @@
+# ==============================================================================
+# LLMOps Production Platform - Base Service Topology
+# ==============================================================================
+# The same architecture runs on every platform. The engine is vLLM everywhere and
+# is driven only by the model block in .env (any Hugging Face model; see
+# scripts/configure_model.py). Platform overlays swap just the engine image and
+# device wiring:
+#   docker-compose.gpu.yml    NVIDIA CUDA  (vllm/vllm-openai)       + NVIDIA DCGM exporter
+#   docker-compose.rocm.yml   AMD ROCm     (vllm/vllm-openai-rocm)
+#   docker-compose.cpu.yml    x86_64/arm64 CPU (vllm/vllm-openai-cpu)
+#   docker-compose.metal.yml  Apple Silicon: native vllm-metal on macOS, bridged in
+#   docker-compose.mock.yml   no inference at all: emulated engine for UI / pipeline dev
+#
+# Network exposure: every host port binds to BIND_ADDRESS (default 127.0.0.1) so
+# a cloud VM never exposes Postgres/Redis/vLLM/Prometheus to the internet. Only
+# services with their own authentication can be published individually:
+#   GATEWAY_BIND_ADDRESS  LiteLLM gateway + admin UI (virtual keys / master key)
+#   UI_BIND_ADDRESS       Grafana and Langfuse (login required)
+# Everything else is reachable through Grafana or an SSH tunnel.
+# ==============================================================================
+
+# Fixed project name -> deterministic volume names (llmops_postgres_data, ...) on any checkout path.
+name: llmops
+
 services:
   # ============================================================================
   # 1. INFERENCE ENGINE (Plane 2: GPU Inference Plane)
   # ============================================================================
   vllm:
-    build:
-      context: ./engine
-      dockerfile: Dockerfile
-    image: llmops-vllm-engine:latest
+    # Overlays replace only the image & device wiring (cuda | rocm | cpu | metal | mock).
+    image: vllm/vllm-openai:${VLLM_VERSION:-v0.31.0}
     container_name: vllm-inference
     ipc: host
     ports:
-      - "${VLLM_PORT:-8000}:8000"
+      - "${BIND_ADDRESS:-127.0.0.1}:${VLLM_PORT:-8000}:8000"
     volumes:
-      - ~/.cache/huggingface:/root/.cache/huggingface
+      - ${HF_CACHE_DIR:-~/.cache/huggingface}:/root/.cache/huggingface
+      # torch.compile / Triton kernel caches: warm restarts skip recompilation
+      - vllm_compile_cache:/root/.cache/vllm
+      - vllm_triton_cache:/root/.triton
     environment:
+      - HF_TOKEN=${HF_TOKEN:-}
       - HF_HUB_ENABLE_HF_TRANSFER=0
-      - OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4318
+      - OTEL_SERVICE_NAME=vllm-engine
+      - SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-qwen3.5-9b}
+    # The image ENTRYPOINT is `vllm serve`, so the first argument is the model:
+    # any Hugging Face repo id (or a local directory under HF_CACHE_DIR).
+    command: >
+      ${MODEL_NAME:-Qwen/Qwen3.5-9B}
+      --revision ${MODEL_REVISION:-main}
+      --served-model-name ${SERVED_MODEL_NAME:-qwen3.5-9b}
+      --dtype ${MODEL_DTYPE:-auto}
+      --max-model-len ${MAX_MODEL_LEN:-auto}
+      --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION:-0.90}
+      --enable-prefix-caching
+      --otlp-traces-endpoint http://alloy:4317
+      --disable-access-log-for-endpoints /health,/metrics
+      --host 0.0.0.0
+      --port 8000
+      ${VLLM_MODEL_ARGS:-}
+      ${VLLM_EXTRA_ARGS:-}
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 5s
+      # python3 ships in every vLLM image (cuda/rocm/cpu); curl is not guaranteed
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=4)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      # Weight download + CUDA graph capture can take several minutes on first boot.
+      start_period: 1200s
     networks:
       - llmops-net
 
@@ -33,16 +78,20 @@ services:
     build:
       context: ./router
       dockerfile: Dockerfile
+    image: llmops-kv-router:latest
     container_name: kv-router
     environment:
       - ROUTER_PORT=8000
       - VLLM_BACKENDS=http://vllm:8000
-      - ROUTER_TIMEOUT=60
+      # Max seconds between upstream bytes (long thinking-mode generations stream for minutes).
+      - ROUTER_TIMEOUT=${ROUTER_TIMEOUT:-600}
     ports:
-      - "8001:8000"
+      - "${BIND_ADDRESS:-127.0.0.1}:${ROUTER_PORT:-8001}:8000"
+    # The router tracks backend health itself; it must not block on the engine
+    # finishing a multi-minute model load.
     depends_on:
       vllm:
-        condition: service_healthy
+        condition: service_started
     restart: unless-stopped
     networks:
       - llmops-net
@@ -51,24 +100,51 @@ services:
   # 3. AI GATEWAY (Plane 1: Ingress & Routing Plane)
   # ============================================================================
   litellm:
-    image: ghcr.io/berriai/litellm:main-latest
+    image: ghcr.io/berriai/litellm:${LITELLM_IMAGE_TAG:-v1.104.1}
     container_name: litellm-gateway
     ports:
-      - "${LITELLM_PORT:-4000}:4000"
+      - "${GATEWAY_BIND_ADDRESS:-127.0.0.1}:${LITELLM_PORT:-4000}:4000"
     volumes:
       - ./config/litellm.yaml:/app/config.yaml:ro
+      - ./config/render_litellm_config.py:/app/render_litellm_config.py:ro
+      - ./config/pii_guardrail.py:/app/pii_guardrail.py:ro
     environment:
       - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-admin-master-sec-9a8b7c6d5e4f3a2b1c0d}
       - DATABASE_URL=postgresql://${POSTGRES_USER:-llmops_admin}:${POSTGRES_PASSWORD:-llmops_production_secure_pass_2026}@postgres:5432/${POSTGRES_DB:-litellm_db}
       - REDIS_URL=redis://:${REDIS_PASSWORD:-redis_cluster_production_pass_2026}@redis:6379
       - KV_ROUTER_URL=http://kv-router:8000/v1
       - VLLM_DIRECT_URL=http://vllm:8000/v1
-      - EDGE_FALLBACK_URL=http://vllm:8000/v1
+      # OTLP/HTTP -> Alloy -> Tempo (LiteLLM infers the otlp_http exporter from the endpoint)
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4318
-    command: >
-      --config /app/config.yaml
-      --port 4000
-      --num_workers ${LITELLM_NUM_WORKERS:-2}
+      - OTEL_SERVICE_NAME=litellm-gateway
+      # Unauthenticated metrics for Prometheus on an internal-only port; /metrics on the
+      # (possibly public) gateway port requires a key (require_auth_for_metrics_endpoint).
+      - PROMETHEUS_METRICS_PORT=9095
+      # LLM traces -> Langfuse (callback langfuse_otel -> ${LANGFUSE_HOST}/api/public/otel)
+      - LANGFUSE_HOST=http://langfuse:3000
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-pk-lf-llmops-public-key}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-sk-lf-llmops-secret-key}
+      # Engine model settings -> generated gateway routes (config/render_litellm_config.py)
+      - SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-qwen3.5-9b}
+      - MAX_MODEL_LEN=${MAX_MODEL_LEN:-auto}
+      - MODEL_SUPPORTS_REASONING=${MODEL_SUPPORTS_REASONING:-false}
+      - MODEL_SUPPORTS_TOOLS=${MODEL_SUPPORTS_TOOLS:-false}
+      - MODEL_SUPPORTS_VISION=${MODEL_SUPPORTS_VISION:-false}
+      - MODEL_THINKING_EXTRA_BODY=${MODEL_THINKING_EXTRA_BODY:-}
+      - MODEL_INPUT_COST_PER_TOKEN=${MODEL_INPUT_COST_PER_TOKEN:-0.0000001}
+      - MODEL_OUTPUT_COST_PER_TOKEN=${MODEL_OUTPUT_COST_PER_TOKEN:-0.0000004}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - python3 /app/render_litellm_config.py /app/config.yaml /app/litellm.generated.yaml && exec docker/prod_entrypoint.sh "$$@"
+      - litellm-entrypoint
+    command: ["--config", "/app/litellm.generated.yaml", "--port", "4000", "--num_workers", "${LITELLM_NUM_WORKERS:-4}"]
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness', timeout=3)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 60s
     depends_on:
       postgres:
         condition: service_healthy
@@ -87,7 +163,7 @@ services:
     image: redis:7-alpine
     container_name: llmops-redis
     ports:
-      - "6379:6379"
+      - "${BIND_ADDRESS:-127.0.0.1}:${REDIS_PORT:-6379}:6379"
     command: redis-server --requirepass ${REDIS_PASSWORD:-redis_cluster_production_pass_2026}
     healthcheck:
       test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-redis_cluster_production_pass_2026}", "ping"]
@@ -112,7 +188,7 @@ services:
       - postgres_data:/var/lib/postgresql/data
       - ./scripts/init-postgres.sh:/docker-entrypoint-initdb.d/init-databases.sh:ro
     ports:
-      - "5432:5432"
+      - "${BIND_ADDRESS:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-llmops_admin} -d ${POSTGRES_DB:-litellm_db}"]
       interval: 5s
@@ -123,22 +199,125 @@ services:
       - llmops-net
 
   # ============================================================================
-  # 6. APPLICATION OBSERVABILITY (Plane 6: Langfuse Tracing Engine)
+  # 6. APPLICATION OBSERVABILITY (Plane 6: Langfuse v4 - LLM traces, evals, cost)
   # ============================================================================
-  langfuse:
-    image: langfuse/langfuse:2
-    container_name: langfuse-server
-    ports:
-      - "${LANGFUSE_PORT:-3000}:3000"
-    environment:
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-llmops_admin}:${POSTGRES_PASSWORD:-llmops_production_secure_pass_2026}@postgres:5432/langfuse
-      - NEXTAUTH_SECRET=${NEXTAUTH_SECRET:-sec-nextauth-token-984729104827104928}
-      - SALT=${LANGFUSE_SALT:-sec-salt-83920194857291048572910485}
-      - NEXTAUTH_URL=http://localhost:3000
-      - TELEMETRY_ENABLED=false
-    depends_on:
+  # LiteLLM exports every request over OTLP to Langfuse (callback langfuse_otel).
+  # Org, project, API keys and the admin user are provisioned headlessly from .env.
+  # Storage: Postgres (metadata, shared instance) + ClickHouse (traces/observations)
+  # + MinIO (raw event payloads) + Redis (ingestion queue, shared instance).
+  langfuse-worker:
+    image: langfuse/langfuse-worker:${LANGFUSE_VERSION:-4.54.0}
+    container_name: langfuse-worker
+    environment: &langfuse-env
+      DATABASE_URL: postgresql://${POSTGRES_USER:-llmops_admin}:${POSTGRES_PASSWORD:-llmops_production_secure_pass_2026}@postgres:5432/langfuse
+      NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3000}
+      SALT: ${LANGFUSE_SALT:-sec-salt-83920194857291048572910485}
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}
+      TELEMETRY_ENABLED: "false"
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse_production_pass_2026}
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minio}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioproductionpass2026}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minio}
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioproductionpass2026}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_AUTH: ${REDIS_PASSWORD:-redis_cluster_production_pass_2026}
+    depends_on: &langfuse-depends-on
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - llmops-net
+
+  langfuse:
+    image: langfuse/langfuse:${LANGFUSE_VERSION:-4.54.0}
+    container_name: langfuse-server
+    ports:
+      - "${UI_BIND_ADDRESS:-127.0.0.1}:${LANGFUSE_PORT:-3000}:3000"
+    environment:
+      <<: *langfuse-env
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-sec-nextauth-token-984729104827104928}
+      LANGFUSE_INIT_ORG_ID: llmops
+      LANGFUSE_INIT_ORG_NAME: LLMOps Platform
+      LANGFUSE_INIT_PROJECT_ID: llmops-gateway
+      LANGFUSE_INIT_PROJECT_NAME: LLMOps Gateway
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-llmops-public-key}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-llmops-secret-key}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_ADMIN_EMAIL:-admin@llmops.local}
+      LANGFUSE_INIT_USER_NAME: admin
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_ADMIN_PASSWORD:-llmops-admin-password}
+    depends_on: *langfuse-depends-on
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://$$(hostname -i):3000/api/public/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - llmops-net
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:${CLICKHOUSE_VERSION:-25.12}
+    container_name: langfuse-clickhouse
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse_production_pass_2026}
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - clickhouse_logs:/var/log/clickhouse-server
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+    networks:
+      - llmops-net
+
+  minio:
+    # MinIO no longer publishes community images; Chainguard's build is what Langfuse ships with.
+    image: cgr.dev/chainguard/minio@${MINIO_IMAGE_DIGEST:-sha256:59667194421209c2c1eacbe761e24787e047985c5dfa96b15da9b59fe9b55cd0}
+    container_name: langfuse-minio
+    entrypoint: sh
+    # create the 'langfuse' bucket before starting the service
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioproductionpass2026}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
     restart: unless-stopped
     networks:
       - llmops-net
@@ -147,17 +326,20 @@ services:
   # 7. METRICS ENGINE (Plane 3: Prometheus with Recording & Alerting Rules)
   # ============================================================================
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:${PROMETHEUS_IMAGE_TAG:-v3.15.0}
     container_name: prometheus-scraper
     ports:
-      - "${PROMETHEUS_PORT:-9090}:9090"
+      - "${BIND_ADDRESS:-127.0.0.1}:${PROMETHEUS_PORT:-9090}:9090"
     volumes:
-      - ./config/prometheus.yaml:/etc/prometheus/prometheus.yml:ro
-      - ./config/prometheus-rules.yaml:/etc/prometheus/rules/prometheus-rules.yaml:ro
-      - ./config/prometheus-alerts.yaml:/etc/prometheus/rules/prometheus-alerts.yaml:ro
+      # Directory (not single-file) mount: `git pull` / editors replace files with new
+      # inodes, which single-file mounts never see ("stale file handle"). With the
+      # directory mounted, `curl -X POST localhost:9090/-/reload` picks up edits live.
+      - ./config:/etc/prometheus/llmops:ro
+      - prometheus_data:/prometheus
     command:
-      - --config.file=/etc/prometheus/prometheus.yml
+      - --config.file=/etc/prometheus/llmops/prometheus.yaml
       - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-30d}
       - --web.enable-lifecycle
     restart: unless-stopped
     networks:
@@ -167,10 +349,10 @@ services:
   # 8. ALERTING ENGINE (Plane 3: Alertmanager for SLO Burn-Rate Alerts)
   # ============================================================================
   alertmanager:
-    image: prom/alertmanager:latest
+    image: prom/alertmanager:${ALERTMANAGER_IMAGE_TAG:-v0.34.1}
     container_name: alertmanager-engine
     ports:
-      - "${ALERTMANAGER_PORT:-9093}:9093"
+      - "${BIND_ADDRESS:-127.0.0.1}:${ALERTMANAGER_PORT:-9093}:9093"
     volumes:
       - ./config/alertmanager.yaml:/etc/alertmanager/alertmanager.yml:ro
     command:
@@ -187,9 +369,9 @@ services:
     image: grafana/alloy:v1.1.0
     container_name: alloy-telemetry-agent
     ports:
-      - "12345:12345"
-      - "4317:4317"
-      - "4318:4318"
+      - "${BIND_ADDRESS:-127.0.0.1}:${ALLOY_PORT:-12345}:12345"
+      - "${BIND_ADDRESS:-127.0.0.1}:${OTLP_GRPC_PORT:-4317}:4317"
+      - "${BIND_ADDRESS:-127.0.0.1}:${OTLP_HTTP_PORT:-4318}:4318"
     volumes:
       - ./config/alloy.config:/etc/alloy/config.alloy:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -212,7 +394,7 @@ services:
     image: grafana/tempo:2.4.1
     container_name: tempo-tracing-engine
     ports:
-      - "3200:3200"
+      - "${BIND_ADDRESS:-127.0.0.1}:${TEMPO_PORT:-3200}:3200"
     volumes:
       - ./config/tempo.yaml:/etc/tempo/tempo.yaml:ro
     command:
@@ -228,7 +410,7 @@ services:
     image: grafana/loki:3.0.0
     container_name: loki-engine
     ports:
-      - "${LOKI_PORT:-3100}:3100"
+      - "${BIND_ADDRESS:-127.0.0.1}:${LOKI_PORT:-3100}:3100"
     volumes:
       - ./config/loki.yaml:/etc/loki/local-config.yaml:ro
     command: -config.file=/etc/loki/local-config.yaml
@@ -240,13 +422,19 @@ services:
   # 12. HARDWARE TELEMETRY AGENT (Plane 4: NVIDIA DCGM Exporter)
   # ============================================================================
   dcgm-exporter:
+    # Non-NVIDIA platforms: a stub that reports the platform and no GPU samples, so GPU
+    # panels show "No data" instead of invented numbers. The gpu overlay swaps in NVIDIA
+    # DCGM; the mock overlay switches the stub to synthetic GPU telemetry.
     build:
       context: ./engine
       dockerfile: Dockerfile.dcgm
-    image: llmops-dcgm-exporter:latest
+    image: llmops-hw-exporter:latest
     container_name: dcgm-hardware-exporter
+    environment:
+      - GPU_TELEMETRY_MODE=none
+      - LLMOPS_PLATFORM=${LLMOPS_PLATFORM:-unknown}
     ports:
-      - "9400:9400"
+      - "${BIND_ADDRESS:-127.0.0.1}:${DCGM_PORT:-9400}:9400"
     restart: unless-stopped
     networks:
       - llmops-net
@@ -258,7 +446,7 @@ services:
     image: prom/node-exporter:v1.8.0
     container_name: node-exporter
     ports:
-      - "9100:9100"
+      - "${BIND_ADDRESS:-127.0.0.1}:${NODE_EXPORTER_PORT:-9100}:9100"
     command:
       - '--path.procfs=/host/proc'
       - '--path.sysfs=/host/sys'
@@ -272,13 +460,13 @@ services:
       - llmops-net
 
   # ============================================================================
-  # 14. PRODUCTION VISUALIZATION (Plane 7: Grafana 11)
+  # 14. PRODUCTION VISUALIZATION (Plane 7: Grafana)
   # ============================================================================
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:${GRAFANA_IMAGE_TAG:-13.2.3}
     container_name: grafana-dashboard
     ports:
-      - "${GRAFANA_PORT:-3001}:3000"
+      - "${UI_BIND_ADDRESS:-127.0.0.1}:${GRAFANA_PORT:-3001}:3000"
     volumes:
       - ./config/grafana-datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml:ro
       - ./config/grafana-dashboards.yaml:/etc/grafana/provisioning/dashboards/dashboards.yaml:ro
@@ -299,6 +487,11 @@ services:
 volumes:
   postgres_data:
   prometheus_data:
+  vllm_compile_cache:
+  vllm_triton_cache:
+  clickhouse_data:
+  clickhouse_logs:
+  minio_data:
 
 networks:
   llmops-net:

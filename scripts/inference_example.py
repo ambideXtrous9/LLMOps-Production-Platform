@@ -11,6 +11,7 @@ Demonstrates how to invoke models via the hardened AI Gateway (:4000):
 =============================================================================
 """
 
+import argparse
 import os
 import sys
 import time
@@ -18,9 +19,11 @@ import json
 import urllib.request
 import urllib.error
 
-GATEWAY_URL = os.environ.get("LITELLM_URL", "http://localhost:4000/v1/chat/completions")
-API_KEY = os.environ.get("LITELLM_API_KEY", "sk-eng-team-a1b2c3d4e5f6g7h8i9j0")
-MODEL_NAME = os.environ.get("MODEL_NAME", "smollm2")
+from llmops_client import GATEWAY_MODEL, VIRTUAL_KEY, gateway_chat_url  # loads the repo .env
+
+GATEWAY_URL = gateway_chat_url()
+API_KEY = os.environ.get("LITELLM_API_KEY", VIRTUAL_KEY)
+MODEL_NAME = GATEWAY_MODEL
 
 
 def test_sync_inference(prompt: str = "Explain what continuous batching is in 2 sentences."):
@@ -144,4 +147,5 @@ def main():
 
 
 if __name__ == "__main__":
+    argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter).parse_args()
     main()

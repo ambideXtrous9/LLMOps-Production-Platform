@@ -1,628 +1,690 @@
-# Enterprise LLMOps Production Platform (Maturity Level 4/5)
+# LLMOps Platform
 
-An enterprise-grade, **air-gapped, 100% self-hosted LLMOps production platform** engineered for real-time Large Language Model serving, KV-cache-aware routing, distributed OpenTelemetry tracing, SLO burn-rate alerting, event-driven autoscaling, and end-to-end model lifecycle governance.
+> **One architecture · any Hugging Face model · any hardware.**
+> Self-hosted LLM serving with gateway governance, routing, observability, autoscaling and quality gates.
 
----
+<p align="center">
+  <img src="docs/images/grafana-slo-cost-gateway.png" alt="Grafana dashboard: TTFT SLO, KV-cache saturation, team spend and gateway latency" width="100%">
+  <br>
+  <img src="docs/images/grafana-throughput-gpu.png" alt="Grafana dashboard: concurrency vs queue backlog, token throughput and NVIDIA GPU telemetry" width="100%">
+</p>
+<p align="center"><sub><b>Live Grafana dashboard</b> · Qwen3.5-9B on 1× A100 40 GB · load test 8 → 32 → 64 concurrent streams · 1,248/1,248 requests OK · ~2,000 tokens/s · GPU 95 %</sub></p>
 
-## 1. Executive Summary & Architectural Maturity
-
-Following an in-depth LLMOps Maturity Review, the platform has been hardened from an observability-only proof-of-concept (Level 2) into an enterprise-ready serving and platform ecosystem (Level 4/5).
-
-### Key Architectural Correctives & Upgrades:
-1. **Decoupled Control Plane (Grafana Removed from Control Loop):** Grafana is strictly a telemetry viewer. KEDA polls **Prometheus directly** for scaling decisions.
-2. **Dual-Trigger Saturation Scaler:** Autoscaling scales on **normalized per-replica queue backlog** (`sum(waiting) / count(replicas)`) combined with **KV-cache memory saturation** (`gpu_cache_usage_factor > 80%`), guarded by a 300-second stabilization window to prevent cold-start flapping.
-3. **KV-Cache-Aware Intelligent Router:** Solves prefix cache fragmentation across multi-replica inference pods by routing prompts with shared system contexts to the same replica.
-4. **Security Hardening & Virtual Keys:** The LiteLLM master key is isolated strictly to administrator use. Upstream applications authenticate via **per-team virtual keys** backed by PostgreSQL with enforced monthly spend budgets and RPM/TPM rate limits.
-5. **Guardrails & PII Redaction:** Integrated moderation, prompt-injection heuristic filters, and automated regex/Presidio PII redaction before traces land in storage.
-6. **Unified Telemetry Shipper (Grafana Alloy):** Replaced deprecated Promtail with Grafana Alloy, eliminating root Docker socket exposure and unifying logs, metrics, and OTel traces.
-7. **End-to-End Distributed Tracing (Tempo + W3C Context):** LiteLLM propagates W3C `traceparent` headers to vLLM, exporting spans to Grafana Tempo for sub-second distributed trace inspection.
-8. **SLO Burn-Rate Alerting (Alertmanager):** Multi-window burn-rate alerts on P95 TTFT (<=1.5s), gateway 5xx error rate (<=0.5%), and GPU thermals (>82°C).
-9. **Plane 9: Comprehensive Model Lifecycle & CI/CD Eval Gate:** Pinned Hugging Face revisions, automated CI evaluation gates (`scripts/eval_gate.py`), Argo Rollouts canary promotions, and online LLM-as-judge scoring.
-10. **Multi-Tier Hardware Profiles:** Formal separation between 4GB Dev/Edge consumer GPUs (`dev-edge-4gb.yaml`) and Enterprise Datacenter GPUs (`prod-datacenter-gpu.yaml`).
-
----
-
-## 2. Hardened 9-Plane Target Architecture
-
-```
-                    ┌────────────────────────────────────────────────────────┐
-                    │       ENTERPRISE USER / API CLIENT / MICROSERVICE      │
-                    └───────────────────────────┬────────────────────────────┘
-                                                │ POST /v1/chat/completions (stream: true)
-                                                │ Bearer sk-team-engineering-... (Virtual Key)
-                                                ▼
-┌────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ 1. INGRESS & ROUTING PLANE                                                                             │
-│    LiteLLM AI Gateway (:4000, 2+ Replicas)                                                             │
-│    • Per-Team Virtual Keys         • Spend Limits & Budgets       • Moderation & PII Redaction         │
-│    • Redis Rate-Limit Sync         • Redis Exact Response Cache   • W3C traceparent Propagation        │
-│                                                                                                        │
-│    KV-Cache-Aware Intelligent Router (:8001)                                                           │
-│    • Prefix Hash Affinity          • Cache Hit Optimization       • Least-Busy Healthy Fallback        │
-└──────────────────┬───────────────────────────────────────────────────┬─────────────────────────────────┘
-                   │ Forward via Router (:8000/v1)                     │ Async Traces (OTLP / Langfuse)
-                   ▼                                                   ▼
-┌──────────────────────────────────────────────────┐ ┌──────────────────────────────────────────────────┐
-│ 2. GPU INFERENCE PLANE (vLLM Engine)             │ │ 6. APPLICATION OBSERVABILITY (Langfuse v3)       │
-│    • Continuous Batching & PagedAttention        │ │    • ClickHouse Columnar Analytics Engine         │
-│    • Automatic Prefix Caching Enabled            │ │    • MinIO / S3 Raw Trace Blob Storage            │
-│    • Native OTLP Distributed Trace Export        │ │    • PII Redaction & 14-Day Retention Policy      │
-│    • Pluggable Profiles (Dev 4GB vs Prod DC GPU) │ │    • Online Evaluation & Feedback Scores          │
-└──────────┬───────────────────────────┬───────────┘ └──────────────────────────────────────────────────┘
-           │                           │
-           │ Logs & OTLP Traces        │ /metrics (:8000)
-           ▼                           ▼
-┌──────────────────────────────────────────────────┐ ┌──────────────────────────────────────────────────┐
-│ 5. LOGS & TRACES PLANE                           │ │ 3. METRICS & ALERTING PLANE                      │
-│    Grafana Alloy Unified Agent (:12345)          │ │    Prometheus Scraper (:9090)                    │
-│    • Replaces Promtail (End-of-Life)             │ │    • 15s Global Scrape Interval                  │
-│    • Non-root log parsing & label extraction     │ │    • Golden Signal Recording Rules (TTFT, TPS)   │
-│    • Ships OTLP traces to Tempo                  │ │                                                  │
-│                                                  │ │    Alertmanager Engine (:9093)                   │
-│    Grafana Loki Engine (:3100)                   │ │    • Multi-Window SLO Burn-Rate Alerts           │
-│    • Sub-second LogQL query storage              │ │    • Saturation & Hardware Thermal Alerts        │
-│                                                  │ └───────────────────────────┬──────────────────────┘
-│    Grafana Tempo Engine (:3200)                  │                             │
-│    • Distributed trace storage & span graphs     │                             │ PromQL Saturation Polling
-└──────────────────────────┬───────────────────────┘                             ▼
-                           │ LogQL / TraceQL / PromQL         ┌─────────────────────────────────────────┐
-                           ▼                                  │ 8. AUTOSCALING CONTROLLER (KEDA)        │
-┌────────────────────────────────────────────────────────┐    │    • Direct Prometheus Scaler (No UI)   │
-│ 7. PRODUCTION VISUALIZATION (Grafana 11 :3001)         │    │    • Normalized Queue / Replica > 4     │
-│    • Dashboards ONLY (Zero Control-Loop Role)          │    │    • KV-Cache Saturation > 80%          │
-│    • SLO Burn-Down, Error Budget & Latency Drift       │    │    • 300s Scale-Down Stabilization      │
-│    • Team Spend Tracking & Virtual Key Quota           │    │    • Karpenter GPU Node Pool Follows    │
-│    • Tempo Trace Drilldown Links from Loki Logs        │    └─────────────────────────────────────────┘
-└────────────────────────────────────────────────────────┘
-                           ▲
-                           │ Models & Artifacts
-┌──────────────────────────┴─────────────────────────────────────────────────────────────────────────────┐
-│ 9. MODEL LIFECYCLE & GOVERNANCE PLANE (New!)                                                           │
-│    • Model Registry: Pinned Hugging Face revisions & precision matrix (models/catalog.yaml)           │
-│    • CI/CD Evaluation Gate: Pre-promotion verification against golden dataset (scripts/eval_gate.py) │
-│    • Canary Deployments: Argo Rollouts with automated metric analysis (k8s/argo-rollouts-vllm.yaml)   │
-│    • Online Evaluation: Automated LLM-as-judge quality scoring (scripts/online_eval_judge.py)         │
-└────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```bash
+./run_all.sh                                  # detect hardware → pick model → boot → verify
+./run_all.sh --model <preset | any/hf-repo>   # serve a different model
 ```
 
 ---
 
-## 3. End-to-End Request & Control Lifecycle
+## Table of Contents
+
+| # | Section | # | Section |
+| :-: | :--- | :-: | :--- |
+| 1 | [Overview](#1-overview) | 9 | [Security](#9-security) |
+| 2 | [Architecture](#2-architecture) | 10 | [Verification](#10-verification) |
+| 3 | [Getting Started](#3-getting-started) | 11 | [Kubernetes](#11-kubernetes) |
+| 4 | [Accessing the Stack](#4-accessing-the-stack) | 12 | [Configuration Reference](#12-configuration-reference) |
+| 5 | [Models](#5-models) | 13 | [Runbooks](#13-runbooks) |
+| 6 | [Platforms](#6-platforms) | 14 | [Troubleshooting](#14-troubleshooting) |
+| 7 | [Using the Gateway](#7-using-the-gateway) | 15 | [Repository Layout](#15-repository-layout) |
+| 8 | [Operations](#8-operations) | | |
+
+---
+
+## 1. Overview
+
+| Capability | What it does | Built with |
+| :--- | :--- | :--- |
+| **Serve** | Any Hugging Face model; continuous batching; prefix caching | vLLM v0.31 |
+| **Run anywhere** | NVIDIA CUDA · AMD ROCm · CPU · Apple Silicon — same architecture | Compose overlays · Kubernetes overlays |
+| **Govern** | Virtual keys, budgets, rate limits, PII masking, response cache | LiteLLM · Postgres · Redis |
+| **Route** | Prompt-prefix affinity across engine replicas | KV-cache-aware router |
+| **Observe** | Metrics, alerts, logs, traces, LLM traces | Prometheus · Alertmanager · Loki · Tempo · Alloy · Langfuse · Grafana |
+| **Scale** | Scale on queue backlog and KV-cache saturation | KEDA |
+| **Qualify** | End-to-end checks, load test, eval gate, LLM-as-judge | `scripts/` test suite |
+
+---
+
+## 2. Architecture
+
+### 2.1 System Architecture — 9 Planes
 
 ```text
- Client App           LiteLLM (:4000)      KV Router (:8001)     vLLM Engine (:8000)     Prometheus (:9090)    KEDA Scaler      Alloy / Tempo
-     │                      │                      │                     │                       │                  │                 │
- 1   │── POST /v1/chat ────>│                      │                     │                       │                  │                 │
-     │   (Virtual Key, SSE) │                      │                     │                       │                  │                 │
- 2   │                      │── Validate Auth,     │                     │                       │                  │                 │
-     │                      │   Budget & Guardrails│                     │                       │                  │                 │
- 3   │                      │── Forward with ─────>│                     │                       │                  │                 │
-     │                      │   traceparent        │                     │                       │                  │                 │
- 4   │                      │                      │── Hash Prefix & ───>│                       │                  │                 │
-     │                      │                      │   Route Affinity    │                       │                  │                 │
- 5   │                      │                      │                     │── Continuous Batch &  │                  │                 │
-     │                      │                      │                     │   Prefix KV-Cache     │                  │                 │
- 6   │                      │<── Stream Tokens ────│<── Stream Tokens ───│                       │                  │                 │
- 7   │<── Stream SSE ───────│                      │                     │                       │                  │                 │
-     │    (Client sees TTFT)│                      │                     │                       │                  │                 │
-     │                      │                      │                     │                       │                  │                 │
-     │── [ ASYNCHRONOUS TELEMETRY & DIRECT CONTROL-LOOP ] ────────────────────────────────────────────────────────────────────────────│
- 8   │                      │── Export OTel Spans ─────────────────────────────────────────────────────────────────────────>│ (Tempo :3200)
- 9   │                      │                      │                     │── Export OTLP Spans ────────────────────────────>│ (Alloy :4317)
- 10  │                      │                      │                     │── Scrape 15s (TTFT, KV-Cache %, Queue) ─────────>│
- 11  │                      │                      │                     │                       │── Poll Saturation ──────>│
- 12  │                      │                      │                     │                       │   (Queue/Rep & KV-Cache) │── Scale 1..N
+                    ┌────────────────────────────────────────────────────────┐
+                    │       API CLIENT  ·  MICROSERVICE  ·  OPENAI SDK       │
+                    └───────────────────────────┬────────────────────────────┘
+                                                │ POST /v1/chat/completions  (stream · tools · images)
+                                                │ Bearer <team virtual key>  ·  W3C traceparent
+                                                ▼
+┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ 1. INGRESS & ROUTING PLANE                                                                            │
+│    LiteLLM AI Gateway (:4000) - routes rendered from the .env model block                             │
+│    • Team Virtual Keys (Postgres)   • Spend Limits & Budgets         • PII Masking Guardrail          │
+│    • Redis Rate-Limit Sync          • Redis Response Cache           • traceparent Forwarded          │
+│    • Aliases: <name> → router · <name>-thinking → router · <name>-direct → vLLM (fallback)            │
+│    KV-Cache-Aware Router (:8001)                                                                      │
+│    • Prefix-Hash Affinity           • Health-Tracked Backends        • Streaming Pass-Through         │
+└──────────────────┬───────────────────────────────────────────────────┬────────────────────────────────┘
+                   │ Forward via Router (:8000/v1)                     │ OTLP LLM traces (langfuse_otel)
+                   ▼                                                   ▼
+┌──────────────────────────────────────────────────┐ ┌──────────────────────────────────────────────────┐
+│ 2. INFERENCE PLANE (vLLM v0.31)                  │ │ 6. LLM OBSERVABILITY PLANE (Langfuse v4)         │
+│    • Any Hugging Face model (.env model block)   │ │    • Web + Worker (async ingestion queue)        │
+│    • cuda | rocm | cpu | metal engines           │ │    • ClickHouse Analytics Store                  │
+│    • Continuous Batching & PagedAttention        │ │    • MinIO Raw Payload Storage                   │
+│    • Automatic Prefix Caching                    │ │    • Traces Keyed by Caller's W3C Trace ID       │
+│    • Reasoning & Tool-Call Parsers               │ │    • Online LLM-as-Judge Scores Written Back     │
+│    • Native OTLP Trace Export                    │ │    • Prompts, Completions, Tokens & Cost         │
+└──────────┬───────────────────────────┬───────────┘ └──────────────────────────────────────────────────┘
+           │ Logs & OTLP Spans         │
+           │                           └──── /metrics (:8000) · 15 s scrape ──┐
+           ▼                                                                  ▼
+┌──────────────────────────────────────────────────┐ ┌──────────────────────────────────────────────────┐
+│ 5. LOGS & TRACES PLANE                           │ │ 3. METRICS & ALERTING PLANE                      │
+│    Grafana Alloy (:12345)                        │ │    Prometheus (:9090) - 15 s scrape:             │
+│    • Docker Logs + OTLP from Gateway & Engine    │ │    vLLM :8000 · LiteLLM :9095 · router · Plane 4 │
+│                                                  │ │    • Golden Signals: TTFT · ITL · KV-Cache %     │
+│    Grafana Loki (:3100)                          │ │      Queue Backlog · Prefix-Cache Hits · Errors  │
+│    • LogQL Log Storage                           │ │                                                  │
+│                                                  │ │    Alertmanager (:9093)                          │
+│    Grafana Tempo (:3200)                         │ │    • SLO Burn-Rate Alerts (fast + slow window)   │
+│    • One Trace Spans Gateway + Engine            │ │    • Saturation & GPU Thermal Alerts             │
+└───────────────┬──────────────────────────────────┘ └──────────────────────────────────┬───────────────┘
+                │ LogQL · TraceQL                           ▲                           │ PromQL
+                │ PromQL                                    │ scraped                   │ polling
+                ▼                                                                       ▼
+┌────────────────────────────────┐ ┌────────────────────────┴──────┐ ┌──────────────────────────────────┐
+│ 7. VISUALIZATION PLANE         │ │ 4. HARDWARE TELEMETRY PLANE   │ │ 8. AUTOSCALING (KEDA · k8s only) │
+│    Grafana (:3001)             │ │    • NVIDIA DCGM (:9400)      │ │    • Reads Prometheus Directly   │
+│    • Dashboards Only           │ │      GPU util · VRAM · temp   │ │    • Queue Backlog / Replica > 4 │
+│      (no control-loop role)    │ │    • node-exporter (:9100)    │ │    • KV-Cache Saturation > 80 %  │
+│    • SLOs, Engine, GPU, Cost   │ │      CPU · RAM · disk · net   │ │    • 300 s Scale-Down Window     │
+│    • Loki → Tempo Deep Links   │ │    • Platform stub off-NVIDIA │ │    • Karpenter GPU Nodes (EKS)   │
+│                                │ │                               │ │                                  │
+└────────────────────────────────┘ └───────────────────────────────┘ └──────────────────────────────────┘
+
+┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ 9. MODEL LIFECYCLE & GOVERNANCE PLANE                                                                 │
+│    • Model Block: one place defines the model for engine, gateway, keys & tests (.env)                │
+│    • Presets + Auto-Profiling: any Hub repo configured from metadata (scripts/configure_model.py)     │
+│    • Model Registry: pinned Hugging Face revisions & thresholds (models/catalog.yaml)                 │
+│    • CI/CD Eval Gate: golden probes before promotion (scripts/eval_gate.py)                           │
+│    • Online Evaluation: LLM-as-judge on live traffic (scripts/online_eval_judge.py)                   │
+│    • Canary Rollouts: Argo Rollouts with SLO analysis (k8s/extras/argo-rollouts-vllm.yaml)            │
+└───────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 Planes
+
+| # | Plane | Components | Responsibility |
+| :-: | :--- | :--- | :--- |
+| 1 | Ingress & Routing | LiteLLM, KV router, Postgres, Redis | auth · budgets · limits · PII masking · cache · prefix affinity |
+| 2 | Inference | vLLM | batching · prefix caching · reasoning and tool-call parsing |
+| 3 | Metrics & Alerting | Prometheus, Alertmanager | golden-signal rules · SLO burn-rate alerts |
+| 4 | Hardware | DCGM exporter, node exporter | GPU and host telemetry |
+| 5 | Logs & Traces | Alloy, Loki, Tempo | container logs · OTLP traces |
+| 6 | LLM Observability | Langfuse v4 (ClickHouse, MinIO) | prompts · completions · cost · judge scores |
+| 7 | Visualization | Grafana | dashboards only — never in a control loop |
+| 8 | Autoscaling | KEDA (Kubernetes only) | scale vLLM on saturation signals |
+| 9 | Model Lifecycle | model block, presets, eval gate, judge, Argo Rollouts | qualify and promote models |
+
+### 2.3 End-to-End Request & Control Lifecycle
+
+```text
+Client App       LiteLLM (:4000)     KV Router (:8001)      vLLM (:8000)       Prometheus (:9090)        KEDA         Alloy · Tempo       Langfuse
+    │                   │                    │                    │                     │                  │                │                 │
+ 1  │── POST /v1/chat ─>│                    │                    │                     │                  │                │                 │
+ 2  │                   │── auth · budget    │                    │                     │                  │                │                 │
+    │                   │   PII mask · cache │                    │                     │                  │                │                 │
+ 3  │                   │── + traceparent ──>│                    │                     │                  │                │                 │
+ 4  │                   │                    │── hash prefix      │                     │                  │                │                 │
+    │                   │                    │   → pick replica   │                     │                  │                │                 │
+ 5  │                   │                    │── proxy (stream) ─>│                     │                  │                │                 │
+ 6  │                   │                    │                    │── batch + prefix    │                  │                │                 │
+    │                   │                    │                    │   KV-cache reuse    │                  │                │                 │
+ 7  │                   │                    │<── stream tokens ──│                     │                  │                │                 │
+ 8  │                   │<── stream tokens ──│                    │                     │                  │                │                 │
+ 9  │<── SSE · TTFT ────│                    │                    │                     │                  │                │                 │
+    │                   │                    │                    │                     │                  │                │                 │
+  ── [ ASYNCHRONOUS TELEMETRY & CONTROL LOOP ] ───────────────────────────────────────────────────────────────────────────────────────────────────────────
+    │                   │                    │                    │                     │                  │                │                 │
+10  │                   │┄┄ OTLP spans + logs ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄>│                 │
+11  │                   │                    │                    │┄┄ OTLP spans + logs ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄>│                 │
+12  │                   │┄┄ prompt · completion · tokens · cost ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄>│
+13  │                   │                    │                    │<┄┄ scrape 15 s ┄┄┄┄┄│                  │                │                 │
+14  │                   │<┄┄ scrape :9095 (internal) ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄│                  │                │                 │
+15  │                   │                    │                    │                     │<┄┄ poll (k8s) ┄┄┄│                │                 │
+16  │                   │                    │                    │<── scale 1..N (k8s) ───────────────────│                │                 │
+    │                   │                    │                    │                     │                  │                │                 │
+```
+
+- **One trace id** — the caller's `traceparent` is continued by the gateway and forwarded to the engine; the bundled scripts start a fresh one per request.
+- **Tempo** — gateway and engine spans land in a single trace.
+- **Loki** — container logs; the router logs each request's `trace_id=`, which Grafana links to Tempo.
+- **Langfuse** — the same trace id carries prompt, completion, cost and judge scores.
+
+### 2.4 Configuration Flow
+
+```text
+┌─────────────────────┐      ┌──────────────────────────┐      ┌────────────────────────────────────────┐
+│ Hugging Face Hub    │─────>│ configure_model.py       │─────>│ .env  MODEL BLOCK                      │
+│ (metadata only)     │      │ preset | auto-profile    │      │ MODEL_NAME · VLLM_MODEL_ARGS · EVAL_*  │
+└─────────────────────┘      └──────────────────────────┘      └───────────────────┬────────────────────┘
+┌─────────────────────┐ preset that fits  ▲                                        │
+│ detect_hardware.py  │───────────────────┘                                        │
+│ VRAM · RAM · cores  │                                                            │
+└─────────────────────┘                                                            │
+                                                                                   │
+          ┌────────────────────┬────────────────────┬────────────────────┬─────────┴──────────┐
+          ▼                    ▼                    ▼                    ▼                    ▼
+┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
+│ vLLM command     │ │ Gateway routes   │ │ Key scopes       │ │ Tests & gates    │ │ k8s ConfigMap    │
+│ engine flags     │ │ model aliases    │ │ allowed models   │ │ capability-aware │ │ deploy_k8s.sh    │
+└──────────────────┘ └──────────────────┘ └──────────────────┘ └──────────────────┘ └──────────────────┘
+          ▲
+          │ engine image + devices · sizing for this machine
+┌─────────┴─────────────────────────────────────────────────────────────────────────────────────────────┐
+│ Platform overlay      gpu · rocm · cpu · metal · mock                                                 │
+│ run_all.sh at boot    preflight.py: free host ports · GPU memory fraction · gateway workers           │
+│ On a failed boot      engine_doctor.py: context auto · fp16 · retry · smaller preset (saved in .env)  │
+└───────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+- **Model block** — the single place a model is defined; a model swap edits nothing else.
+- **Platform overlay** — swaps only the engine image and device wiring.
+- **Gateway routes** — rendered at start: `<name>`, `<name>-direct`, `<name>-thinking`.
+- **Hardware fit** — `detect_hardware.py` picks the preset that fits; at boot `preflight.py` sizes engine + gateway for the machine and `engine_doctor.py` repairs a failed boot.
+
+### 2.5 Network Exposure
+
+```text
+  ┌──────────────────┐                                                ┌──────────────────┐
+  │ Internet         │                                                │ Your laptop      │
+  └────────┬─────────┘                                                └────────┬─────────┘
+           │ cloud firewall                                                    │ SSH tunnel
+           │ TCP 3000 · 3001 · 4000                                            │ port 22
+           ▼                                                                   ▼
+┌──────────────────────────────────────────────────┐ ┌──────────────────────────────────────────────────┐
+│ PUBLISHABLE · LOGIN REQUIRED                     │ │ SERVER-LOCAL · 127.0.0.1 · NO LOGIN              │
+│                                                  │ │                                                  │
+│ Gateway + UI   :4000   GATEWAY_BIND_ADDRESS      │ │ vLLM :8000 · KV router :8001                     │
+│ Grafana        :3001   UI_BIND_ADDRESS           │ │ Prometheus :9090 · Alertmanager :9093            │
+│ Langfuse       :3000   UI_BIND_ADDRESS           │ │ Loki :3100 · Tempo :3200 · Alloy :12345          │
+│                                                  │ │ OTLP :4317/:4318 · DCGM :9400 · node :9100       │
+│                                                  │ │ Postgres :5432 · Redis :6379                     │
+└──────────────────────────────────────────────────┘ └──────────────────────────────────────────────────┘
+
+┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ DOCKER NETWORK ONLY:  LiteLLM metrics :9095 · ClickHouse · MinIO (never published)                    │
+└───────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+- **Default** — every port binds to `127.0.0.1`.
+- **Publishable** — only services with their own login (`GATEWAY_BIND_ADDRESS`, `UI_BIND_ADDRESS`).
+- **Internal only** — LiteLLM metrics `:9095`, ClickHouse, MinIO never leave the Docker network.
+
+### 2.6 Kubernetes Topology
+
+```text
+┌───────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ namespace: llmops                                                                                     │
+│       ┌─────────────────────────────── OTLP :4318 ────────────────────────────────────┐               │
+│       │    ┌────── <name>-direct fallback ─────────────┐                              │               │
+│  ┌────┴────┴────┐      ┌────────────────┐      ┌───────▼────────┐ OTLP :4317  ┌───────▼────────┐      │
+│  │ litellm ×2   │─────>│ kv-router ×2   │─────>│ vllm ×1…8      │────────────>│ tempo          │      │
+│  └──────┬───────┘      └────────────────┘      └────────────┬───┘             └────────────────┘      │
+│         │                           scale replicas   ▲      │ /metrics                                │
+│         │                         ┌──────────────────┘      │                                         │
+│         ▼                         │                         ▼                                         │
+│ ┌───────────────────┐     ┌───────┴────────┐       ┌──────────────────┐                               │
+│ │ postgres · redis  │     │ KEDA           │<──────│ prometheus       │ also scrapes litellm          │
+│ └───────────────────┘     └────────────────┘       └────────┬─────────┘ :9095 + kv-router, per pod    │
+│                          backlog > 4 · KV > 80 %            ▼                                         │
+│                                                    ┌──────────────────┐                               │
+│                                                    │ alertmanager     │                               │
+│                                                    └──────────────────┘                               │
+│                                                                                                       │
+└───────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ Not in k8s/base: Grafana · Loki · Langfuse (cluster-wide) · Alloy DaemonSet in k8s/extras/
 ```
 
 ---
 
-## 4. Hardware Detection & Serving Profiles (vLLM-Metal & CUDA)
+## 3. Getting Started
 
-The platform features an automated hardware detection engine ([`scripts/detect_hardware.py`](file:///Users/sushovansaha/Desktop/Project/Personal/LLMOps-Production-Platform/scripts/detect_hardware.py)) that inspects host capabilities (Apple Silicon M-Series, NVIDIA CUDA, or generic CPU) before selecting the optimal serving architecture.
+### 3.1 Requirements
+
+| Platform | Needs |
+| :--- | :--- |
+| NVIDIA GPU host | Ubuntu 22.04/24.04 with the NVIDIA driver; Docker + NVIDIA toolkit are installed by `run_all.sh` when missing (passwordless sudo) |
+| CPU host / laptop | Docker, Python 3.8+ (Compose older than v2.24 is replaced by a pinned release in `~/.docker/cli-plugins`) |
+| Apple Silicon | macOS 15+, Docker Desktop, Homebrew (vllm-metal is installed by `run_all.sh`) |
+
+### 3.2 Cloud GPU Host
 
 ```bash
-# Run standalone hardware diagnostic
-python3 scripts/detect_hardware.py
+git clone <repo> && cd LLMOps
+./run_all.sh                       # installs what is missing, boots, warms up, verifies
 ```
 
-### How vLLM-Metal Works on Apple Silicon
-On macOS (Darwin arm64), the platform integrates the [`vllm-metal`](https://github.com/vllm-project/vllm-metal) architecture:
-* **Unified Memory Architecture:** Utilizes the Mac's shared memory pool for **zero-copy tensor operations**, eliminating PCIe bus transfer bottlenecks between CPU and GPU.
-* **Backend Stack:** Keeps vLLM's core engine, scheduler, and continuous batching intact on top, while Apple's **MLX framework** and **Metal GPU shaders** handle the underlying hardware compute.
-* **Model Support:** Directly serves quantized `.safetensors` models from the `mlx-community` repository on Hugging Face (such as SmolLM2, Llama-3.2, and Qwen).
+- **No NVIDIA driver yet** — `bash scripts/bootstrap_host.sh` once (driver installs are never automatic).
 
-### Hardware Profiles & Quantization Matrix (`config/profiles/`):
+### 3.3 CPU Host
 
-| Parameter | Apple Silicon Metal Tier (`apple-silicon-metal.yaml`) | Production Datacenter (`prod-datacenter-gpu.yaml`) | Dev / Edge Tier (`dev-edge-4gb.yaml`) |
+```bash
+./run_all.sh                       # no usable GPU: real inference on vLLM's CPU backend
+./run_all.sh --cpu                 # force CPU on a GPU host
+```
+
+- **Preset** — `qwen3-4b` with ≥ 16 threads and ≥ 24 GB RAM, else `smollm2-360m`.
+
+### 3.4 Apple Silicon
+
+```bash
+./run_all.sh                       # installs vllm-metal, starts the native engine, rest in Docker
+```
+
+- **Preset** — `qwen3-4b` with ≥ 16 GB unified memory, else `smollm2-360m`.
+- **No Homebrew / vllm-metal** — the engine runs on CPU in Docker instead.
+
+### 3.5 No Model (UI / pipeline development)
+
+```bash
+./run_all.sh --mock                # emulated engine with real vLLM metric names
+```
+
+### 3.6 What Every Run Does
+
+- **Never prompts** — every decision is automatic and listed under *Fixed automatically* in the final report.
+- **Secrets** — the first run creates `.env` with fresh keys and passwords; later runs only add new ones.
+- **Model** — the first run picks the preset for the hardware; a platform change re-sizes it.
+- **Ports** — a port used by another program moves to the next free one (saved in `.env`).
+- **Sizing** — the engine takes the GPU with the most free memory and sizes itself to it; gateway workers follow CPU threads; CPU KV cache follows RAM.
+- **Engine recovery** — a failed boot gets context `auto`, fp16, a retry, a smaller preset, and finally the CPU; a model dropped because the GPU was shared is retried next run.
+- **Database & keys** — the Postgres password is re-synced with `.env`; team keys left by a lost `.env` are retired and the seed keys re-issued.
+- **Timing** — cold start ≈ 3.5 min (9B on A100, includes 19 GB download); warm restart ≈ 80 s.
+
+---
+
+## 4. Accessing the Stack
+
+### 4.1 Endpoints
+
+| Service | Port | Path | Login | Public |
+| :--- | :-: | :--- | :--- | :-: |
+| Gateway API | 4000 | `/v1` | Bearer `TEAM_ENGINEERING_KEY` | ✅ |
+| LiteLLM admin UI | 4000 | `/ui` | `admin` + `LITELLM_MASTER_KEY` | ✅ |
+| Grafana | 3001 | `/` | `admin` + `GF_SECURITY_ADMIN_PASSWORD` | ✅ |
+| Langfuse | 3000 | `/` | `LANGFUSE_ADMIN_EMAIL` + `LANGFUSE_ADMIN_PASSWORD` | ✅ |
+| Prometheus | 9090 | `/` | none | ❌ |
+| Alertmanager | 9093 | `/` | none | ❌ |
+| vLLM | 8000 | `/docs` | none | ❌ |
+| KV router | 8001 | `/health` | none | ❌ |
+| Tempo · Loki · Alloy | 3200 · 3100 · 12345 | `/` | none | ❌ |
+
+### 4.2 Credentials
+
+```bash
+grep -E '^(TEAM_ENGINEERING_KEY|LITELLM_MASTER_KEY|GF_SECURITY_ADMIN_PASSWORD|LANGFUSE_ADMIN_(EMAIL|PASSWORD))=' .env
+```
+
+### 4.3 Option A — SSH Tunnel (default)
+
+```bash
+ssh -N -L 4000:localhost:4000 -L 3001:localhost:3001 -L 3000:localhost:3000 \
+       -L 9090:localhost:9090 ubuntu@<server-ip>
+```
+
+- Open `http://localhost:<port>` on your laptop.
+- Nothing is exposed to the internet.
+
+### 4.4 Option B — Public URLs
+
+1. **Edit `.env`**
+   ```bash
+   GATEWAY_BIND_ADDRESS=0.0.0.0
+   UI_BIND_ADDRESS=0.0.0.0
+   PUBLIC_HOST=<server-ip>
+   NEXTAUTH_URL=http://<server-ip>:3000
+   ```
+2. **Apply** — `./run_all.sh --skip-tests`
+3. **Open the cloud firewall** — inbound TCP `3000-3001` and `4000`, source = your IP
+   (Lambda Cloud: dashboard → **Firewall**; only SSH is open by default)
+4. **Browse** — `http://<server-ip>:3001` (Grafana), `:3000` (Langfuse), `:4000/ui` (LiteLLM)
+
+> ⚠️ **Plain HTTP:** passwords and API keys travel unencrypted. Restrict the firewall to your IP and add TLS before wider use.
+
+---
+
+## 5. Models
+
+### 5.1 Choose a Model
+
+```bash
+python3 scripts/configure_model.py --list                 # curated presets
+python3 scripts/configure_model.py qwen3.5-9b             # apply a preset
+python3 scripts/configure_model.py openai/gpt-oss-20b     # any Hub repo (auto-profiled)
+./run_all.sh --model <preset | repo>                      # configure + deploy + verify
+```
+
+### 5.2 Presets
+
+| Preset | Model | Best for | Verified on |
 | :--- | :--- | :--- | :--- |
-| **Target Hardware** | Apple Silicon M1 / M2 / M3 / M4 (Unified Memory) | NVIDIA L4 / A10G / L40S / A100 / H100 | NVIDIA GeForce GTX 1650 (4GB VRAM) |
-| **Compute Backend** | Apple MLX + Metal Shaders (`vllm-metal`) | Native CUDA + TensorRT-LLM | Native CUDA (`vllm`) |
-| **Memory Strategy** | Unified Memory Zero-Copy (16GB+ shared pool) | Dedicated VRAM (22GB+ dedicated KV cache) | Dedicated VRAM (`0.60` pool ~1,952 MiB) |
-| **Execution Precision**| 4-bit / 8-bit MLX (`mlx-community`) | Native BF16 / FP8 / AWQ | FP16 (`--dtype half`) |
-| **PagedAttention** | Native Metal Paged Varlen Kernels | PagedAttention v2 / FlashAttention-2 | PagedAttention (CUDA graph disabled) |
-| **Target Model** | `mlx-community/SmolLM2-360M-Instruct-4bit` | `meta-llama/Llama-3.1-8B-Instruct` | `HuggingFaceTB/SmolLM2-360M-Instruct` |
-| **Hardware Telemetry**| powermetrics / sysctl (Unified RAM & SoC Power) | Full DCGM (SM Occupancy, Bandwidth, Thermals)| DCGM (Util, FB_USED, Temp, Power) |
+| `qwen3.5-9b` | Qwen/Qwen3.5-9B — vision, tools, thinking, 128K | ≥ 24 GB accelerators | A100-40GB |
+| `qwen3-4b` | Qwen/Qwen3-4B — tools, thinking | CPU hosts, 10–24 GB GPUs | 30-core EPYC CPU |
+| `smollm2-360m` | HuggingFaceTB/SmolLM2-360M-Instruct | 4 GB dev GPUs, smoke tests | — |
+
+### 5.3 Auto-Profiling (any repo)
+
+Reads Hub metadata only — no weights downloaded.
+
+| Setting | Derived from |
+| :--- | :--- |
+| Reasoning parser | model family (`qwen3`, `openai_gptoss`, `granite`, `glm45`, generic `<think>`) |
+| Tool-call parser | family + chat template (`qwen3_coder`, `hermes`, `llama3_json`, `mistral`, …) |
+| Thinking toggle | `enable_thinking` / `thinking` in the template |
+| Vision support | `vision_config` / `image-text-to-text` |
+| Context length | `auto` — largest that fits memory |
+| Quality gates | fixed bar; speed SLOs relaxed on CPU / Metal |
+| Warnings | gated repos (`HF_TOKEN`), weight-memory estimate |
+
+### 5.4 Gateway Aliases
+
+| Alias | Path | Behaviour |
+| :--- | :--- | :--- |
+| `<name>` | gateway → router → vLLM | answers directly (default) |
+| `<name>-thinking` | gateway → router → vLLM | reasoning returned separately (reasoning models) |
+| `<name>-direct` | gateway → vLLM | bypasses the router · fallback target |
 
 ---
 
+## 6. Platforms
 
-## 5. Security & Virtual Key Management
-
-### Master Key Isolation & Cryptographic Rotation
-The master key grants root proxy administration and is stored strictly in `.env` / Kubernetes Secrets. Rotate it anytime without downtime using the automated script:
-
-```bash
-bash scripts/rotate_master_key.sh
-```
-
-### Issuing Per-Team Virtual Keys
-Client applications and microservices **never** receive the master key. Issue scoped virtual keys with budget caps and rate limits:
-
-```bash
-# 1. Generate key for platform engineering
-python3 scripts/manage_keys.py generate \
-  --team engineering \
-  --alias core-backend-service \
-  --budget 250.0 \
-  --rpm 200 \
-  --tpm 80000 \
-  --models smollm2
-
-# 2. Inspect virtual key metadata and spend
-python3 scripts/manage_keys.py info --key sk-eng-team-a1b2c3d4e5f6g7h8i9j0
-
-# 3. Calculate aggregate spend across all teams
-python3 scripts/manage_keys.py spend
-
-# 4. Bootstrap seed keys for dev/testing
-python3 scripts/manage_keys.py seed
-```
-
----
-
-## 6. Service Port & Endpoint Registry
-
-| Service | Internal Port | Host Port | Accessible Endpoint | Authentication / Role |
+| Platform | Overlay | Engine image | GPU telemetry | Status |
 | :--- | :--- | :--- | :--- | :--- |
-| **LiteLLM Gateway** | `4000` | `4000` | `http://localhost:4000` | Bearer Virtual Key (`sk-eng-team-a1b2c3d4e5f6g7h8i9j0`) |
-| **KV-Aware Router** | `8000` | `8001` | `http://localhost:8001/health` | Prefix Affinity Routing Layer |
-| **vLLM Engine** | `8000` | `8000` | `http://localhost:8000/health` | Direct GPU Serving Engine |
-| **Prometheus** | `9090` | `9090` | `http://localhost:9090/targets` | Golden Signals & Recording Rules (All 9 Targets UP) |
-| **Alertmanager** | `9093` | `9093` | `http://localhost:9093` | Multi-Window SLO Burn-Rate Alerts |
-| **Grafana Tempo** | `3200` | `3200` | `http://localhost:3200` | Distributed Trace Storage (OTLP HTTP :4318, gRPC :4317) |
-| **Grafana Alloy** | `12345`| `12345`| `http://localhost:12345` | Unified Log & Trace Agent |
-| **Grafana Loki** | `3100` | `3100` | `http://localhost:3100/ready` | LogQL Log Aggregation Engine |
-| **Grafana 11 UI** | `3000` | `3001` | `http://localhost:3001` | Visualizations & Dashboards (User: `admin` / Pass: `admin`) |
-| **PostgreSQL** | `5432` | `5432` | `postgres:5432` | LiteLLM Virtual Keys, Teams, Budgets & Langfuse DB |
-| **Redis** | `6379` | `6379` | `redis:6379` | Rate-Limit Sync & Exact Response Cache |
-| **Langfuse Server** | `3000` | `3000` | `http://localhost:3000` | Application Tracing & Online Evals |
-| **DCGM Exporter** | `9400` | `9400` | `http://localhost:9400/metrics` | NVIDIA GPU Telemetry |
-| **Node Exporter** | `9100` | `9100` | `http://localhost:9100/metrics` | Host Infrastructure Telemetry |
+| NVIDIA CUDA | `docker-compose.gpu.yml` | `vllm/vllm-openai` | DCGM | ✅ verified (A100) |
+| CPU (x86_64 / arm64) | `docker-compose.cpu.yml` | `vllm/vllm-openai-cpu` | — | ✅ verified (EPYC) |
+| AMD ROCm | `docker-compose.rocm.yml` | `vllm/vllm-openai-rocm` | — | not verified |
+| Apple Silicon | `docker-compose.metal.yml` | native `vllm-metal` | — | not verified |
+| Mock | `docker-compose.mock.yml` | emulator | synthetic | emulation only |
+
+- **Auto-detection** — Metal → CUDA → ROCm → CPU (`scripts/detect_hardware.py`).
+- **ROCm** — needs `rocm-smi` and ≥ 8 GB VRAM; integrated AMD graphics run on CPU.
+- **Old NVIDIA GPUs** — compute capability < 7.0 (pre-Volta) run on CPU.
+- **SELinux (Fedora / RHEL)** — `docker-compose.selinux.yml` is added automatically when enforcing.
+- **GPU Docker cannot use** — NVIDIA toolkit installed automatically (Linux, passwordless sudo, no other containers running), else CPU.
+- **Override** — `./run_all.sh --platform cuda | rocm | cpu | metal | mock`; a platform the machine cannot run falls back to the detected one.
+- **Same engine** — vLLM `v0.31.0` everywhere: identical API, metrics and tests.
 
 ---
 
-## 7. Quickstart Guide (Local Docker Compose)
+## 7. Using the Gateway
 
-### 🚀 Option A: One-Command Master Runner (Recommended)
-
-The platform provides a master runner script (`run_all.sh`) that automates all 10 stages from cold hardware detection to model qualification:
+### 7.1 cURL
 
 ```bash
-# Execute complete automated bootstrap & 10-point verification
-./run_all.sh
+KEY=$(grep ^TEAM_ENGINEERING_KEY .env | cut -d= -f2)
+curl -N http://localhost:4000/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"model": "qwen3.5-9b", "stream": true,
+       "messages": [{"role": "user", "content": "Explain KV-cache prefix affinity in one sentence."}]}'
 ```
 
-#### What `run_all.sh` executes automatically:
-1. **Multi-Hardware Detection:** Detects Apple Silicon Metal (Apple M-series with zero-copy unified memory), NVIDIA CUDA GPUs, or generic CPUs and configures profiles dynamically.
-2. **Secrets Initialization:** Loads and exports `.env` secrets into the environment.
-3. **Clean Teardown:** Dismantles any stale or conflicting containers and networks.
-4. **Microservices Build:** Builds `kv-router`, `vllm-inference`, and `dcgm-exporter` container images locally.
-5. **Distributed State:** Boots and health-checks PostgreSQL and Redis.
-6. **Inference & Routing Plane:** Boots vLLM, KV-Aware Router, and LiteLLM AI Gateway.
-7. **Observability Stack:** Boots Prometheus, Alertmanager, Alloy, Tempo, Loki, Grafana, and Langfuse.
-8. **Security Bootstrap:** Automatically registers teams (`/team/new`) and seeds per-team virtual keys in PostgreSQL.
-9. **7-Point Health Check:** Validates vLLM, router, streaming SSE inference, PII guardrails, Prometheus targets, Alertmanager, and Alloy/Tempo/Loki pipelines.
-10. **Stress & Model Lifecycle CI Gates:** Executes streaming traffic load tests, Plane 9 model CI evaluation gate (`scripts/eval_gate.py`), and online LLM-as-judge evaluation (`scripts/online_eval_judge.py`).
-
-#### Operational CLI Flags:
-```bash
-./run_all.sh --metal       # Force Apple Silicon Metal mode (vLLM-Metal / MLX zero-copy)
-./run_all.sh --gpu         # Force NVIDIA CUDA mode (docker-compose.gpu.yml)
-./run_all.sh --cpu         # Force generic CPU / emulation dev mode
-./run_all.sh --test        # Run verification & evaluation suites against active running stack
-./run_all.sh --skip-tests  # Start the platform without running load tests & eval gates
-./run_all.sh --down        # Cleanly stop and dismantle all containers & networks
-```
-
----
-
-### 🛠️ Option B: Step-by-Step Manual Operations
-
-For engineers requiring granular, step-by-step control:
-
-#### 1. Configure Environment Secrets
-```bash
-cp .env.example .env
-```
-
-#### 2. Launch the Hardened Multi-Plane Stack
-```bash
-# On Apple Silicon / macOS / CPU:
-docker compose up -d
-
-# On Linux with NVIDIA GPUs:
-docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
-```
-
-#### 3. Bootstrap Teams & Per-Team Virtual Keys
-```bash
-set -a; source .env; set +a
-python3 scripts/manage_keys.py seed
-```
-
-#### 4. Run 7-Point Health & Telemetry Verification
-```bash
-python3 scripts/test_stack.py
-```
-*(Validates vLLM, KV Router, Virtual Key SSE Streaming, PII Redaction, Prometheus Recording Rules, Alertmanager, and Alloy/Tempo/Loki tracing).*
-
-#### 5. Run Concurrent Streaming Stress Test & KEDA Saturation Trigger
-```bash
-CONCURRENCY=20 python3 scripts/load_test.py
-```
-*(Simulates concurrent streaming requests, measuring P50/P90/P95 TTFT, Inter-Token Latency, and verifying KEDA trigger conditions).*
-
-#### 6. Execute Model Qualification Gate (Plane 9 CI Gate)
-```bash
-python3 scripts/eval_gate.py --model smollm2 --max-ttft 2.0 --min-tps 15.0 --min-accuracy 0.80
-```
-
-#### 7. Optional: Launch Langfuse v3 Enterprise Stack Overlay
-```bash
-docker compose -f docker-compose.yml -f docker-compose.langfuse-v3.yml up -d
-```
-*(Enables ClickHouse columnar storage, MinIO S3 blob storage, and Redis queues for Langfuse v3).*
-
----
-
-## 8. Making Inferences (cURL & Python API)
-
-The platform exposes an **OpenAI-compatible `/v1/chat/completions` API** at the LiteLLM Gateway (`http://localhost:4000/v1`), protected by per-team virtual keys. Every request benefits from:
-1. **Virtual Key Authentication & Rate Limiting:** Enforced via PostgreSQL budgets and Redis token bucket rate limiters.
-2. **PII Redaction & Guardrails:** Prompt inputs are evaluated and sanitized to prevent sensitive data leakage.
-3. **KV-Cache Optimization:** The KV-Aware Router hashes prompt prefixes and directs requests to worker instances with warm KV-cache affinity.
-4. **End-to-End Tracing:** W3C `traceparent` headers are injected and propagated down to Grafana Tempo and Loki.
-
----
-
-### 1. Via cURL (Command Line)
-
-#### Option A: Streaming SSE Response (Recommended for Real-Time TTFT)
-Streaming returns Server-Sent Events (SSE) token chunks as they are generated by the PagedAttention engine:
-
-```bash
-curl -N -X POST "http://localhost:4000/v1/chat/completions" \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-eng-team-a1b2c3d4e5f6g7h8i9j0" \
-  -d '{
-    "model": "smollm2",
-    "messages": [
-      {"role": "system", "content": "You are a production assistant."},
-      {"role": "user", "content": "Explain what KV-cache optimization is in 2 sentences."}
-    ],
-    "stream": true,
-    "temperature": 0.2,
-    "max_tokens": 100
-  }'
-```
-
-#### Option B: Non-Streaming Synchronous Response (Standard JSON)
-Returns the complete JSON completion object once generation terminates:
-
-```bash
-curl -X POST "http://localhost:4000/v1/chat/completions" \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-eng-team-a1b2c3d4e5f6g7h8i9j0" \
-  -d '{
-    "model": "smollm2",
-    "messages": [
-      {"role": "user", "content": "What is continuous batching in vLLM?"}
-    ],
-    "temperature": 0.2,
-    "max_tokens": 80
-  }'
-```
-
-#### Option C: Injecting W3C Trace Context (Distributed Tracing)
-Pass a W3C `traceparent` header to correlate client calls with Grafana Tempo traces:
-
-```bash
-curl -X POST "http://localhost:4000/v1/chat/completions" \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-eng-team-a1b2c3d4e5f6g7h8i9j0" \
-  -H "traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" \
-  -d '{
-    "model": "smollm2",
-    "messages": [{"role": "user", "content": "Ping!"}]
-  }'
-```
-
----
-
-### 2. Via Python API
-
-#### Option A: Official OpenAI Python SDK (`pip install openai`)
-Point the `OpenAI` client to `base_url="http://localhost:4000/v1"` with your team virtual key:
+### 7.2 Python
 
 ```python
 from openai import OpenAI
-import time
+client = OpenAI(base_url="http://localhost:4000/v1", api_key="<TEAM_ENGINEERING_KEY>")
 
-# Initialize client pointing to local LiteLLM AI Gateway
-client = OpenAI(
-    base_url="http://localhost:4000/v1",
-    api_key="sk-eng-team-a1b2c3d4e5f6g7h8i9j0",
-)
+# direct answer
+client.chat.completions.create(model="qwen3.5-9b",
+    messages=[{"role": "user", "content": "Capital of France?"}])
 
-# 1. Streaming Inference with TTFT (Time-To-First-Token) measurement
-start_time = time.time()
-stream = client.chat.completions.create(
-    model="smollm2",
-    messages=[
-        {"role": "system", "content": "You are a production assistant."},
-        {"role": "user", "content": "Explain how PagedAttention partitions GPU memory."}
-    ],
-    stream=True,
-    temperature=0.2,
-    max_tokens=150,
-)
+# reasoning (returned separately from the answer)
+client.chat.completions.create(model="qwen3.5-9b-thinking", max_tokens=2048,
+    messages=[{"role": "user", "content": "What is 17 * 23?"}])
 
-first_token = True
-print("--- Streaming Output ---")
-for chunk in stream:
-    if chunk.choices and chunk.choices[0].delta.content:
-        if first_token:
-            ttft = time.time() - start_time
-            print(f"[TTFT: {ttft:.4f}s]")
-            first_token = False
-        print(chunk.choices[0].delta.content, end="", flush=True)
-
-print(f"\n[Total Latency: {time.time() - start_time:.4f}s]")
-
-# 2. Synchronous Non-Streaming Inference
-response = client.chat.completions.create(
-    model="smollm2",
-    messages=[
-        {"role": "user", "content": "What is the difference between TTFT and ITL?"}
-    ],
-    temperature=0.2,
-)
-print("\n--- Synchronous Output ---")
-print(response.choices[0].message.content)
-print(f"Usage: {response.usage.prompt_tokens} prompt + {response.usage.completion_tokens} completion tokens")
+# vision
+client.chat.completions.create(model="qwen3.5-9b", messages=[{"role": "user", "content": [
+    {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+    {"type": "text", "text": "What is in this image?"}]}])
 ```
 
-#### Option B: Zero-Dependency Python (Standard Library `urllib.request`)
-Run inference directly without installing any third-party packages:
+### 7.3 Request Options
 
-```python
-import urllib.request
-import json
-import time
+| Option | How |
+| :--- | :--- |
+| Skip the response cache | body: `"cache": {"no-cache": true}` |
+| Correlate across Tempo / Loki / Langfuse | header: `traceparent: 00-<trace-id>-<span-id>-01` |
+| More examples | `python3 scripts/inference_example.py` |
 
-url = "http://localhost:4000/v1/chat/completions"
-headers = {
-    "Content-Type": "application/json",
-    "Authorization": "Bearer sk-eng-team-a1b2c3d4e5f6g7h8i9j0",
-}
-payload = {
-    "model": "smollm2",
-    "messages": [
-        {"role": "user", "content": "Summarize continuous batching in one sentence."}
-    ],
-    "temperature": 0.2,
-}
+---
 
-t0 = time.time()
-req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers)
-with urllib.request.urlopen(req) as resp:
-    result = json.loads(resp.read().decode("utf-8"))
-    print(f"Latency: {time.time() - t0:.4f}s")
-    print("Response:", result["choices"][0]["message"]["content"])
-```
+## 8. Operations
 
-#### Option C: Ready-to-Run Script
-Run the platform's included inference client directly from your terminal:
+### 8.1 Stack
+
+| Task | Command |
+| :--- | :--- |
+| Start / redeploy + verify | `./run_all.sh` |
+| Start only | `./run_all.sh --skip-tests` |
+| Verify a running stack | `./run_all.sh --test` |
+| Switch model | `./run_all.sh --model <preset \| repo>` |
+| Stop (keeps data) | `./run_all.sh --down` |
+| Engine logs | `docker logs -f vllm-inference` |
+| Reload Prometheus rules | `curl -X POST localhost:9090/-/reload` |
+
+### 8.2 Keys, Quality & Data
+
+| Task | Command |
+| :--- | :--- |
+| Issue a team key | `python3 scripts/manage_keys.py generate --team <t> --alias <a> --budget 50` |
+| Key spend / limits | `python3 scripts/manage_keys.py info --key <sk-...>` |
+| Rotate master key | `bash scripts/rotate_master_key.sh` |
+| Load test | `CONCURRENCY=32 python3 scripts/load_test.py` |
+| Quality gate | `python3 scripts/eval_gate.py` |
+| Score live traffic | `python3 scripts/online_eval_judge.py --sample 10` |
+| Back up Postgres | `docker exec llmops-postgres pg_dump -U llmops_admin litellm_db > backup.sql` |
+| Restore Postgres | `docker exec -i llmops-postgres psql -U llmops_admin litellm_db < backup.sql` |
+
+### 8.3 Lifecycle
+
+- **Reboots** — containers restart automatically (`restart: unless-stopped`).
+- **Upgrades** — images are pinned; bump `VLLM_VERSION`, `LITELLM_IMAGE_TAG`, `LANGFUSE_VERSION`, … then `./run_all.sh`.
+- **New secrets** — appended to an existing `.env` automatically; existing values never change.
+- **Ephemeral clouds** — keep repo + `.env` + `HF_CACHE_DIR` on persistent storage; back up Postgres before terminating.
+
+---
+
+## 9. Security
+
+| Area | Control |
+| :--- | :--- |
+| Network | all ports `127.0.0.1` by default; only login-protected services publishable |
+| Secrets | generated per deployment; `.env` mode `600` |
+| Keys | master key admin-only; per-team virtual keys with budgets + RPM/TPM limits |
+| Metrics | gateway `/metrics` needs a key; Prometheus reads an internal-only port |
+| PII | masked before inference (e-mail, card, SSN, API keys) — never reaches model, cache, logs, traces |
+| Retention | Prometheus 30 days; prompts not stored in spend logs |
+| Tests | never fall back to the master key |
+
+---
+
+## 10. Verification
+
+### 10.1 Gates (end of every `run_all.sh`)
+
+| Gate | Checks |
+| :--- | :--- |
+| `test_stack.py` | 13 checks: engine · router · streaming · thinking · vision · auth · PII · Prometheus · Alertmanager · Tempo trace · Loki log for the same trace id · Langfuse · Grafana (GPU telemetry reported, not required) |
+| `load_test.py` | concurrent streaming burst: TTFT / latency percentiles, saturation, KEDA trigger state |
+| `eval_gate.py` | accuracy · injection + PII safety · formatting · arithmetic · tool calling |
+| `online_eval_judge.py` | scores live generations from Langfuse (schema-constrained verdicts), writes scores back; `JUDGE_MODEL` picks a stronger judge than the served model |
+
+### 10.2 Verified Results (Lambda Cloud, 2026-10-08)
+
+| Platform · Model | Checks | Eval gate | Load burst |
+| :--- | :-: | :--- | :--- |
+| A100 · Qwen3.5-9B | 13/13 | 8/8 · P95 TTFT 0.11 s · 74 tok/s | 32/32 · 1455 tok/s |
+| A100 · gpt-oss-20b (auto-profiled) | 11/11 | 7/8 (pass) · 213 tok/s | 32/32 · 1912 tok/s |
+| CPU · Qwen3-4B | 13/13 | 8/8 · P95 TTFT 1.67 s · 9.9 tok/s | 8/8 · 23 tok/s |
+| CPU · Qwen3-0.6B / 1.7B | 12/12 | rejected (4/8) — weak model | — |
+| Mock engine | 11/11 | skipped | 32/32 |
+| k3s · Qwen3.5-9B | 10/10 | — | KEDA scaled 1 → 8 |
+
+### 10.3 Self-Healing Scenarios (`./run_all.sh`, A100 host, 2026-10-08)
+
+| Scenario | What `run_all.sh` did | Result |
+| :--- | :--- | :--- |
+| Plain re-run | 8 gateway workers (auto), ports free | 13/13 · eval 8/8 · 32/32 streams |
+| Ports 5432 + 9100 taken, 20 GiB of GPU held | ports → 5433 / 9101, memory 0.45, 9B → 4B | 13/13 · eval 100 % |
+| GPU free again | retried and restored the 9B | 13/13 · eval 100 % |
+| `--cpu` (platform switch) | model re-sized to `qwen3-4b`, 2 workers, KV 8 GiB | 13/13 · eval 100 % · 9.8 tok/s |
+| CPU + `smollm2-360m` (laptop path) | — (found a judge bug, fixed) | 13/13 · eval 57 % (gate 40 %) |
+| 4 GB-class GPU (4.1 GiB free) | 9B → 4B → `smollm2-360m` | 13/13 · eval 71 % |
+| GPU full (0.5 GiB free) | engine on CPU this run | 13/13 · eval 100 % |
+| `.env` lost, old databases | new secrets, DB re-synced, stale keys retired | 13/13 · eval 100 % |
+| Original `.env` restored | DB re-synced, original keys re-issued | 13/13 · eval 100 % · 74 tok/s |
+
+---
+
+## 11. Kubernetes
+
+### 11.1 Deploy
+
 ```bash
-python3 scripts/inference_example.py
+./scripts/deploy_k8s.sh cuda --verify      # or: rocm | cpu
 ```
 
----
+- Installs KEDA and (when needed) the NVIDIA device plugin.
+- Applies the overlay, waits for rollouts, seeds keys.
+- `--verify` runs the same test suite through port-forwards.
 
-## 9. Production Load Testing & Benchmark Evidence
+### 11.2 Layout
 
-The platform includes a dedicated multi-threaded streaming load tester ([`scripts/load_test.py`](file:///Users/sushovansaha/Desktop/Project/Personal/LLMOps-Production-Platform/scripts/load_test.py)) that sends concurrent Server-Sent Events (SSE) requests through the entire production pipeline:
-$$\text{Client (Team Virtual Key)} \longrightarrow \text{LiteLLM AI Gateway (:4000)} \longrightarrow \text{KV-Aware Router (:8001)} \longrightarrow \text{vLLM Engine (:8000)}$$
+| Path | Contents |
+| :--- | :--- |
+| `k8s/base/` | Postgres, Redis, vLLM, KV router, LiteLLM, Prometheus, Alertmanager, Tempo, KEDA |
+| `k8s/overlays/` | `cuda` · `cuda-runtimeclass` (k3s) · `rocm` · `cpu` |
+| `k8s/extras/` | Argo Rollouts canary · Karpenter · Gateway API · Alloy · kind |
 
-### Real-World Stress & Saturation Benchmark:
+- **Same inputs as Compose** — model block + secrets from `.env`; configs from the repo.
+- **Not in the base** — Grafana, Loki, Langfuse (use cluster-wide instances). For LLM traces, add `LANGFUSE_HOST`, `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` to the LiteLLM env in `k8s/base/litellm.yaml`.
 
-| Metric | 20 Concurrent Streams | 30 Concurrent Streams | 50 Concurrent Streams (Spike) | Production SLO Threshold | Status |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Success Rate** | **100.0%** (20/20) | **100.0%** (30/30) | **100.0%** (50/50) | $\ge 99.5\%$ | **PASSED** |
-| **Total Tokens Generated** | 276 tokens | 414 tokens | 690 tokens | — | — |
-| **Cluster Throughput** | **226.1 tok/sec** | **338.3 tok/sec** | **542.1 tok/sec** | $\ge 100$ tok/sec | **PASSED** |
-| **Time-To-First-Token (P50)**| **0.135s** | **0.378s** | **0.300s** | — | — |
-| **Time-To-First-Token (P90)**| **0.159s** | **0.525s** | **0.456s** | — | — |
-| **Time-To-First-Token (P95)**| **0.159s** | **0.540s** | **0.482s** | $\le 1.500\text{s}$ | **PASSED** |
-| **Time-To-First-Token (P99)**| **0.163s** | **0.549s** | **0.505s** | $\le 2.000\text{s}$ | **PASSED** |
-| **Total Duration** | 1.22s | 1.22s | 1.27s | — | — |
-| **KEDA Scaler Saturation** | **92.0% KV-Cache** | **92.0% KV-Cache** | **92.0% KV-Cache** | Trigger threshold: $>80\%$ | **VERIFIED** |
+### 11.3 Single-Node Test Cluster (k3s)
 
-### Verified Autoscaling & Telemetry Behaviors:
-1. **True Streaming TTFT Measurement:** Captures the real elapsed time from the initial HTTP request until the first Server-Sent Event `data:` token chunk arrives, directly isolating network and prefill latency.
-2. **KEDA Dual-Metric Scale-Out Trigger:** During high-concurrency bursts, KV-cache utilization reaches **92.0%** (`vllm:gpu_cache_usage_factor > 0.80`), successfully triggering the Prometheus scaler defined in [`k8s/keda-scaledobject.yaml`](file:///Users/sushovansaha/Desktop/Project/Personal/LLMOps-Production-Platform/k8s/keda-scaledobject.yaml) before request timeouts or queue degradation occur.
-3. **Multi-Tenant Spend & Rate-Limit Tracking:** Each request is authenticated via per-team virtual keys (`sk-eng-team-...`), validating that token usage, RPM, and TPM decrement in real-time in PostgreSQL and Redis.
-
----
-
-## 10. Kubernetes & Event-Driven Autoscaling (KEDA)
-
-In Kubernetes production clusters, KEDA scales vLLM inference pods directly off Prometheus metrics:
-
-```yaml
-apiVersion: keda.sh/v1alpha1
-kind: ScaledObject
-metadata:
-  name: vllm-inference-scaler
-  namespace: llmops
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: vllm-deployment
-  minReplicaCount: 1
-  maxReplicaCount: 8
-  cooldownPeriod: 300 # 5-minute stabilization prevents cold-start thrashing
-  pollingInterval: 15
-  triggers:
-    # Trigger 1: Normalized Queue Backlog Per Replica (>4 requests/replica)
-    - type: prometheus
-      metadata:
-        serverAddress: http://prometheus-service.llmops.svc.cluster.local:9090
-        metricName: vllm_queue_backlog_per_replica
-        query: >-
-          sum(vllm:num_requests_waiting)
-          /
-          clamp_min(count(count by (instance) (vllm:num_requests_running)), 1)
-        threshold: '4'
-
-    # Trigger 2: KV-Cache Memory Saturation (>80%)
-    - type: prometheus
-      metadata:
-        serverAddress: http://prometheus-service.llmops.svc.cluster.local:9090
-        metricName: vllm_kv_cache_saturation_percent
-        query: >-
-          avg(vllm:gpu_cache_usage_factor) * 100
-        threshold: '80'
-```
-
-### Scale-Down Stabilization Window
-Model weights take seconds to minutes to load into GPU VRAM. The KEDA configuration enforces a **300-second stabilization window** (`cooldownPeriod: 300`), eliminating pod thrashing during transient traffic dips.
-
-### Deploying to Kubernetes:
 ```bash
-bash scripts/deploy_k8s_keda.sh
+curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--disable traefik --write-kubeconfig-mode 644" sh -
+KUBECONFIG=/etc/rancher/k3s/k3s.yaml ./scripts/deploy_k8s.sh cuda --verify
+/usr/local/bin/k3s-uninstall.sh            # remove afterwards
 ```
 
 ---
 
-## 11. Verification & Operational Runbooks
+## 12. Configuration Reference
 
-### Runbook 1: Investigating TTFT SLO Degradation
-1. Check Alertmanager (:9093) for `LLMHighTTFTSLOBurnRateFast` alerts.
-2. In Grafana (:3001), open Row 1 (SLO Burn-Down) to check if TTFT P95 exceeds 1.5s.
-3. Check KV Router Prefix Hit Rate: if hit rate drops below 50%, requests are encountering cold KV caches.
-4. Drill down from Loki logs to **Tempo traces** using the trace link to identify whether latency occurred in queue scheduling or token generation.
+All settings live in `.env` (template: `.env.example`).
 
-### Runbook 2: Investigating KV-Cache Saturation
-1. Check `job:vllm_kv_cache_usage_percent` in Prometheus.
-2. If KV cache exceeds 80%, verify that KEDA has triggered pod scale-out.
-3. If node pool capacity is reached, verify Karpenter `gpu-inference-nodepool` is provisioning new GPU instances.
-
-### Runbook 3: Model Canary Rollout & Rollback
-1. Register candidate model revision in `models/catalog.yaml`.
-2. Run CI evaluation gate: `python3 scripts/eval_gate.py`.
-3. Apply canary rollout: `kubectl apply -f k8s/argo-rollouts-vllm.yaml`.
-4. Argo Rollouts routes 10% traffic, evaluating Prometheus TTFT and error rates for 5 minutes before auto-promoting.
-
-### Runbook 4: Real-Time Multi-Stream Logs & Trace Deep-Links (Grafana + Loki + Tempo)
-1. **Datasource UID Alignment:** Ensure datasources in `config/grafana-datasources.yaml` declare explicit UIDs matching dashboard JSON schemas (`uid: Loki`, `uid: Prometheus`, `uid: Alertmanager`, `uid: tempo`). Mismatched or auto-generated UIDs cause panel "Datasource not found" errors.
-2. **ECMAScript-Compliant Derived Fields:** In Grafana Loki datasource settings, trace-to-log deep-linking must use standard JavaScript RegExp without inline `(?i)` flag modifiers (which crash browser panel rendering with a `SyntaxError`):
-   ```yaml
-   matcherRegex: '(?:trace_id[=:\s"]+|traceparent[=:\s"]+00-)([a-fA-F0-9]{16,32})'
-   ```
-3. **Validating Log Ingestion:** Verify Loki is receiving container streams from Grafana Alloy:
-   ```bash
-   curl -s -G "http://localhost:3100/loki/api/v1/query_range" \
-     --data-urlencode 'query={container="vllm-inference"}' --data-urlencode 'limit=5'
-   ```
-4. **Browser Hard Refresh:** If Grafana panels ever show a red `[!]` badge after a datasource or schema update, clear client-side browser caches via `Cmd + Shift + R` (macOS) or `Ctrl + F5` (Windows/Linux).
+| Group | Keys |
+| :--- | :--- |
+| Model | `MODEL_NAME` · `MODEL_REVISION` · `SERVED_MODEL_NAME` |
+| Engine sizing | `MODEL_DTYPE` · `MAX_MODEL_LEN` · `GPU_MEMORY_UTILIZATION` · `GPU_COUNT` (GPUs used; the emptiest are picked) |
+| Auto when empty | `LITELLM_NUM_WORKERS` · `VLLM_CPU_KVCACHE_SPACE` |
+| Boot patience | `VLLM_READY_TIMEOUT` (seconds without engine progress) |
+| Host ports | `VLLM_PORT` · `ROUTER_PORT` · `LITELLM_PORT` · `LANGFUSE_PORT` · `GRAFANA_PORT` · `PROMETHEUS_PORT` · `ALERTMANAGER_PORT` · `LOKI_PORT` · `TEMPO_PORT` · `ALLOY_PORT` · `OTLP_GRPC_PORT` · `OTLP_HTTP_PORT` · `POSTGRES_PORT` · `REDIS_PORT` · `DCGM_PORT` · `NODE_EXPORTER_PORT` |
+| Kept by `run_all.sh` | `MODEL_PLATFORM` · `MODEL_FALLBACK_FROM` |
+| Engine flags | `VLLM_MODEL_ARGS` (configurator-owned) · `VLLM_EXTRA_ARGS` (yours) |
+| Capabilities | `MODEL_SUPPORTS_REASONING` · `_TOOLS` · `_VISION` · `MODEL_REASONING_BY_DEFAULT` · `MODEL_THINKING_EXTRA_BODY` |
+| Quality gates | `EVAL_MIN_ACCURACY` · `EVAL_MAX_TTFT` · `EVAL_MIN_TPS` |
+| Exposure | `BIND_ADDRESS` · `GATEWAY_BIND_ADDRESS` · `UI_BIND_ADDRESS` · `PUBLIC_HOST` · `NEXTAUTH_URL` |
+| Versions | `VLLM_VERSION` · `LITELLM_IMAGE_TAG` · `LANGFUSE_VERSION` · `GRAFANA_IMAGE_TAG` · … |
+| Hugging Face | `HF_TOKEN` · `HF_CACHE_DIR` |
 
 ---
 
-## 12. Repository Taxonomy & File Index
+## 13. Runbooks
+
+### 13.1 TTFT SLO Breach
+
+- **Alert** — `LLMHighTTFTSLOBurnRate*` (`job:vllm_time_to_first_token_seconds_p95 > 1.5 s`).
+- **Queueing?** — `vllm:request_queue_time_seconds` rising → scale out.
+- **Cold prefixes?** — `job:vllm_prefix_cache_hit_percent`, `job:kv_router_affinity_hit_percent`.
+- **Where?** — open the trace in Tempo; compare gateway vs engine span time.
+- **Gateway-bound?** — client TTFT ≫ engine TTFT → gateway CPU saturated: raise `LITELLM_NUM_WORKERS` (2 → 8 took P95 1.8 s → 0.4 s at 64 streams).
+
+### 13.2 KV-Cache Saturation
+
+- **Alert** — `LLMKVCacheSaturationCritical` (`job:vllm_kv_cache_usage_ratio > 0.85`).
+- **Kubernetes** — KEDA scales out above 80 %.
+- **Single host** — lower `MAX_MODEL_LEN` or raise `GPU_MEMORY_UTILIZATION`.
+
+### 13.3 Model Rollout
+
+- **Compose** — `configure_model.py` → `./run_all.sh` (eval gate runs on the candidate).
+- **Kubernetes** — Argo Rollouts canary in `k8s/extras/` with the same SLO queries.
+
+---
+
+## 14. Troubleshooting
+
+| Symptom | Fix |
+| :--- | :--- |
+| `AMD CDI spec not found` | run `bash scripts/bootstrap_host.sh` (registers NVIDIA runtime, restarts Docker) |
+| Engine stuck on `health: starting` | first boot downloads + compiles; `run_all.sh` waits while it progresses (`VLLM_READY_TIMEOUT` = seconds without progress) |
+| First CPU request ≈ 1 min | one-time JIT; `run_all.sh` warms up automatically |
+| `config.json not readable (gated)` | accept the license on huggingface.co, set `HF_TOKEN` (meanwhile the recommended preset is served) |
+| Engine OOM / max-seq-len error | fixed automatically (context `auto`, then a smaller preset) — see *Fixed automatically* |
+| `Driver/library version mismatch` | NVIDIA driver updated without a reboot: reboot (the stack runs on CPU until then) |
+| A port moved (e.g. Grafana on 3002) | another program held the default: free it, set the `*_PORT` back in `.env` |
+| Client TTFT ≫ engine TTFT | gateway CPU-bound: raise `LITELLM_NUM_WORKERS` |
+| Public URL times out | open the port in the **cloud** firewall; check `*_BIND_ADDRESS` |
+| Langfuse login bounces to `localhost` | set `NEXTAUTH_URL=http://<server-ip>:3000`, recreate Langfuse |
+| `.env` deleted | a new one is generated, the Postgres password re-synced and the old team keys retired (they stop working) |
+| `stale file handle` after `git pull` | `docker compose … up -d --force-recreate <service>` |
+
+---
+
+## 15. Repository Layout
 
 ```text
-LLMOps-Production-Platform/
-├── run_all.sh                      # Master bootstrap & runner (1-command hardware detection & 10-point validation)
-├── docker-compose.yml              # Portable multi-service deployment specification (14 services, all 9 planes)
-├── docker-compose.gpu.yml          # Linux CUDA GPU device reservation overlay
-├── docker-compose.langfuse-v3.yml  # Langfuse v3 enterprise overlay (ClickHouse + MinIO S3 + Redis + Postgres)
-├── .env.example                    # Environment secrets template (no hardcoded credentials)
-├── README.md                       # Complete production architecture, runbooks & documentation
-│
-├── config/                         # Unified configuration plane
-│   ├── litellm.yaml                # LiteLLM: Postgres virtual keys, Redis cache, PII guardrails, OTel HTTP exporter
-│   ├── prometheus.yaml             # 15s scrape interval, recording rules & Alertmanager links (9 active targets)
-│   ├── prometheus-rules.yaml       # Recording rules for Golden Signals (TTFT, TPS, KV-Cache %, Queue Backlog)
-│   ├── prometheus-alerts.yaml      # Multi-window SLO burn-rate alerts (TTFT, Errors, Availability, Thermals)
-│   ├── alertmanager.yaml           # Alertmanager routing, receivers & inhibition rules (clean null dispatch)
-│   ├── alloy.config                # Grafana Alloy agent (replaces Promtail: logs, metrics, OTel HTTP/gRPC traces)
-│   ├── loki.yaml                   # Grafana Loki storage & indexing configuration
-│   ├── tempo.yaml                  # Grafana Tempo distributed tracing configuration (single-binary mode)
-│   ├── grafana-datasources.yaml    # Provisioned Prometheus, Loki (ECMAScript derivedFields), Tempo, Alertmanager
-│   ├── grafana-dashboards.yaml     # Provisioned dashboard provider definition
-│   ├── llmops-dashboard.json       # 48-panel production dashboard with SLOs, KV Cache, and Cost rows
-│   └── profiles/                   # Multi-tier hardware serving profiles
-│       ├── apple-silicon-metal.yaml# Apple Silicon Metal profile (vLLM-Metal, MLX zero-copy unified memory)
-│       ├── dev-edge-4gb.yaml       # GTX 1650 4GB dev profile (FP16, 60% VRAM, eager execution)
-│       ├── prod-datacenter-gpu.yaml# L4/A10/A100/H100 prod profile (FP8/AWQ, 90% VRAM, FlashAttention)
-│       └── edge-cpu-llamacpp.yaml  # CPU fallback profile with llama.cpp GGUF quantization
-│
-├── router/                         # Planes 1 & 2: KV-Cache-Aware Routing Layer
-│   ├── kv_router.py                # Asynchronous prefix-hashing KV affinity router
-│   ├── Dockerfile                  # Router container build specification
-│   └── requirements.txt            # Lightweight aiohttp dependencies
-│
-├── engine/                         # Plane 2: Serving Engine & Emulation
-│   ├── mock_vllm.py                # OpenAI-compatible vLLM engine with PagedAttention & exact /metrics
-│   ├── mock_dcgm.py                # Hardware telemetry exporter for Apple Silicon / CPU parity
-│   ├── Dockerfile                  # Inference container build definition
-│   └── Dockerfile.dcgm             # Telemetry container build definition
-│
-├── k8s/                            # Production Kubernetes & KEDA manifests
-│   ├── keda-scaledobject.yaml      # Decoupled KEDA ScaledObject: dual triggers (Queue + KV cache) + stabilization
-│   ├── vllm-deployment.yaml        # GPU inference deployment with prefix caching & OTLP export
-│   ├── litellm-deployment.yaml     # LiteLLM deployment (2 replicas) with Redis rate-limit sync
-│   ├── kv-router-deployment.yaml   # In-cluster KV-aware router deployment & service
-│   ├── prometheus-k8s.yaml         # Kubernetes Prometheus scraper with recording rules
-│   ├── alertmanager-k8s.yaml       # Kubernetes Alertmanager deployment & service
-│   ├── tempo-k8s.yaml              # Kubernetes Tempo distributed tracing deployment
-│   ├── alloy-daemonset.yaml        # Grafana Alloy DaemonSet for Kubernetes (replaces Promtail)
-│   ├── karpenter-nodepool.yaml     # Karpenter GPU NodePool & EC2NodeClass configuration
-│   ├── model-weight-cache-pvc.yaml # Shared ReadWriteMany PVC caching model weights
-│   ├── gateway-inference-ext.yaml  # Kubernetes Gateway API Inference Extension HTTPRoute
-│   ├── argo-rollouts-vllm.yaml     # Argo Rollouts canary promotion with automated SLO metric analysis
-│   └── kind-config.yaml            # Local KinD cluster configuration with GPU enablement
-│
-├── models/                         # Plane 9: Model Lifecycle & Governance
-│   ├── catalog.yaml                # Model registry catalog (pinned commit revisions, quant, hardware targets)
-│   ├── golden_dataset.jsonl        # Evaluation golden test dataset for CI eval gate
-│   └── retention_policy.yaml       # Data governance & prompt/trace retention policy
-│
-├── scripts/                        # Operational verification & automation tooling
-│   ├── detect_hardware.py          # Automated hardware detection (Apple Silicon Metal vs CUDA vs CPU)
-│   ├── serve_metal.py              # Native vLLM-Metal inference server using Apple MLX framework
-│   ├── inference_example.py        # Python & cURL inference client demonstration (sync & streaming SSE)
-│   ├── test_stack.py               # 7-point health check (virtual keys, SSE streaming, Alloy, Tempo, alerts)
-│   ├── load_test.py                # Multi-threaded streaming load tester with TTFT/ITL breakdown & KEDA metrics
-│   ├── manage_keys.py              # CLI for virtual key generation, budget tracking, team provisioning
-│   ├── eval_gate.py                # Model qualification CI evaluation gate (SLO & accuracy verification)
-│   ├── online_eval_judge.py        # Langfuse LLM-as-judge online evaluation worker
-│   ├── deploy_k8s_keda.sh          # Hardened Kubernetes deployment automation script
-│   ├── rotate_master_key.sh        # Secure cryptographic master key rotation utility
-│   └── init-postgres.sh            # PostgreSQL initialization script for LiteLLM DB and Langfuse
-│
-└── .github/workflows/
-    └── model-ci-eval.yaml          # GitHub Actions CI workflow for model evaluation gate on PRs
+LLMOps/
+├── run_all.sh                     # detect · size · boot · self-heal · verify
+├── docker-compose.yml             # base architecture
+├── docker-compose.{gpu,rocm,cpu,metal,mock}.yml   # platform overlays
+├── docker-compose.selinux.yml     # added on SELinux-enforcing hosts
+├── .env.example                   # model block · exposure · versions · secrets
+├── config/
+│   ├── litellm.yaml               # gateway policy
+│   ├── render_litellm_config.py   # gateway routes from the model block
+│   ├── pii_guardrail.py           # PII masking
+│   ├── prometheus*.yaml           # scrape config · rules · alerts
+│   ├── alertmanager.yaml · alloy.config · loki.yaml · tempo.yaml
+│   ├── grafana-*.yaml · llmops-dashboard.json
+│   └── profiles/                  # hardware tier notes
+├── router/kv_router.py            # KV-cache-aware router
+├── engine/                        # mock engine · hardware-exporter stub
+├── docs/images/                   # README screenshots
+├── models/
+│   ├── presets/*.env              # verified model blocks
+│   ├── catalog.yaml               # model registry
+│   ├── golden_dataset.jsonl       # eval probes
+│   └── retention_policy.yaml
+├── k8s/
+│   ├── base/                      # kustomize base
+│   ├── overlays/                  # cuda · cuda-runtimeclass · rocm · cpu
+│   └── extras/                    # Argo Rollouts · Karpenter · Gateway API · Alloy · kind
+└── scripts/
+    ├── bootstrap_host.sh          # GPU host setup
+    ├── configure_model.py         # presets / auto-profile
+    ├── init_env.py                # secrets
+    ├── detect_hardware.py         # platform detection
+    ├── preflight.py               # host ports · sizing for this machine
+    ├── engine_doctor.py           # engine boot failure -> fix
+    ├── deploy_k8s.sh              # Kubernetes deploy
+    ├── llmops_client.py           # shared client
+    ├── test_stack.py · load_test.py · eval_gate.py · online_eval_judge.py
+    ├── manage_keys.py · rotate_master_key.sh · inference_example.py
+    └── serve_metal.py             # Apple Silicon engine
 ```

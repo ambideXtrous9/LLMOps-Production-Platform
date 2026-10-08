@@ -28,3 +28,7 @@ htmlcov/
 
 # Local logs
 *.log
+
+# Local run reports (run_all / benchmark logs)
+reports/
+k8s/base/generated/
