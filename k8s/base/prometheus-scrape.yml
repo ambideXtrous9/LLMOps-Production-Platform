@@ -40,7 +40,7 @@ scrape_configs:
   # Gateway and router run several replicas with per-pod counters: scrape every pod
   # (a Service VIP would hit a random pod per scrape and make counters jump).
   - job_name: "litellm"
-    metrics_path: /metrics/
+    metrics_path: /metrics
     kubernetes_sd_configs:
       - role: endpoints
         namespaces:
@@ -48,6 +48,9 @@ scrape_configs:
     relabel_configs:
       - source_labels: [__meta_kubernetes_service_name]
         regex: litellm
+        action: keep
+      - source_labels: [__meta_kubernetes_endpoint_port_name]
+        regex: metrics
         action: keep
       - source_labels: [__meta_kubernetes_pod_name]
         target_label: pod

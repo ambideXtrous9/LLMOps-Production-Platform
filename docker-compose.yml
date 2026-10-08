@@ -12,9 +12,11 @@
 #   docker-compose.mock.yml   no inference at all: emulated engine for UI / pipeline dev
 #
 # Network exposure: every host port binds to BIND_ADDRESS (default 127.0.0.1) so
-# a cloud VM never exposes Postgres/Redis/vLLM/admin UIs to the internet. Reach
-# the UIs through an SSH tunnel, or set GATEWAY_BIND_ADDRESS=0.0.0.0 to publish
-# only the authenticated LiteLLM gateway.
+# a cloud VM never exposes Postgres/Redis/vLLM/Prometheus to the internet. Only
+# services with their own authentication can be published individually:
+#   GATEWAY_BIND_ADDRESS  LiteLLM gateway + admin UI (virtual keys / master key)
+#   UI_BIND_ADDRESS       Grafana and Langfuse (login required)
+# Everything else is reachable through Grafana or an SSH tunnel.
 # ==============================================================================
 
 # Fixed project name -> deterministic volume names (llmops_postgres_data, ...) on any checkout path.
@@ -115,6 +117,9 @@ services:
       # OTLP/HTTP -> Alloy -> Tempo (LiteLLM infers the otlp_http exporter from the endpoint)
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://alloy:4318
       - OTEL_SERVICE_NAME=litellm-gateway
+      # Unauthenticated metrics for Prometheus on an internal-only port; /metrics on the
+      # (possibly public) gateway port requires a key (require_auth_for_metrics_endpoint).
+      - PROMETHEUS_METRICS_PORT=9095
       # LLM traces -> Langfuse (callback langfuse_otel -> ${LANGFUSE_HOST}/api/public/otel)
       - LANGFUSE_HOST=http://langfuse:3000
       - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-pk-lf-llmops-public-key}
@@ -248,7 +253,7 @@ services:
     image: langfuse/langfuse:${LANGFUSE_VERSION:-4.54.0}
     container_name: langfuse-server
     ports:
-      - "${BIND_ADDRESS:-127.0.0.1}:${LANGFUSE_PORT:-3000}:3000"
+      - "${UI_BIND_ADDRESS:-127.0.0.1}:${LANGFUSE_PORT:-3000}:3000"
     environment:
       <<: *langfuse-env
       NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-sec-nextauth-token-984729104827104928}
@@ -326,12 +331,13 @@ services:
     ports:
       - "${BIND_ADDRESS:-127.0.0.1}:${PROMETHEUS_PORT:-9090}:9090"
     volumes:
-      - ./config/prometheus.yaml:/etc/prometheus/prometheus.yml:ro
-      - ./config/prometheus-rules.yaml:/etc/prometheus/rules/prometheus-rules.yaml:ro
-      - ./config/prometheus-alerts.yaml:/etc/prometheus/rules/prometheus-alerts.yaml:ro
+      # Directory (not single-file) mount: `git pull` / editors replace files with new
+      # inodes, which single-file mounts never see ("stale file handle"). With the
+      # directory mounted, `curl -X POST localhost:9090/-/reload` picks up edits live.
+      - ./config:/etc/prometheus/llmops:ro
       - prometheus_data:/prometheus
     command:
-      - --config.file=/etc/prometheus/prometheus.yml
+      - --config.file=/etc/prometheus/llmops/prometheus.yaml
       - --storage.tsdb.path=/prometheus
       - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-30d}
       - --web.enable-lifecycle
@@ -460,7 +466,7 @@ services:
     image: grafana/grafana:${GRAFANA_IMAGE_TAG:-13.2.3}
     container_name: grafana-dashboard
     ports:
-      - "${BIND_ADDRESS:-127.0.0.1}:${GRAFANA_PORT:-3001}:3000"
+      - "${UI_BIND_ADDRESS:-127.0.0.1}:${GRAFANA_PORT:-3001}:3000"
     volumes:
       - ./config/grafana-datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml:ro
       - ./config/grafana-dashboards.yaml:/etc/grafana/provisioning/dashboards/dashboards.yaml:ro

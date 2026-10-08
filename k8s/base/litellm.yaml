@@ -55,9 +55,14 @@ spec:
               value: http://tempo:4318
             - name: OTEL_SERVICE_NAME
               value: litellm-gateway
+            # Unauthenticated metrics for Prometheus on a separate port (gateway /metrics needs a key)
+            - name: PROMETHEUS_METRICS_PORT
+              value: "9095"
           ports:
             - containerPort: 4000
               name: http
+            - containerPort: 9095
+              name: metrics
           readinessProbe:
             httpGet: {path: /health/liveliness, port: 4000}
             initialDelaySeconds: 20
@@ -87,3 +92,6 @@ spec:
     - name: http
       port: 4000
       targetPort: 4000
+    - name: metrics
+      port: 9095
+      targetPort: 9095

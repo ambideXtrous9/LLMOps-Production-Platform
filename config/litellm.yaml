@@ -41,8 +41,9 @@ guardrails:
       default_on: true
 
 litellm_settings:
-  # Internal Prometheus scraper access within docker network
-  require_auth_for_metrics_endpoint: false
+  # /metrics on the gateway port needs a key (it lists teams, key aliases and spend);
+  # Prometheus scrapes the separate internal metrics port (PROMETHEUS_METRICS_PORT).
+  require_auth_for_metrics_endpoint: true
 
   # Multi-telemetry egress: Prometheus golden signals, OTLP spans via Alloy -> Tempo,
   # and LLM traces (prompts, completions, tokens, cost) to Langfuse over OTLP

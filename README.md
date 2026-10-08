@@ -312,6 +312,7 @@ The same architecture deploys to any conformant cluster from the same `.env`:
 | `config.json not readable (gated ...)` | accept the model license on huggingface.co and set `HF_TOKEN` |
 | Engine OOM / "max seq len" errors | use `MAX_MODEL_LEN=auto` or lower it; lower `GPU_MEMORY_UTILIZATION` if the GPU is shared |
 | Postgres auth errors after deleting `.env` | the data volume keeps the old password: restore `.env` or `docker volume rm llmops_postgres_data` |
+| `stale file handle` / old config after `git pull` | single-file bind mounts pin the replaced file's inode: `docker compose ... up -d --force-recreate <service>` (Prometheus mounts the whole `config/` dir, so `curl -X POST localhost:9090/-/reload` is enough) |
 
 ---
 
