@@ -9,6 +9,9 @@
 # vLLM names). The GGUF build comes from the model block (GGUF_REPO / GGUF_FILE /
 # GGUF_REVISION, pinned) and is downloaded once into HF_CACHE_DIR/gguf.
 #
+# Private / gated repos: engine/llamacpp-start.sh fetches the GGUF files with HF_TOKEN
+# first (llama-server's own URL downloader never sends it), then starts llama-server.
+#
 # Sizing (run_all.sh, from RAM and CPU threads): LLAMACPP_CTX tokens of KV cache
 # shared by LLAMACPP_PARALLEL request slots.
 # No GPU: the hardware exporter stub reports the platform without GPU samples.
@@ -17,8 +20,9 @@
 services:
   vllm:
     image: ghcr.io/ggml-org/llama.cpp:${LLAMACPP_IMAGE_TAG:-server-b10902}
+    entrypoint: ["/bin/sh", "/llmops/llamacpp-start.sh"]
     command: >
-      --model-url https://huggingface.co/${GGUF_REPO:-Qwen/Qwen3-4B-GGUF}/resolve/${GGUF_REVISION:-main}/${GGUF_FILE:-Qwen3-4B-Q4_K_M.gguf}
+      --model-url ${HF_ENDPOINT:-https://huggingface.co}/${GGUF_REPO:-Qwen/Qwen3-4B-GGUF}/resolve/${GGUF_REVISION:-main}/${GGUF_FILE:-Qwen3-4B-Q4_K_M.gguf}
       --model /models/${GGUF_FILE:-Qwen3-4B-Q4_K_M.gguf}
       --alias ${SERVED_MODEL_NAME:-qwen3-4b}
       --ctx-size ${LLAMACPP_CTX:-16384}
@@ -32,6 +36,7 @@ services:
       ${LLAMACPP_EXTRA_ARGS:-}
     volumes:
       - ${HF_CACHE_DIR:-~/.cache/huggingface}/gguf:/models
+      - ./engine/llamacpp-start.sh:/llmops/llamacpp-start.sh:ro
     healthcheck:
       # the llama.cpp image ships curl (no python3)
       test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]

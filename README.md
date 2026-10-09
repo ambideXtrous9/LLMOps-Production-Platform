@@ -72,7 +72,7 @@
 │ 2. INFERENCE PLANE (engine picked per hardware)  │ │ 6. LLM OBSERVABILITY PLANE (Langfuse v4)         │
 │    • GPU: vLLM v0.31 · Apple Silicon: vllm-metal │ │    • Web + Worker (async ingestion queue)        │
 │    • CPU: llama.cpp (GGUF, Q4_K_M)               │ │    • ClickHouse Analytics Store                  │
-│    • Any Hugging Face model (.env model block)   │ │    • MinIO Raw Payload Storage                   │
+│    • Any HF model, public or private (HF_TOKEN)  │ │    • MinIO Raw Payload Storage                   │
 │    • Continuous Batching · Prefix Caching        │ │    • Traces Keyed by Caller's W3C Trace ID       │
 │    • Reasoning & Tool-Call Parsing               │ │    • Online LLM-as-Judge Scores Written Back     │
 │    • Prometheus Metrics · OTLP Traces (vLLM)     │ │    • Prompts, Completions, Tokens & Cost         │
@@ -304,6 +304,7 @@ git clone <repo> && cd LLMOps
 - **Engine** — picked from the detected hardware: vLLM on NVIDIA / AMD GPUs, vllm-metal on Apple Silicon, llama.cpp on CPU (also whenever a run falls back to the CPU).
 - **Secrets** — the first run creates `.env` with fresh keys and passwords; later runs only add new ones.
 - **Model** — the first run picks the preset for the hardware; a platform change re-sizes it.
+- **Private & gated models** — `HF_TOKEN` (or a token from `hf auth login`) is checked with the Hub each run and used by every engine to download private and gated repos; a model the token cannot read falls back to the recommended preset with the exact fix (license page, token scope).
 - **Ports** — a port used by another program moves to the next free one (saved in `.env`).
 - **Sizing** — the engine takes the GPU with the most free memory and sizes itself to it; gateway workers follow CPU threads; CPU KV cache follows RAM.
 - **Engine recovery** — a failed boot gets context `auto`, fp16, a retry, a smaller preset, and finally the CPU; a model dropped because the GPU was shared is retried next run.
@@ -415,7 +416,8 @@ Reads Hub metadata only — no weights downloaded.
 | Context length | `auto` — largest that fits memory |
 | CPU build | a GGUF on the Hub — the repo itself, `<repo>-GGUF`, ggml-org / unsloth / bartowski / lmstudio-community, then search — Q4_K_M preferred, commit-pinned |
 | Quality gates | fixed bar; speed SLOs relaxed on CPU / Metal |
-| Warnings | gated repos (`HF_TOKEN`), weight-memory estimate |
+| Private / gated repos | read with `HF_TOKEN`; without access, the reason and fix (license URL, token account, scope) |
+| Warnings | weight-memory estimate |
 
 ### 5.4 Gateway Aliases
 
@@ -588,6 +590,16 @@ client.chat.completions.create(model="qwen3.5-9b", messages=[{"role": "user", "c
 | Langfuse + Postgres + Redis | LiteLLM | 13/13 · eval 8/8 · judge scores in your Langfuse |
 | Endpoints that hang, reset, send garbage or answer every URL | the affected service | never fatal: bundled, reason reported |
 
+### 10.5 Private & Gated Models (stand-in private Hub + the real Hub, 2026-10-09)
+
+| Case | Result |
+| :--- | :--- |
+| Private GGUF on CPU, token with access — llama.cpp container, compose overlay, rendered k8s pod spec | fetched with the token, served, chat answered |
+| Private repo: no token / token without access / expired token | reason + fix shown; the engine falls back to the recommended preset |
+| Gated repo, license not accepted (`meta-llama/Llama-3.2-1B-Instruct`) | `accept it at https://huggingface.co/…` |
+| Public model with an expired token set | still downloads; the token is reported as rejected |
+| Token scope | sent only to the Hub, only for files it refuses anonymously — never to other hosts |
+
 ---
 
 ## 11. Kubernetes
@@ -642,7 +654,7 @@ All settings live in `.env` (template: `.env.example`).
 | Quality gates | `EVAL_MIN_ACCURACY` · `EVAL_MAX_TTFT` · `EVAL_MIN_TPS` · `EVAL_ENFORCE` |
 | Exposure | `BIND_ADDRESS` · `GATEWAY_BIND_ADDRESS` · `UI_BIND_ADDRESS` · `PUBLIC_HOST` · `NEXTAUTH_URL` |
 | Versions | `VLLM_VERSION` · `LITELLM_IMAGE_TAG` · `LANGFUSE_VERSION` · `GRAFANA_IMAGE_TAG` · … |
-| Hugging Face | `HF_TOKEN` · `HF_CACHE_DIR` |
+| Hugging Face | `HF_TOKEN` (private / gated models; else the shell's or `hf auth login`'s) · `HF_CACHE_DIR` |
 
 ---
 
@@ -676,7 +688,9 @@ All settings live in `.env` (template: `.env.example`).
 | `AMD CDI spec not found` | run `bash scripts/bootstrap_host.sh` (registers NVIDIA runtime, restarts Docker) |
 | Engine stuck on `health: starting` | first boot downloads + compiles; `run_all.sh` waits while it progresses (`VLLM_READY_TIMEOUT` = seconds without progress) |
 | First CPU request ≈ 1 min | one-time JIT; `run_all.sh` warms up automatically |
-| `config.json not readable (gated)` | accept the license on huggingface.co, set `HF_TOKEN` (meanwhile the recommended preset is served) |
+| `<repo> is gated: … accept it at https://huggingface.co/<repo>` | accept the license with the account of `HF_TOKEN` (fine-grained tokens: allow reading gated repos); meanwhile the recommended preset is served |
+| `not found on the Hub, or private` | check the repo id; for a private repo set `HF_TOKEN` to a token of an account that can read it |
+| `HF_TOKEN was rejected by the Hub` | the token expired or was revoked: create one at huggingface.co/settings/tokens (public models keep working) |
 | Engine OOM / max-seq-len error | fixed automatically (context `auto`, then a smaller preset) — see *Fixed automatically* |
 | `Driver/library version mismatch` | NVIDIA driver updated without a reboot: reboot (the stack runs on CPU until then) |
 | A port moved (e.g. Grafana on 3002) | another program held the default: free it, set the `*_PORT` back in `.env` |
@@ -710,7 +724,7 @@ LLMOps/
 │   ├── grafana-*.yaml · llmops-dashboard.json
 │   └── profiles/                  # hardware tier notes
 ├── router/kv_router.py            # KV-cache-aware router
-├── engine/                        # mock engine · hardware-exporter stub
+├── engine/                        # mock engine · hardware-exporter stub · llama.cpp launcher
 ├── docs/images/                   # README screenshots
 ├── models/
 │   ├── presets/*.env              # verified model blocks

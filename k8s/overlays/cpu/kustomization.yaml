@@ -2,11 +2,18 @@
 # Same engine contract as vLLM - Service vllm:8000, OpenAI API, /health, /metrics - so
 # router, gateway, Prometheus rules and KEDA are unchanged. The pinned GGUF build comes
 # from the model block (GGUF_REPO / GGUF_FILE / GGUF_REVISION in the llmops-model
-# ConfigMap) and is cached on the model PVC under gguf/ (mounted at /models).
+# ConfigMap) and is cached on the model PVC under gguf/ (mounted at /models). Private /
+# gated repos: engine/llamacpp-start.sh fetches the files with HF_TOKEN first.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
   - ../../base
+configMapGenerator:
+  - name: llamacpp-start
+    files:
+      - llamacpp-start.sh=../../../engine/llamacpp-start.sh
+    options:
+      disableNameSuffixHash: true  # referenced by the volume patch below
 images:
   - name: vllm/vllm-openai
     newName: ghcr.io/ggml-org/llama.cpp
@@ -18,8 +25,8 @@ patches:
         path: /spec/template/spec/containers/0/args
         value:
           - >-
-            exec /app/llama-server
-            --model-url "https://huggingface.co/$GGUF_REPO/resolve/$GGUF_REVISION/$GGUF_FILE"
+            exec /bin/sh /llmops/llamacpp-start.sh
+            --model-url "${HF_ENDPOINT:-https://huggingface.co}/$GGUF_REPO/resolve/$GGUF_REVISION/$GGUF_FILE"
             --model "/models/$GGUF_FILE"
             --alias "$SERVED_MODEL_NAME"
             --ctx-size "${LLAMACPP_CTX:-16384}"
@@ -32,6 +39,12 @@ patches:
       - op: add
         path: /spec/template/spec/containers/0/volumeMounts/-
         value: {name: model-cache, mountPath: /models, subPath: gguf}
+      - op: add
+        path: /spec/template/spec/containers/0/volumeMounts/-
+        value: {name: llamacpp-start, mountPath: /llmops, readOnly: true}
+      - op: add
+        path: /spec/template/spec/volumes/-
+        value: {name: llamacpp-start, configMap: {name: llamacpp-start}}
       - op: add
         path: /spec/template/spec/containers/0/resources
         value:

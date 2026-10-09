@@ -33,7 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from init_env import ENV_PATH, ROOT_DIR, ensure_env, quote  # noqa: E402
 
 PRESET_DIR = os.path.join(ROOT_DIR, "models", "presets")
-HF = "https://huggingface.co"
+HF = (os.getenv("HF_ENDPOINT") or "https://huggingface.co").rstrip("/")  # the Hub (or a mirror)
 
 # Keys owned by this tool; VLLM_EXTRA_ARGS stays user-owned and is never touched.
 MODEL_KEYS = [
@@ -114,6 +114,52 @@ def load_preset(name: str) -> Dict[str, str]:
 
 
 # ------------------------------------------------------------------------------
+# Hugging Face access (private and gated repos need a token)
+# ------------------------------------------------------------------------------
+def hf_token() -> Optional[str]:
+    """HF_TOKEN (environment, then .env; HUGGING_FACE_HUB_TOKEN also accepted), else the
+    token `hf auth login` saved."""
+    env = parse_env_file(ENV_PATH) if os.path.exists(ENV_PATH) else {}
+    for key in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+        value = (os.getenv(key) or env.get(key) or "").strip()
+        if value:
+            return value
+    try:
+        with open(os.path.join(os.getenv("HF_HOME") or os.path.expanduser("~/.cache/huggingface"), "token")) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def hub_account(token: str) -> Tuple[str, Optional[str]]:
+    """("accepted", account name) | ("rejected", None) | ("unchecked", None): the Hub's verdict on a token."""
+    req = urllib.request.Request(f"{HF}/api/whoami-v2", headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return "accepted", json.loads(resp.read().decode("utf-8")).get("name") or "?"
+    except urllib.error.HTTPError as e:
+        return ("rejected" if e.code in (401, 403) else "unchecked"), None
+    except (urllib.error.URLError, OSError, ValueError):
+        return "unchecked", None
+
+
+def access_fix(repo: str, token: Optional[str], gated: object) -> str:
+    """Why `repo` cannot be read with this token, and what fixes it."""
+    license_url = f"{HF}/{repo}"
+    if not token:
+        return f"accept its license at {license_url}, then set HF_TOKEN in .env" if gated \
+            else "set HF_TOKEN in .env to a token that can read it"
+    status, account = hub_account(token)
+    if status == "rejected":
+        return f"HF_TOKEN was rejected by the Hub (expired or revoked?): create one at {HF}/settings/tokens"
+    who = f"account '{account}'" if account else "the HF_TOKEN account"
+    if gated:
+        return f"{who} has not accepted its license yet: accept it at {license_url} " \
+               "(a fine-grained token also needs read access to gated repos)"
+    return f"not visible to {who} (HF_TOKEN)"
+
+
+# ------------------------------------------------------------------------------
 # Hugging Face auto-profiling
 # ------------------------------------------------------------------------------
 def hub_get(path: str, token: Optional[str]) -> Optional[str]:
@@ -173,14 +219,15 @@ def pick_parsers(model_type: str, repo: str, template: str) -> Tuple[Optional[st
 def profile_hf_model(repo: str, revision: str, token: Optional[str]) -> Tuple[Dict[str, str], Dict[str, object]]:
     info_raw = hub_get(f"api/models/{repo}", token)
     if info_raw is None:
-        sys.exit(f"✗ {repo}: not found on the Hub (or private / gated without a valid HF_TOKEN).")
+        sys.exit(f"✗ {repo}: not found on the Hub, or private - {access_fix(repo, token, False)}.")
     info = json.loads(info_raw)
     sha = info.get("sha") if revision == "main" else revision
     cfg_raw = hub_get(f"{repo}/resolve/{revision}/config.json", token)
     if cfg_raw is None:
-        gated = info.get("gated")
-        hint = " (gated: accept the license on huggingface.co and set HF_TOKEN in .env)" if gated else ""
-        sys.exit(f"✗ {repo}: config.json not readable{hint}.")
+        if info.get("gated") or info.get("private"):
+            sys.exit(f"✗ {repo} is {'gated' if info.get('gated') else 'private'}: "
+                     f"{access_fix(repo, token, info.get('gated'))}.")
+        sys.exit(f"✗ {repo}: config.json not readable (not a Transformers model repo?).")
     cfg = json.loads(cfg_raw)
     text_cfg = cfg.get("text_config") or {}
 
@@ -233,6 +280,7 @@ def profile_hf_model(repo: str, revision: str, token: Optional[str]) -> Tuple[Di
     facts = {
         "model_type": model_type, "params_b": round(params / 1e9, 2), "quantization": quant or "none",
         "weights_gb": round(params * bytes_per_param / 1e9, 1), "vision": vision, "gated": info.get("gated"),
+        "private": info.get("private"),
         "max_position_embeddings": cfg.get("max_position_embeddings") or text_cfg.get("max_position_embeddings"),
         "reasoning_parser": reasoning_parser, "tool_parser": tool_parser,
         "thinking_toggle": "enable_thinking" in template, "info": info,
@@ -296,7 +344,25 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="print the model block without writing .env")
     parser.add_argument("--check-preset", action="store_true",
                         help="exit 1 and print the preset to re-apply when .env's model block no longer matches it")
+    parser.add_argument("--check-token", action="store_true",
+                        help="check the Hugging Face token: exit 0 accepted, 1 none, 2 rejected, 3 Hub unreachable")
     args = parser.parse_args()
+
+    if args.check_token:
+        token = hf_token()
+        if not token:
+            print("• Hugging Face token: none - public models only (HF_TOKEN in .env adds private and gated ones)")
+            return 1
+        status, account = hub_account(token)
+        if status == "accepted":
+            print(f"✓ Hugging Face token accepted (account '{account}'): private and gated models can be downloaded")
+            return 0
+        if status == "rejected":
+            print("⚠ HF_TOKEN was rejected by the Hub (expired or revoked?): only public models can be downloaded - "
+                  f"create a new token at {HF}/settings/tokens")
+            return 2
+        print("• Hugging Face Hub unreachable: HF_TOKEN not checked")
+        return 3
 
     presets = list_presets()
     if args.check_preset:
@@ -320,16 +386,14 @@ def main() -> int:
     if args.model in presets:
         block, facts = load_preset(args.model), {}
     elif "/" in args.model:
-        token = os.getenv("HF_TOKEN") or (parse_env_file(ENV_PATH).get("HF_TOKEN") if os.path.exists(ENV_PATH) else None)
-        block, facts = profile_hf_model(args.model, args.revision, token or None)
+        block, facts = profile_hf_model(args.model, args.revision, hf_token())
     else:
         print(f"✗ '{args.model}' is neither a preset ({', '.join(presets)}) nor a Hugging Face repo id (org/name).")
         return 1
 
     if facts and args.platform == "cpu":
         # CPU engine = llama.cpp: needs a GGUF build of the model
-        token = os.getenv("HF_TOKEN") or (parse_env_file(ENV_PATH).get("HF_TOKEN") if os.path.exists(ENV_PATH) else None)
-        gguf = find_gguf(block["MODEL_NAME"], facts["info"], token or None)
+        gguf = find_gguf(block["MODEL_NAME"], facts["info"], hf_token())
         if not gguf:
             print(f"✗ {block['MODEL_NAME']}: no GGUF build found on the Hub (CPU inference runs on llama.cpp).")
             return 1
@@ -367,8 +431,8 @@ def main() -> int:
               f"~{facts['weights_gb']} GB weights | vision={facts['vision']} | "
               f"reasoning={facts['reasoning_parser']} | tools={facts['tool_parser']}"
               + (f" | GGUF {facts['gguf']}" if facts.get("gguf") else ""))
-        if facts.get("gated"):
-            print("  ⚠ Gated repo: the engine needs HF_TOKEN in .env (license accepted on huggingface.co).")
+        if facts.get("gated") or facts.get("private"):
+            print(f"  • {'Gated' if facts.get('gated') else 'Private'} repo: the engine downloads it with HF_TOKEN.")
     for key in MODEL_KEYS:
         print(f"  {key}={quote(block[key])}")
     if args.dry_run:

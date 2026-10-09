@@ -45,9 +45,10 @@ echo "[2/6] Generating ConfigMap / Secret inputs from .env..."
 python3 - <<'PY'
 import os, sys
 sys.path.insert(0, "scripts")
-from configure_model import DEFAULTS, MODEL_KEYS, parse_env_file
+from configure_model import DEFAULTS, MODEL_KEYS, hf_token, parse_env_file
 
 env = {**DEFAULTS, **{k: v for k, v in parse_env_file(".env").items() if v != ""}}
+env["HF_TOKEN"] = hf_token() or ""  # .env, else the environment or `hf auth login`
 model_keys = MODEL_KEYS + ["VLLM_EXTRA_ARGS", "LLAMACPP_EXTRA_ARGS", "LLAMACPP_CTX", "LLAMACPP_PARALLEL"]
 secret_keys = ["LITELLM_MASTER_KEY", "POSTGRES_USER", "POSTGRES_PASSWORD", "REDIS_PASSWORD", "HF_TOKEN"]
 os.makedirs("k8s/base/generated", exist_ok=True)
