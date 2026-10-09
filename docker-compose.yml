@@ -40,6 +40,7 @@ services:
       - vllm_triton_cache:/root/.triton
     environment:
       - HF_TOKEN=${HF_TOKEN:-}
+      - HF_ENDPOINT=${HF_ENDPOINT:-https://huggingface.co}
       - HF_HUB_ENABLE_HF_TRANSFER=0
       - OTEL_SERVICE_NAME=vllm-engine
       - SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-qwen3.5-9b}

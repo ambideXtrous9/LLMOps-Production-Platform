@@ -188,6 +188,7 @@ running_platform() {
 
 # load_env: .env, then this run's host ports and sizing on top of it
 load_env() {
+    local shell_hf_token="${HF_TOKEN:-}"
     set -a
     # shellcheck disable=SC1091
     source "$ROOT_DIR/.env"
@@ -196,6 +197,13 @@ load_env() {
     if [ -n "$FIT_EXPORTS" ]; then eval "$FIT_EXPORTS"; fi
     if [ -n "$EXT_EXPORTS" ]; then eval "$EXT_EXPORTS"; fi
     if [ -n "${SELFHOST_SERVICES+x}" ]; then read -r -a SELFHOST <<< "$SELFHOST_SERVICES"; fi
+    # Hugging Face token for private / gated models: HF_TOKEN in .env, else one exported in
+    # the shell, HUGGING_FACE_HUB_TOKEN, or the token `hf auth login` saved
+    HF_TOKEN="${HF_TOKEN:-${shell_hf_token:-${HUGGING_FACE_HUB_TOKEN:-}}}"
+    if [ -z "$HF_TOKEN" ] && [ -s "${HF_HOME:-$HOME/.cache/huggingface}/token" ]; then
+        HF_TOKEN="$(tr -d '[:space:]' < "${HF_HOME:-$HOME/.cache/huggingface}/token")"
+    fi
+    export HF_TOKEN
     export LLMOPS_PLATFORM="$TARGET_BACKEND"
     # Apple Silicon: scripts reach the native engine directly
     if [ "$TARGET_BACKEND" = "metal" ]; then export VLLM_PORT="${METAL_ENGINE_PORT:-8000}"; fi
@@ -674,6 +682,14 @@ else
     else
         decide_model
     fi
+fi
+# Hugging Face token (private / gated models): what the Hub says about it. Never fatal.
+if [ "$TEST_ONLY" != true ] && [ "$TARGET_BACKEND" != "mock" ]; then
+    load_env
+    HF_STATUS=0
+    HF_LINE="$(python3 scripts/configure_model.py --check-token 2>/dev/null)" || HF_STATUS=$?
+    if [ -n "$HF_LINE" ]; then echo -e "  ${HF_LINE}"; fi
+    if [ "$HF_STATUS" -eq 2 ]; then ADVISORIES+=("${HF_LINE#⚠ }"); fi
 fi
 if [ -n "$MODEL_ARG" ]; then
     echo -e "  • Configuring served model: ${BOLD}${MODEL_ARG}${NC}"

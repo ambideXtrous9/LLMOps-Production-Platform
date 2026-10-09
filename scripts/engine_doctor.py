@@ -42,7 +42,7 @@ RULES = [
                r"|Cannot allocate memory|std::bad_alloc|Failed core proc\(s\): \{[^}]*-9\}"
                r"|failed to allocate|unable to allocate|insufficient memory"),
     ("access", r"GatedRepoError|Cannot access gated repo|is restricted\. You must|401 Client Error|RepositoryNotFoundError"
-               r"|Repository Not Found|Invalid credentials|failed with status (401|403|404)"),
+               r"|Repository Not Found|Invalid credentials|failed with status (code: )?(401|403|404)"),
     ("unsupported", r"are not supported for now|Unrecognized model in|trust_remote_code=True|Model architectures .* not supported"
                     r"|unknown model architecture"),
     ("network", r"Temporary failure in name resolution|Name or service not known|Max retries exceeded|ConnectionError"
@@ -143,12 +143,14 @@ def decide(env: Dict[str, str], text: str, oom_killed: bool, platform_name: str 
     why = {
         "memory": f"{model} does not fit this machine's memory",
         "disk": f"not enough disk space for the {model} weights",
-        "access": f"{model} is gated or private (accept its license and set HF_TOKEN in .env)",
+        "access": f"{model} is private or gated and HF_TOKEN cannot read it (gated: accept its license on huggingface.co)"
+                  if env.get("HF_TOKEN") else f"{model} is private or gated (set HF_TOKEN in .env to a token that can read it)",
         "unsupported": f"{model} is not supported by this {'llama.cpp' if platform_name == 'cpu' else 'vLLM'} release",
     }.get(kind or "", f"{model} failed to start twice")
     nxt = fallback_model(env)
     if nxt:
-        return {"DOCTOR_ACTION": "model", "DOCTOR_MODEL": nxt, "DOCTOR_REASON": f"{why}: falling back to preset {nxt}"}
+        retry = f"; once fixed: ./run_all.sh --model {model}" if kind == "access" else ""
+        return {"DOCTOR_ACTION": "model", "DOCTOR_MODEL": nxt, "DOCTOR_REASON": f"{why}: falling back to preset {nxt}{retry}"}
     if on_gpu and kind not in ("access", "disk"):
         return {"DOCTOR_ACTION": "cpu", "DOCTOR_REASON": f"{why}, even the smallest preset: running the engine on CPU"}
     return {"DOCTOR_ACTION": "fail", "DOCTOR_REASON": f"{why}, and no smaller verified preset is left"}
