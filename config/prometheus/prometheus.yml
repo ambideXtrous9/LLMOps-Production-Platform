@@ -1,0 +1,33 @@
+# ==============================================================================
+# Prometheus: scrape jobs + alert rules (alerts are listed in Grafana)
+# ==============================================================================
+# The engine and GPU jobs depend on the hardware: each compose overlay mounts its
+# job file into /etc/prometheus/scrape.d (config/prometheus/scrape/*.yml).
+# Reload after edits: curl -X POST localhost:9090/-/reload
+# ==============================================================================
+
+global:
+  scrape_interval: 10s
+  evaluation_interval: 15s
+  scrape_timeout: 8s
+
+rule_files:
+  - /etc/prometheus/llmops/alerts.yml
+
+scrape_config_files:
+  - /etc/prometheus/scrape.d/*.yml
+
+scrape_configs:
+  # LiteLLM gateway (internal metrics port, PROMETHEUS_METRICS_PORT)
+  - job_name: litellm
+    static_configs:
+      - targets: ["litellm:9095"]
+
+  # Host CPU, memory, disk, network
+  - job_name: node
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

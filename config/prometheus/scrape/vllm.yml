@@ -1,0 +1,7 @@
+# vLLM OpenAI server: API and metrics on one port (compose/vllm.yml)
+scrape_configs:
+  - job_name: engine
+    static_configs:
+      - targets: ["engine:8000"]
+        labels:
+          engine: vllm

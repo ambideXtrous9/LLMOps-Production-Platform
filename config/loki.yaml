@@ -1,8 +1,10 @@
+# Loki: single-process log store for the stack's container logs (shipped by Alloy)
 auth_enabled: false
 
 server:
   http_listen_port: 3100
   grpc_listen_port: 9096
+  log_level: warn
 
 common:
   path_prefix: /tmp/loki
@@ -18,7 +20,7 @@ common:
 
 schema_config:
   configs:
-    - from: 2020-10-24
+    - from: 2024-01-01
       store: tsdb
       object_store: filesystem
       schema: v13
@@ -26,8 +28,13 @@ schema_config:
         prefix: index_
         period: 24h
 
-ruler:
-  alertmanager_url: http://localhost:9093
+limits_config:
+  retention_period: 168h
+
+compactor:
+  working_directory: /tmp/loki/compactor
+  retention_enabled: true
+  delete_request_store: filesystem
 
 analytics:
   reporting_enabled: false

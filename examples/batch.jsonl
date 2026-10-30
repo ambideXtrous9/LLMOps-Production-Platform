@@ -1,0 +1,8 @@
+{"custom_id": "q1", "method": "POST", "url": "/v1/chat/completions", "body": {"messages": [{"role": "user", "content": "What is a KV cache in LLM inference? One sentence."}], "max_tokens": 128}}
+{"custom_id": "q2", "method": "POST", "url": "/v1/chat/completions", "body": {"messages": [{"role": "user", "content": "Explain continuous batching in one sentence."}], "max_tokens": 128}}
+{"custom_id": "q3", "method": "POST", "url": "/v1/chat/completions", "body": {"messages": [{"role": "user", "content": "Why does prefix caching reduce time to first token? One sentence."}], "max_tokens": 128}}
+{"custom_id": "q4", "method": "POST", "url": "/v1/chat/completions", "body": {"messages": [{"role": "user", "content": "Give one tip to lower LLM serving latency."}], "max_tokens": 128}}
+{"custom_id": "q5", "method": "POST", "url": "/v1/chat/completions", "body": {"messages": [{"role": "user", "content": "What does an LLM gateway such as LiteLLM add in front of a model server? One sentence."}], "max_tokens": 128}}
+{"custom_id": "q6", "method": "POST", "url": "/v1/chat/completions", "body": {"messages": [{"role": "user", "content": "Translate 'good morning' to French, German and Spanish."}], "max_tokens": 128}}
+{"custom_id": "q7", "method": "POST", "url": "/v1/chat/completions", "body": {"messages": [{"role": "user", "content": "Write a haiku about GPUs."}], "max_tokens": 128}}
+{"custom_id": "q8", "method": "POST", "url": "/v1/chat/completions", "body": {"messages": [{"role": "user", "content": "What is 17 * 23? Answer with the number only."}], "max_tokens": 128}}

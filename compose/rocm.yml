@@ -1,0 +1,17 @@
+# ==============================================================================
+# AMD GPUs (ROCm): device access for the vLLM engine (compose/vllm.yml)
+# ==============================================================================
+# Host needs the amdgpu kernel driver (/dev/kfd and /dev/dri present).
+# ==============================================================================
+
+services:
+  engine:
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp=unconfined

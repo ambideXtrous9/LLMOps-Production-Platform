@@ -1,179 +1,70 @@
 #!/usr/bin/env python3
-"""
-scripts/load_test.py
-Production Load Simulator & Saturation Stress Tester.
+"""Streaming load test through the gateway: latency and throughput under concurrency.
 
-Features:
-  - Concurrent multi-process streaming traffic through the full path
-    (LiteLLM gateway -> KV-cache-aware router -> vLLM), Redis response cache bypassed
-  - Per request: Time-To-First-Token (TTFT), end-to-end latency, decode tokens/s
-    (token counts come from the engine's usage report, not chunk counting)
-  - Continuous engine telemetry sampling during the burst:
-      * running / waiting requests (queue backlog)
-      * KV-cache utilisation (vllm:kv_cache_usage_perc)
-      * KEDA ScaledObject trigger evaluation (backlog > 4/replica or KV > 80%)
-  - Per-team virtual key attribution (never the master key)
+Every request shares a long system prompt (so the engine's prefix cache is exercised)
+and asks a different question (so the gateway's response cache is not). Results show up
+on the Grafana dashboard while it runs.
 
-Env: CONCURRENCY (default 32), REQUESTS (default = CONCURRENCY), MAX_TOKENS (default 256)
+  python3 scripts/load_test.py --concurrency 16 --requests 64
 """
 
 import argparse
-import concurrent.futures
-import json
-import multiprocessing
+import asyncio
 import os
 import sys
-import threading
 import time
-import urllib.request
-from typing import Dict, List
 
-from llmops_client import GATEWAY_MODEL, NO_CACHE, VIRTUAL_KEY, ChatResult, chat, local_url
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from llm_client import API_KEY, GATEWAY_URL, percentile, served_model, stream_chat  # noqa: E402
 
-VLLM_METRICS_URL = os.getenv("VLLM_METRICS_URL", local_url("VLLM_PORT", 8000) + "/metrics")
-CONCURRENT_REQUESTS = int(os.getenv("CONCURRENCY", "32"))
-TOTAL_REQUESTS = int(os.getenv("REQUESTS", str(CONCURRENT_REQUESTS)))
-TOKENS_TO_GENERATE = int(os.getenv("MAX_TOKENS", "256"))
-
-PROMPTS = [
-    "Explain how PagedAttention solves physical memory fragmentation in continuous batching.",
-    "Describe how a KV-cache-aware router routes requests based on prompt prefix affinity.",
-    "Why is inference queue depth combined with KV-cache usage superior to CPU for autoscaling?",
-    "Detail how OpenTelemetry W3C traceparent headers propagate from gateway down to CUDA execution.",
-    "How does Grafana Alloy collect container logs and OpenTelemetry traces?",
-]
+SYSTEM = ("You are a concise assistant for an engineering team. Answer in two or three sentences, "
+          "plainly, without lists or headings. ") * 8
+TOPICS = ["KV caching", "continuous batching", "prefix caching", "tensor parallelism", "quantization",
+          "speculative decoding", "paged attention", "load balancing", "rate limiting", "observability"]
 
 
-def send_streaming_request(req_id: int) -> ChatResult:
-    res = chat(
-        [
-            {"role": "system", "content": "You are a concise production systems assistant."},
-            {"role": "user", "content": PROMPTS[req_id % len(PROMPTS)]},
-        ],
-        max_tokens=TOKENS_TO_GENERATE,
-        temperature=0.7,
-        extra=NO_CACHE,
-        headers={"traceparent": f"00-{os.urandom(16).hex()}-{os.urandom(8).hex()}-01"},
-        timeout=300,
-    )
-    if res.ok:
-        print(f"  [Req {req_id:03d}] ✓ TTFT: {res.ttft or 0:5.3f}s | Total: {res.total:5.2f}s | "
-              f"{res.completion_tokens:4d} tok ({res.tps:5.1f} tok/s)")
-    else:
-        print(f"  [Req {req_id:03d}] ✗ HTTP {res.status} after {res.total:5.2f}s: {res.error[:120]}")
-    return res
+async def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--concurrency", type=int, default=16)
+    p.add_argument("--requests", type=int, default=64)
+    p.add_argument("--max-tokens", type=int, default=128)
+    p.add_argument("--url", default=GATEWAY_URL)
+    p.add_argument("--key", default=API_KEY)
+    p.add_argument("--model")
+    args = p.parse_args()
 
+    model = args.model or await served_model(args.url, args.key)
+    url = args.url.rstrip("/") + "/v1/chat/completions"
+    sem = asyncio.Semaphore(args.concurrency)
+    print(f"{args.requests} streaming requests, {args.concurrency} at a time -> {url} ({model})")
 
-# llama.cpp (CPU engine) equivalents of the vLLM gauges
-LLAMACPP_GAUGES = {"llamacpp:requests_processing": "vllm:num_requests_running",
-                   "llamacpp:requests_deferred": "vllm:num_requests_waiting"}
+    async def one(i: int):
+        async with sem:
+            return await stream_chat(url, {
+                "model": model, "max_tokens": args.max_tokens, "temperature": 0.7,
+                "cache": {"no-cache": True},
+                "messages": [{"role": "system", "content": SYSTEM},
+                             {"role": "user", "content": f"Request {i}: explain {TOPICS[i % len(TOPICS)]} "
+                                                         f"for an LLM server."}]}, key=args.key)
 
+    start = time.perf_counter()
+    results = await asyncio.gather(*(one(i) for i in range(args.requests)))
+    wall = time.perf_counter() - start
+    good = [r for r in results if r.ok]
+    tokens = sum(r.completion_tokens for r in good)
+    ttft = [r.ttft for r in good]
+    total = [r.total for r in good]
+    decode = [(r.completion_tokens - 1) / (r.total - r.ttft) for r in good if r.completion_tokens > 1 and r.total > r.ttft]
 
-def scrape_engine() -> Dict[str, float]:
-    """Sums the engine gauges we care about (labels vary by vLLM version). llama.cpp has no
-    KV-cache gauge: its load is busy / total request slots from /slots."""
-    wanted = {"vllm:num_requests_running": 0.0, "vllm:num_requests_waiting": 0.0, "vllm:kv_cache_usage_perc": 0.0}
-    llamacpp = False
-    try:
-        with urllib.request.urlopen(VLLM_METRICS_URL, timeout=3) as resp:
-            for line in resp.read().decode("utf-8").splitlines():
-                name = line.split("{", 1)[0].split(" ", 1)[0]
-                llamacpp = llamacpp or name.startswith("llamacpp:")
-                name = LLAMACPP_GAUGES.get(name, name)
-                if name in wanted and not line.startswith("#"):
-                    wanted[name] += float(line.rsplit(" ", 1)[-1])
-        if llamacpp:
-            with urllib.request.urlopen(VLLM_METRICS_URL.rsplit("/metrics", 1)[0] + "/slots", timeout=3) as resp:
-                slots = json.loads(resp.read().decode("utf-8"))
-            wanted["vllm:kv_cache_usage_perc"] = sum(1 for s in slots if s.get("is_processing")) / max(len(slots), 1)
-    except Exception:
-        pass
-    return wanted
-
-
-class TelemetrySampler(threading.Thread):
-    def __init__(self) -> None:
-        super().__init__(daemon=True)
-        self.stop_event = threading.Event()
-        self.peak = {"running": 0.0, "waiting": 0.0, "kv": 0.0}
-
-    def run(self) -> None:
-        while not self.stop_event.is_set():
-            m = scrape_engine()
-            self.peak["running"] = max(self.peak["running"], m["vllm:num_requests_running"])
-            self.peak["waiting"] = max(self.peak["waiting"], m["vllm:num_requests_waiting"])
-            self.peak["kv"] = max(self.peak["kv"], m["vllm:kv_cache_usage_perc"])
-            self.stop_event.wait(0.5)
-
-
-def percentile(data: List[float], p: float) -> float:
-    if not data:
-        return 0.0
-    data = sorted(data)
-    k = (len(data) - 1) * p
-    f = int(k)
-    c = min(f + 1, len(data) - 1)
-    return data[f] + (k - f) * (data[c] - data[f])
-
-
-def main() -> int:
-    print("=" * 72)
-    print(f"  LLMOps STRESS & SATURATION TEST: {TOTAL_REQUESTS} STREAMING REQS @ CONCURRENCY {CONCURRENT_REQUESTS}")
-    print(f"  Path        : LiteLLM (:4000) -> KV Router (:8001) -> vLLM (:8000) | model '{GATEWAY_MODEL}'")
-    print(f"  Auth        : Team Virtual Key ({VIRTUAL_KEY[:12]}...) | response cache bypassed")
-    print(f"  Max tokens  : {TOKENS_TO_GENERATE}")
-    print("=" * 72)
-
-    sampler = TelemetrySampler()
-    sampler.start()
-    start_all = time.time()
-    # Worker processes, not threads: with dozens of SSE streams parsed in one interpreter,
-    # GIL contention inflates client-side TTFT several-fold versus what the server delivers
-    # (64 streams: ~1.3s with threads vs ~0.3s measured by `vllm bench serve`).
-    # "spawn": forking while the telemetry thread holds a lock deadlocks the children.
-    with concurrent.futures.ProcessPoolExecutor(
-        max_workers=CONCURRENT_REQUESTS, mp_context=multiprocessing.get_context("spawn")
-    ) as executor:
-        results = list(executor.map(send_streaming_request, range(1, TOTAL_REQUESTS + 1)))
-    wall = time.time() - start_all
-    sampler.stop_event.set()
-    sampler.join(timeout=2)
-
-    ok = [r for r in results if r.ok]
-    ttfts = [r.ttft or r.total for r in ok]
-    latencies = [r.total for r in ok]
-    tokens = sum(r.completion_tokens for r in ok)
-    peak = sampler.peak
-    keda = "🚨 BREACHED (backlog > 4/replica or KV > 80%)" if (peak["waiting"] > 4 or peak["kv"] > 0.80) else "NORMAL"
-
-    print("\n" + "=" * 72)
-    print("  PRODUCTION BENCHMARK SUMMARY & LATENCY DISTRIBUTION:")
-    print("=" * 72)
-    print(f"  • Total Duration          : {wall:.2f}s")
-    print(f"  • Success Rate            : {len(ok)}/{TOTAL_REQUESTS} ({len(ok) / TOTAL_REQUESTS * 100:.1f}%)")
-    print(f"  • Total Tokens Generated  : {tokens} tokens")
-    print(f"  • Cluster Throughput      : {tokens / wall:.1f} tokens/second")
-    print(f"  • Mean Per-Stream Decode  : {sum(r.tps for r in ok) / max(len(ok), 1):.1f} tokens/second")
-    print("-" * 72)
-    print("  TIME-TO-FIRST-TOKEN (TTFT) DISTRIBUTION:")
-    print(f"  • TTFT P50 (Median)       : {percentile(ttfts, 0.50):.3f}s")
-    print(f"  • TTFT P90                : {percentile(ttfts, 0.90):.3f}s")
-    print(f"  • TTFT P95 (SLO Target)   : {percentile(ttfts, 0.95):.3f}s (SLO: <=1.500s)")
-    print(f"  • TTFT P99                : {percentile(ttfts, 0.99):.3f}s")
-    print("-" * 72)
-    print("  END-TO-END LATENCY DISTRIBUTION:")
-    print(f"  • Latency P50             : {percentile(latencies, 0.50):.2f}s")
-    print(f"  • Latency P95             : {percentile(latencies, 0.95):.2f}s")
-    print(f"  • Latency P99             : {percentile(latencies, 0.99):.2f}s")
-    print("-" * 72)
-    print("  ENGINE SATURATION (peak during burst):")
-    print(f"  • Running / Waiting       : {peak['running']:.0f} / {peak['waiting']:.0f}")
-    print(f"  • KV-Cache Utilisation    : {peak['kv'] * 100:.1f}%")
-    print(f"  • KEDA Trigger State      : {keda}")
-    print("=" * 72)
-    return 0 if len(ok) == TOTAL_REQUESTS else 1
+    print(f"\n  succeeded         {len(good)}/{len(results)}")
+    print(f"  TTFT  p50 / p95   {percentile(ttft, 0.5):.3f}s / {percentile(ttft, 0.95):.3f}s")
+    print(f"  total p50 / p95   {percentile(total, 0.5):.2f}s / {percentile(total, 0.95):.2f}s")
+    print(f"  per-stream speed  {percentile(decode, 0.5):.1f} tokens/s (median)")
+    print(f"  throughput        {tokens / wall:.1f} output tokens/s, {len(good) / wall:.2f} requests/s ({wall:.1f}s)")
+    for r in [r for r in results if not r.ok][:3]:
+        print(f"  error: HTTP {r.status} {r.error[:200]}")
+    return 0 if len(good) == len(results) else 1
 
 
 if __name__ == "__main__":
-    argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter).parse_args()
-    sys.exit(main())
+    sys.exit(asyncio.run(main()))

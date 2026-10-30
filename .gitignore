@@ -29,6 +29,6 @@ htmlcov/
 # Local logs
 *.log
 
-# Local run reports (run_all / benchmark logs)
-reports/
-k8s/base/generated/
+# Native engine (Apple Silicon) pid + log; batch outputs
+.run/
+results*.jsonl

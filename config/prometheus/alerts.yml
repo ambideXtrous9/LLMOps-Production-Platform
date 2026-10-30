@@ -1,0 +1,91 @@
+# ==============================================================================
+# Alert rules - firing alerts show on the Grafana dashboard ("Alerts" row) and at
+# http://localhost:9090/alerts. To get notified, add an Alertmanager or a Grafana
+# contact point.
+# ==============================================================================
+
+groups:
+  - name: availability
+    rules:
+      - alert: EngineDown
+        expr: up{job="engine"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Inference engine is not answering ({{ $labels.instance }})"
+          description: "Prometheus cannot scrape the engine. Check: docker compose logs engine"
+
+      - alert: GatewayDown
+        expr: up{job="litellm"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "LiteLLM gateway is not answering"
+          description: "Check: docker compose logs litellm"
+
+      - alert: GatewayErrorRateHigh
+        expr: |
+          sum(rate(litellm_proxy_failed_requests_metric_total[5m]))
+            / clamp_min(sum(rate(litellm_proxy_total_requests_metric_total[5m])), 0.001) > 0.05
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "More than 5% of gateway requests fail ({{ $value | humanizePercentage }})"
+
+  - name: latency-and-saturation
+    rules:
+      - alert: TimeToFirstTokenHigh
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[5m]))) > 2
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "P95 time to first token is {{ $value | humanizeDuration }}"
+          description: "Requests queue or prompts are long. Look at waiting requests and KV-cache usage."
+
+      - alert: KVCacheSaturated
+        expr: max(vllm:kv_cache_usage_perc) > 0.9
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "KV cache is {{ $value | humanizePercentage }} full"
+          description: "New requests wait for cache blocks. Lower MAX_MODEL_LEN / MAX_NUM_SEQS, use a smaller model or add GPU memory."
+
+      - alert: RequestsQueueing
+        expr: sum(vllm:num_requests_waiting) > 10
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $value }} requests waiting for a batch slot"
+
+      - alert: RequestsPreempted
+        expr: sum(rate(vllm:num_preemptions_total[5m])) > 0
+        for: 10m
+        labels: {severity: info}
+        annotations:
+          summary: "The engine keeps preempting requests (KV cache pressure)"
+
+  - name: hardware
+    rules:
+      - alert: GPUTemperatureHigh
+        expr: DCGM_FI_DEV_GPU_TEMP > 85
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "GPU {{ $labels.gpu }} at {{ $value }}°C (clocks throttle)"
+
+      - alert: HostMemoryLow
+        expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.08
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Host memory {{ $value | humanizePercentage }} free"
+
+      - alert: DiskSpaceLow
+        expr: |
+          node_filesystem_avail_bytes{mountpoint="/", fstype!~"tmpfs|overlay"}
+            / node_filesystem_size_bytes{mountpoint="/", fstype!~"tmpfs|overlay"} < 0.1
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Root disk {{ $value | humanizePercentage }} free (model weights and images need room)"
