@@ -2333,6 +2333,7 @@
     },
     {
       "type": "logs",
+      "description": "ERROR/CRITICAL lines, tracebacks and out-of-memory errors from the engine and the gateway. Rejected API keys (HTTP 401) show here too; run_all.sh sends one on purpose to test auth. Hidden: the vLLM startup notice that FlashAttention 2 needs compute capability 8.0+ (other backends are used).",
       "title": "Errors (engine + gateway)",
       "id": 40,
       "description": "",
@@ -2352,7 +2353,7 @@
             "type": "loki",
             "uid": "loki"
           },
-          "expr": "{service=~\"engine|litellm\"} |~ \"(?i)(error|exception|traceback|out of memory)\"",
+          "expr": "{service=~\"engine|litellm\"} |~ `\"level\": \"(ERROR|CRITICAL)\"|(^|\\) )(ERROR|CRITICAL) \\d\\d-\\d\\d |Traceback \\(most recent call last\\)|(^|\\) )[A-Za-z_.]*(Error|Exception): |(?i:out of memory)|CUDA error` !~ `Cannot use FA version`",
           "refId": "A",
           "queryType": "range"
         }

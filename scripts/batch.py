@@ -32,7 +32,9 @@ async def run_one(item, model, args, sem):
     body = dict(item.get("body") or {})
     body.setdefault("model", model)
     url = args.url.rstrip("/") + (item.get("url") or "/v1/chat/completions")
-    if args.no_cache:
+    if args.cache:
+        body["cache"] = {"use-cache": True}
+    elif args.no_cache:
         body["cache"] = {"no-cache": True}
     delay, last = 1.0, None
     async with sem:
@@ -62,7 +64,8 @@ async def main() -> int:
     p.add_argument("--model", help="default model (default: the served model)")
     p.add_argument("--url", default=GATEWAY_URL, help=f"gateway base URL (default {GATEWAY_URL})")
     p.add_argument("--key", default=API_KEY, help="API key (default LITELLM_API_KEY from .env)")
-    p.add_argument("--no-cache", action="store_true", help="bypass the gateway response cache")
+    p.add_argument("--cache", action="store_true", help="use the gateway response cache (opt-in): repeats answered from Redis")
+    p.add_argument("--no-cache", action="store_true", help="bypass the gateway response cache (default)")
     args = p.parse_args()
 
     items = []

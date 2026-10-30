@@ -44,12 +44,14 @@ litellm_settings:
   request_timeout: 600
   json_logs: true
 
-  # Exact-match response cache in Redis: a repeated request is answered without the
-  # engine. Per request: {"cache": {"no-cache": true}} skips it.
+  # Exact-match response cache in Redis, opt-in per request: {"cache": {"use-cache": true}}
+  # answers a repeated request without the engine. Off by default: answers are sampled, so a
+  # repeated prompt should get a fresh generation (and real latency in the logs).
   cache: true
   cache_params:
     type: redis
     namespace: llmops
+    mode: default_off
     ttl: 3600
     supported_call_types: ["acompletion", "atext_completion"]
 
@@ -58,4 +60,5 @@ general_settings:
   # virtual keys, budgets, rate limits and spend tracking
   database_url: os.environ/DATABASE_URL
   database_connection_pool_limit: 5
-  store_prompts_in_spend_logs: false
+  # keep request and response bodies with each log entry (Logs page in the gateway UI)
+  store_prompts_in_spend_logs: true

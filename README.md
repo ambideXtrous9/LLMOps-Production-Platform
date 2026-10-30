@@ -30,7 +30,7 @@
 | :--- | :--- |
 | **Serve** | Any Hugging Face model on vLLM: continuous batching, PagedAttention KV cache, prefix caching |
 | **Any hardware** | NVIDIA · AMD ROCm · CPU (x86_64 / arm64) · Apple Silicon — the vLLM build is picked automatically |
-| **Endpoint** | LiteLLM gateway: OpenAI API, virtual keys, rate limits, retries, response cache |
+| **Endpoint** | LiteLLM gateway: OpenAI API, virtual keys, rate limits, retries, opt-in response cache |
 | **Batch** | Server-side continuous batching + `scripts/batch.py` for JSONL batch jobs (OpenAI Batch format) |
 | **Observe** | One Grafana dashboard: latency, throughput, batching, KV cache, gateway, GPU, host, logs, alerts |
 | **Resilient** | Health checks + autoheal, gateway retries, engine boot fallbacks, resumable batch jobs |
@@ -50,7 +50,7 @@
                                                 ▼
 ┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ 1. GATEWAY PLANE — LiteLLM (:4000)                                                              │
-│    • Virtual keys · budgets · rate limits (Postgres)     • Exact-match response cache (Redis)   │
+│    • Virtual keys · budgets · rate limits (Postgres)     • Opt-in response cache (Redis)        │
 │    • Retries · timeouts · cooldowns                      • Prometheus metrics (internal :9095)  │
 └───────────────────────────────────────────────┬─────────────────────────────────────────────────┘
                                                 │ OpenAI API → engine:8000
@@ -87,12 +87,12 @@
 Client            LiteLLM (:4000)                  vLLM engine (:8000)                Prometheus · Loki
   │                     │                                   │                                   │
 1 │── POST /v1/chat ───>│                                   │                                   │
-2 │                     │── key · rate limit · cache lookup │                                   │
+2 │                     │── key · rate limit · opt-in cache │                                   │
 3 │                     │── forward (retry on 5xx/timeout) ─>│                                   │
 4 │                     │                                   │── join the running batch           │
 5 │                     │                                   │   reuse cached prefix KV blocks    │
 6 │                     │<──────────── stream tokens ───────│                                   │
-7 │<── SSE tokens ──────│── cache store                     │                                   │
+7 │<── SSE tokens ──────│── cache store (opt-in)            │                                   │
   │                     │                                   │                                   │
   │                     │<┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄ scrape :9095 ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄│
   │                     │                                   │<┄┄┄┄ scrape /metrics (10 s) ┄┄┄┄┄┄│
@@ -208,6 +208,9 @@ r = client.chat.completions.create(model="qwen2.5-0.5b-instruct",
 print(r.choices[0].message.content)
 ```
 
+- **Notebook** — `test/litellm_api_test.ipynb`: chat + streaming (with time to first token). Reads the key from `LITELLM_API_KEY_QWEN` (environment or `.env`, never printed; empty → `LITELLM_API_KEY`).
+- **Own keys** — create one in the UI (*Virtual Keys*), put it in `.env` as `LITELLM_API_KEY_QWEN=…`; never commit keys.
+
 ### 6.3 Batch Jobs
 
 ```bash
@@ -222,8 +225,9 @@ python3 scripts/batch.py examples/batch.jsonl results.jsonl --concurrency 32
 
 | Option | How |
 | :--- | :--- |
-| Skip the response cache | body `"cache": {"no-cache": true}` |
+| Use the response cache (off by default) | body `"cache": {"use-cache": true}`: an identical request within 1 h is answered from Redis (Logs: duration ≈ 0, no TTFT) |
 | New keys, budgets, rate limits | UI `http://localhost:4000/ui` (admin + `LITELLM_MASTER_KEY`) or `POST /key/generate` |
+| Per-request history (prompt, response, tokens, latency) | UI → Logs; bodies are stored in Postgres (`store_prompts_in_spend_logs` in `config/litellm.yaml`, set `false` to stop) |
 | Engine directly (no key, server-local) | `curl localhost:8000/v1/models` |
 
 ---
@@ -237,7 +241,7 @@ python3 scripts/batch.py examples/batch.jsonl results.jsonl --concurrency 32
 | Automatic prefix caching | shared prompt prefixes (system prompts, chat history) reuse KV blocks | always on |
 | Chunked prefill | long prompts do not stall running decodes | vLLM default |
 | CUDA graphs / compile cache | kernels cached in the `engine_cache` volume → fast restarts | — |
-| Response cache | identical requests answered from Redis without the engine | `cache.no-cache` per request |
+| Response cache | identical requests answered from Redis without the engine (opt-in) | `cache.use-cache` per request · `mode` in `config/litellm.yaml` |
 | Gateway workers | parallel LiteLLM processes, sized by CPU threads | `LITELLM_NUM_WORKERS` |
 
 ```bash
@@ -260,11 +264,13 @@ python3 scripts/load_test.py --concurrency 16 --requests 64      # TTFT, latency
 | Model not downloadable | gated / private / misspelled → default model for the hardware |
 | Busy host port | moved to the next free port, saved in `.env` |
 | Registry offline | cached images used |
-| Batch job interrupted | `scripts/batch.py` resumes; finished requests also hit the response cache |
+| Batch job interrupted | `scripts/batch.py` resumes (finished lines kept); `--cache` also answers repeats from Redis |
 
 ---
 
 ## 9. Observability
+
+### 9.1 Grafana — dashboard "LLM Serving"
 
 Grafana `http://localhost:3001` → dashboard **LLM Serving** (home page).
 
@@ -276,11 +282,34 @@ Grafana `http://localhost:3001` → dashboard **LLM Serving** (home page).
 | KV cache | usage · prefix cache hit rate · preemptions |
 | Gateway (LiteLLM) | requests, failures, tokens per key |
 | Hardware | GPU utilisation, memory, power, temperature · host CPU and memory |
-| Logs & alerts | firing alerts · engine + gateway errors · all logs (filter by service) |
+| Logs & alerts | firing alerts · engine + gateway errors (incl. rejected API keys) · all logs (filter by service) |
 
 - **Same metrics on every platform** — vLLM's own `/metrics` (`vllm:*`), whatever the hardware.
 - **Alerts** — `config/prometheus/alerts.yml`; firing ones on the dashboard and `http://localhost:9090/alerts`. Notifications: add an Alertmanager or a Grafana contact point.
-- **Logs** — Explore → Loki → `{service="engine"}` (also `litellm`, `prometheus`, …).
+- **Logs** — Explore → Loki → `{service="engine"}` (also `litellm`, `prometheus`, …). Kept 7 days in the `loki_data` volume, across restarts and `--down`.
+
+Under a batch job (128 requests, 32 in flight, GTX 1650):
+
+![Grafana: overview and latency](docs/images/grafana-overview-latency.png)
+![Grafana: throughput, continuous batching and KV cache](docs/images/grafana-throughput-kv-cache.png)
+![Grafana: gateway and hardware (DCGM GPU, host)](docs/images/grafana-gateway-hardware.png)
+
+### 9.2 LiteLLM UI — requests, keys, usage
+
+`http://localhost:4000/ui` (admin + `LITELLM_MASTER_KEY`).
+
+| Page | Shows |
+| :--- | :--- |
+| Logs | every request: key, model, tokens, duration, TTFT, cache hit; prompt and response (`store_prompts_in_spend_logs`) |
+| Usage | requests, tokens and failures per model, key and endpoint (tabs *Model / Key / Endpoint Activity*; *Cost* stays $0 for a self-hosted model without a price) |
+| Virtual Keys | create keys, limit models, budgets, rate limits |
+
+- **TTFT** — measured for streamed requests only; a non-streamed answer arrives in one piece, so Logs shows `-`. Engine TTFT for every request: Grafana.
+- **Duration ≈ 0** — answered from the response cache (only when the request opts in with `"cache": {"use-cache": true}`).
+
+![LiteLLM: request logs](docs/images/litellm-logs.png)
+![LiteLLM: request detail (duration, TTFT, cache, prompt and response)](docs/images/litellm-request-detail.png)
+![LiteLLM: usage by model](docs/images/litellm-usage.png)
 
 ---
 
@@ -313,7 +342,7 @@ Grafana `http://localhost:3001` → dashboard **LLM Serving** (home page).
 | :--- | :--- |
 | Model | `MODEL` · `SERVED_MODEL_NAME` · `MAX_MODEL_LEN` · `MAX_NUM_SEQS` · `GPU_MEMORY_UTILIZATION` · `DTYPE` · `GPU_COUNT` · `CPU_KV_CACHE_GB` · `HF_TOKEN` · `HF_CACHE_DIR` |
 | Engine | `VLLM_EXTRA_ARGS` · `ENGINE_START_PERIOD` |
-| Gateway | `LITELLM_MASTER_KEY` · `LITELLM_API_KEY` · `LITELLM_NUM_WORKERS` · `POSTGRES_*` · `REDIS_PASSWORD` |
+| Gateway | `LITELLM_MASTER_KEY` · `LITELLM_API_KEY` · `LITELLM_API_KEY_QWEN` (optional, for `test/`) · `LITELLM_NUM_WORKERS` · `POSTGRES_*` · `REDIS_PASSWORD` |
 | Grafana | `GF_SECURITY_ADMIN_USER` · `GF_SECURITY_ADMIN_PASSWORD` |
 | Network | `PUBLIC_BIND_ADDRESS` · `BIND_ADDRESS` · `PUBLIC_HOST` · `*_PORT` |
 | Versions | `VLLM_VERSION` · `LITELLM_VERSION` · `PROMETHEUS_VERSION` · `GRAFANA_VERSION` · `LOKI_VERSION` · `ALLOY_VERSION` · `DCGM_EXPORTER_VERSION` |
@@ -336,6 +365,9 @@ Grafana `http://localhost:3001` → dashboard **LLM Serving** (home page).
 | Port moved (e.g. Grafana on 3002) | another program held it; see `*_PORT` in `.env` |
 | `401` from the gateway | use `LITELLM_API_KEY` from `.env` (the master key is for admin) |
 | Slow on CPU | expected: a few to tens of tokens/s; keep models ≤ 1.5B |
+| LiteLLM Logs: TTFT `-` | request was not streamed (`stream: true` to measure it) |
+| LiteLLM Logs: duration 0.00, same request ID | cache hit: the request sent `"use-cache": true` |
+| LiteLLM Logs: no prompt / response | request was sent before `store_prompts_in_spend_logs: true` |
 
 ---
 
@@ -361,6 +393,8 @@ LLMOps/
 │   ├── load_test.py              # streaming load test
 │   ├── llm_client.py             # shared asyncio HTTP client
 │   └── bootstrap_host.sh         # Ubuntu: Docker + NVIDIA container toolkit
+├── test/litellm_api_test.ipynb   # OpenAI SDK against the gateway: chat + streaming
 ├── examples/batch.jsonl
+├── docs/images/                  # screenshots (Grafana, LiteLLM UI)
 └── .env.example
 ```

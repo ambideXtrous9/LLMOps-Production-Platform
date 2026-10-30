@@ -110,7 +110,8 @@ async def main() -> int:
     await check("concurrent batch via gateway", batch())
 
     async def cache():
-        body = dict(ask, messages=[{"role": "user", "content": f"Say OK. ({time.time()})"}])
+        body = dict(ask, cache={"use-cache": True},  # the response cache is opt-in
+                    messages=[{"role": "user", "content": f"Say OK. ({time.time()})"}])
         await request("POST", chat_url, body, key=API_KEY, timeout=600)
         t0 = time.perf_counter()
         r = await request("POST", chat_url, body, key=API_KEY, timeout=60)
