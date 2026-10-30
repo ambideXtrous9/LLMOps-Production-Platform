@@ -41,74 +41,109 @@
 
 ### 2.1 Planes
 
-```text
-                   ┌──────────────────────────────────────────────────────────┐
-                   │   CLIENT  ·  OPENAI SDK  ·  CURL  ·  scripts/batch.py    │
-                   └────────────────────────────┬─────────────────────────────┘
-                                                │ POST /v1/chat/completions  (stream · concurrent batch)
-                                                │ Bearer LITELLM_API_KEY
-                                                ▼
-┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ 1. GATEWAY PLANE — LiteLLM (:4000)                                                              │
-│    • Virtual keys · budgets · rate limits (Postgres)     • Opt-in response cache (Redis)        │
-│    • Retries · timeouts · cooldowns                      • Prometheus metrics (internal :9095)  │
-└───────────────────────────────────────────────┬─────────────────────────────────────────────────┘
-                                                │ OpenAI API → engine:8000
-                                                ▼
-┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ 2. INFERENCE PLANE — vLLM 0.32 OpenAI server (:8000), build picked per hardware                 │
-│    NVIDIA: vllm-openai (CUDA 13 / 12.9) · AMD: vllm-openai-rocm · CPU: vllm-openai-cpu          │
-│    Apple Silicon: vllm-metal on the host                                                        │
-│    • Continuous batching  • PagedAttention KV cache  • Automatic prefix caching                 │
-└─────────────────┬───────────────────────────────────────────────────────────┬───────────────────┘
-                  │ /metrics, 10 s scrape                                     │ container logs
-                  ▼                                                           ▼
-┌────────────────────────────────────────────────────┐ ┌──────────────────────────────────────────┐
-│ 3. METRICS PLANE — Prometheus (:9090)              │ │ 4. LOGS PLANE — Alloy → Loki             │
-│    engine · litellm · gpu (DCGM) · node            │ │    every container, label service=<name> │
-│    10 alert rules (availability, latency, KV       │ │    7-day retention                       │
-│    cache, queueing, GPU temperature, memory, disk) │ │                                          │
-└─────────────────────────┬──────────────────────────┘ └────────────────────┬─────────────────────┘
-                          │ PromQL                                          │ LogQL
-                          ▼                                                 ▼
-┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ 5. VISUALIZATION PLANE — Grafana (:3001), dashboard "LLM Serving"                               │
-│    Overview · Latency · Throughput & batching · KV cache · Gateway · Hardware · Logs & alerts   │
-└─────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ 6. RESILIENCE — restart policies · health checks · autoheal (restarts unhealthy containers) ·   │
-│    gateway retries · run_all.sh boot fallbacks (shorter context → smaller model → CPU)          │
-└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+---
+config:
+  flowchart:
+    wrappingWidth: 480
+    subGraphTitleMargin:
+      top: 6
+      bottom: 6
+---
+flowchart TB
+    client(["Client · OpenAI SDK · curl · scripts/batch.py"])
+
+    subgraph gateway["1 · Gateway plane"]
+        litellm["<b>LiteLLM :4000</b><br/>Virtual keys · budgets · rate limits (Postgres)<br/>Retries · timeouts · cooldowns<br/>Opt-in response cache (Redis)<br/>Prometheus metrics (internal :9095)"]
+    end
+
+    subgraph inference["2 · Inference plane"]
+        vllm["<b>vLLM 0.32 OpenAI server :8000</b>, build picked per hardware<br/>NVIDIA: vllm-openai (CUDA 13 / 12.9) · AMD: vllm-openai-rocm<br/>CPU: vllm-openai-cpu · Apple Silicon: vllm-metal on the host<br/>Continuous batching · PagedAttention KV cache · Automatic prefix caching"]
+    end
+
+    subgraph metrics["3 · Metrics plane"]
+        prometheus["<b>Prometheus :9090</b><br/>Scrapes engine · litellm · gpu (DCGM) · node<br/>10 alert rules: availability, latency, KV cache,<br/>queueing, GPU temperature, memory, disk"]
+    end
+
+    subgraph logs["4 · Logs plane"]
+        loki["<b>Alloy → Loki</b><br/>Every container, labelled by service<br/>7-day retention (loki_data volume)"]
+    end
+
+    subgraph visualization["5 · Visualization plane"]
+        grafana["<b>Grafana :3001</b>, dashboard LLM Serving<br/>Overview · Latency · Throughput & batching · KV cache<br/>Gateway · Hardware · Logs & alerts"]
+    end
+
+    resilience["<b>6 · Resilience</b><br/>restart policies · health checks · autoheal (restarts unhealthy containers)<br/>gateway retries · run_all.sh boot fallbacks (shorter context → smaller model → CPU)"]
+
+    client -- "POST /v1/chat/completions (stream · concurrent batch)<br/>Bearer LITELLM_API_KEY" --> litellm
+    litellm -- "OpenAI API → engine:8000" --> vllm
+    vllm -- "/metrics, 10 s scrape" --> prometheus
+    litellm -. ":9095" .-> prometheus
+    vllm -. "container logs" .-> loki
+    litellm -. "container logs" .-> loki
+    prometheus -- PromQL --> grafana
+    loki -- LogQL --> grafana
+    grafana ~~~ resilience
 ```
 
 ### 2.2 Request Path
 
-```text
-Client            LiteLLM (:4000)                  vLLM engine (:8000)                Prometheus · Loki
-  │                     │                                   │                                   │
-1 │── POST /v1/chat ───>│                                   │                                   │
-2 │                     │── key · rate limit · opt-in cache │                                   │
-3 │                     │── forward (retry on 5xx/timeout) ─>│                                   │
-4 │                     │                                   │── join the running batch           │
-5 │                     │                                   │   reuse cached prefix KV blocks    │
-6 │                     │<──────────── stream tokens ───────│                                   │
-7 │<── SSE tokens ──────│── cache store (opt-in)            │                                   │
-  │                     │                                   │                                   │
-  │                     │<┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄ scrape :9095 ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄│
-  │                     │                                   │<┄┄┄┄ scrape /metrics (10 s) ┄┄┄┄┄┄│
-  │                     │┄┄┄┄┄┄┄┄┄ container logs (Alloy) ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄>│
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant G as LiteLLM :4000
+    participant E as vLLM engine :8000
+    participant P as Prometheus
+    participant L as Loki (via Alloy)
+
+    C->>G: POST /v1/chat/completions (Bearer key)
+    G->>G: key · rate limit · response cache (opt-in)
+    G->>E: forward (retry on 5xx / timeout)
+    E->>E: join the running batch · reuse cached prefix KV blocks
+    E-->>G: stream tokens
+    G-->>C: SSE tokens
+    G->>G: cache store (opt-in)
+
+    Note over G,L: observability, independent of requests
+    P-)G: scrape :9095
+    P-)E: scrape /metrics (10 s)
+    G-)L: container logs
+    E-)L: container logs
 ```
 
 ### 2.3 Network Exposure
 
-```text
-┌──────────────────────────────────────────────┐ ┌──────────────────────────────────────────────┐
-│ PUBLIC_BIND_ADDRESS (default 127.0.0.1)      │ │ BIND_ADDRESS (127.0.0.1) · no login          │
-│ login required                               │ │                                              │
-│   LiteLLM gateway + UI   :4000               │ │   vLLM engine            :8000               │
-│   Grafana                :3001               │ │   Prometheus             :9090               │
-└──────────────────────────────────────────────┘ └──────────────────────────────────────────────┘
-  Docker network only: Postgres · Redis · Loki · Alloy · node-exporter · DCGM · LiteLLM metrics :9095
+```mermaid
+---
+config:
+  flowchart:
+    wrappingWidth: 480
+    subGraphTitleMargin:
+      top: 6
+      bottom: 6
+---
+flowchart LR
+    clients(["Clients / browser"])
+    local(["Server shell / SSH tunnel"])
+
+    subgraph public["Login required"]
+        gw["LiteLLM gateway + UI :4000"]
+        gf["Grafana :3001"]
+    end
+
+    subgraph private["No login"]
+        engine["vLLM engine :8000"]
+        prom["Prometheus :9090"]
+    end
+
+    subgraph docker["No host port"]
+        internal["Postgres · Redis · Loki · Alloy<br/>node-exporter · DCGM · LiteLLM metrics :9095"]
+    end
+
+    clients -- "PUBLIC_BIND_ADDRESS<br/>(default 127.0.0.1)" --> public
+    local -- "BIND_ADDRESS<br/>(127.0.0.1)" --> private
+    gw -- "Docker network only" --> internal
 ```
 
 ---
