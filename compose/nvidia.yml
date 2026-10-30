@@ -1,0 +1,43 @@
+# ==============================================================================
+# NVIDIA GPUs: GPU access for the engine + NVIDIA DCGM exporter (GPU telemetry)
+# ==============================================================================
+# Added by run_all.sh to compose/vllm.yml on NVIDIA hosts.
+# CUDA_VISIBLE_DEVICES (set by run_all.sh) lists the GPUs with the most free memory.
+# ==============================================================================
+
+services:
+  engine:
+    environment:
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  dcgm-exporter:
+    image: nvcr.io/nvidia/k8s/dcgm-exporter:${DCGM_EXPORTER_VERSION:-4.5.2-4.8.1-ubuntu22.04}
+    container_name: llmops-dcgm-exporter
+    mem_limit: 1g
+    cap_add:
+      - SYS_ADMIN
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "2"
+
+  prometheus:
+    volumes:
+      - ./config/prometheus/scrape/dcgm.yml:/etc/prometheus/scrape.d/gpu.yml:ro

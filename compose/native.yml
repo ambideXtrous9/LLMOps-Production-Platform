@@ -1,0 +1,16 @@
+# ==============================================================================
+# Apple Silicon: the engine (vllm-metal) runs natively on macOS, outside Docker
+# ==============================================================================
+# Containers cannot reach the Metal GPU, so run_all.sh starts `vllm serve` on the
+# host (port 8000, log in .run/engine.log). Gateway and Prometheus reach it through
+# host.docker.internal.
+# ==============================================================================
+
+services:
+  litellm:
+    environment:
+      ENGINE_API_BASE: http://host.docker.internal:8000/v1
+
+  prometheus:
+    volumes:
+      - ./config/prometheus/scrape/native.yml:/etc/prometheus/scrape.d/engine.yml:ro

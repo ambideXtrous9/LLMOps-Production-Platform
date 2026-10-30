@@ -1,0 +1,65 @@
+# ==============================================================================
+# Engine: vLLM OpenAI server (NVIDIA, AMD ROCm or CPU)
+# ==============================================================================
+# VLLM_IMAGE is set by run_all.sh: vllm/vllm-openai (NVIDIA, with compose/nvidia.yml;
+# -cu129 build for drivers older than 580), vllm/vllm-openai-rocm (AMD, with
+# compose/rocm.yml) or vllm/vllm-openai-cpu (CPU, x86_64 + arm64). Continuous
+# batching, PagedAttention KV cache and prefix caching are vLLM's own; the knobs
+# below come from .env.
+# ==============================================================================
+
+services:
+  engine:
+    image: ${VLLM_IMAGE:-vllm/vllm-openai-cpu:v0.32.0}
+    container_name: llmops-engine
+    mem_limit: ${ENGINE_MEM_LIMIT:-8g}
+    ipc: host
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${VLLM_PORT:-8000}:8000"
+    volumes:
+      - ${HF_CACHE_DIR:-~/.cache/huggingface}:/root/.cache/huggingface
+      - engine_cache:/root/.cache/vllm
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+      # CPU engine only: GiB of RAM for the KV cache, OpenMP threads on physical cores
+      VLLM_CPU_KVCACHE_SPACE: ${CPU_KV_CACHE_GB:-4}
+      VLLM_CPU_OMP_THREADS_BIND: ${VLLM_CPU_OMP_THREADS_BIND:-auto}
+    # The image ENTRYPOINT is `vllm serve`: the first argument is the model.
+    command: >
+      ${MODEL:-Qwen/Qwen2.5-0.5B-Instruct}
+      --served-model-name ${SERVED_MODEL_NAME:-llm}
+      --dtype ${DTYPE:-auto}
+      --max-model-len ${MAX_MODEL_LEN:-8192}
+      --max-num-seqs ${MAX_NUM_SEQS:-64}
+      --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION:-0.90}
+      --tensor-parallel-size ${GPU_COUNT:-1}
+      --enable-prefix-caching
+      --disable-uvicorn-access-log
+      --host 0.0.0.0
+      --port 8000
+      ${VLLM_TUNING_ARGS:-}
+      ${VLLM_EXTRA_ARGS:-}
+    healthcheck:
+      # python3 ships in every vLLM image; curl does not
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=4)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      # first boot downloads weights and compiles kernels
+      start_period: ${ENGINE_START_PERIOD:-1800s}
+    labels:
+      autoheal: "true"
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  litellm:
+    environment:
+      ENGINE_API_BASE: http://engine:8000/v1
+
+  prometheus:
+    volumes:
+      - ./config/prometheus/scrape/vllm.yml:/etc/prometheus/scrape.d/engine.yml:ro

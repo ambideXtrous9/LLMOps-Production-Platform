@@ -1,74 +1,61 @@
 # ==============================================================================
-# LiteLLM AI Gateway Hardened Production Configuration (Plane 1)
+# LiteLLM gateway: one OpenAI-compatible endpoint in front of the engine
 # ==============================================================================
-# Enforces:
-#  - Virtual key authentication via PostgreSQL persistence
-#  - Redis distributed rate-limiting & response caching
-#  - Input guardrail: PII masking before the model sees the prompt (pii_guardrail.py)
-#  - OpenTelemetry W3C traceparent propagation to Tempo (OTEL_* env, see compose)
-#  - Prometheus golden signal callbacks
-#  - Dynamic fallback routing & retries
-#
-# This file is gateway POLICY only. Routes to the self-hosted vLLM engine are
-# generated at container start by config/render_litellm_config.py from the model
-# settings in .env (SERVED_MODEL_NAME, MODEL_SUPPORTS_*, ...):
-#     <served-name>            -> KV-cache-aware router -> vLLM
-#     <served-name>-direct     -> vLLM (fallback, bypasses the router)
-#     <served-name>-thinking   -> reasoning mode (reasoning-capable models only)
-# so switching to any Hugging Face model needs no edit here.
+# __SERVED_MODEL_NAME__ is replaced at container start (SERVED_MODEL_NAME in .env);
+# ENGINE_API_BASE: the vLLM container (engine:8000) or, on Apple Silicon, the host.
 # ==============================================================================
 
-# Optional extra routes (kept alongside the generated engine routes), e.g. a
-# hosted provider as overflow capacity:
-# model_list:
-#   - model_name: gpt-4o-mini
-#     litellm_params:
-#       model: openai/gpt-4o-mini
-#       api_key: os.environ/OPENAI_API_KEY
+model_list:
+  - model_name: __SERVED_MODEL_NAME__
+    litellm_params:
+      model: hosted_vllm/__SERVED_MODEL_NAME__
+      api_base: os.environ/ENGINE_API_BASE
+      api_key: none
+      timeout: 600
+  # Add more deployments under the same model_name to load-balance (with failover)
+  # across several engines, or a hosted model as overflow, e.g.:
+  # - model_name: gpt-4o-mini
+  #   litellm_params:
+  #     model: openai/gpt-4o-mini
+  #     api_key: os.environ/OPENAI_API_KEY
 
 router_settings:
-  routing_strategy: "least-busy"
-  enable_pre_call_checks: true
+  # Resilience: transient engine errors (restart, overload) are retried, client errors are not
   num_retries: 2
   timeout: 600
-  # fallbacks: <served-name> -> <served-name>-direct is added automatically
-
-guardrails:
-  - guardrail_name: "pii-masking"
-    litellm_params:
-      guardrail: pii_guardrail.PIIMaskingGuardrail
-      mode: "pre_call"
-      default_on: true
+  retry_policy:
+    TimeoutErrorRetries: 1
+    RateLimitErrorRetries: 2
+    InternalServerErrorRetries: 2
+    BadRequestErrorRetries: 0
+    AuthenticationErrorRetries: 0
+    ContentPolicyViolationErrorRetries: 0
+  allowed_fails: 3
+  cooldown_time: 30
 
 litellm_settings:
-  # /metrics on the gateway port needs a key (it lists teams, key aliases and spend);
-  # Prometheus scrapes the separate internal metrics port (PROMETHEUS_METRICS_PORT).
+  # Prometheus metrics: requests, latency, TTFT, tokens and failures per key and model
+  callbacks: ["prometheus"]
+  # /metrics on the (possibly public) gateway port needs a key; Prometheus reads the
+  # internal port PROMETHEUS_METRICS_PORT instead
   require_auth_for_metrics_endpoint: true
+  # parameters the engine does not support are dropped instead of failing the request
+  drop_params: true
+  request_timeout: 600
+  json_logs: true
 
-  # Multi-telemetry egress: Prometheus golden signals, OTLP spans via Alloy -> Tempo,
-  # and LLM traces (prompts, completions, tokens, cost) to Langfuse over OTLP
-  callbacks: ["prometheus", "otel", "langfuse_otel"]
-  # Pass the caller's W3C traceparent on to the router / vLLM so engine spans join the
-  # same Tempo trace as the gateway spans (LiteLLM's default is to drop it).
-  forward_traceparent_to_llm_provider: true
-
-  # Distributed Redis exact-response cache (connection from REDIS_URL).
-  # Clients bypass it per request with {"cache": {"no-cache": true}}.
+  # Exact-match response cache in Redis: a repeated request is answered without the
+  # engine. Per request: {"cache": {"no-cache": true}} skips it.
   cache: true
   cache_params:
-    type: "redis"
-    namespace: "litellm.cache"
+    type: redis
+    namespace: llmops
     ttl: 3600
-    supported_call_types: ["acompletion", "completion"]
+    supported_call_types: ["acompletion", "atext_completion"]
 
 general_settings:
-  # Master key loaded strictly from environment secret (ADMIN ONLY)
   master_key: os.environ/LITELLM_MASTER_KEY
-
-  # Relational Database for per-team virtual keys, spend budgets, & audit log
+  # virtual keys, budgets, rate limits and spend tracking
   database_url: os.environ/DATABASE_URL
-  # Connections per worker process: LITELLM_NUM_WORKERS x 5 in total, so a shared or
-  # managed Postgres (often max_connections 100) is never exhausted
   database_connection_pool_limit: 5
-  store_model_in_db: true
-  store_prompts_in_spend_logs: false  # PII protection: don't store raw prompts in DB logs
+  store_prompts_in_spend_logs: false
