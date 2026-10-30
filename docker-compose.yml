@@ -134,6 +134,7 @@ services:
     mem_limit: 1g
     volumes:
       - ./config/loki.yaml:/etc/loki/config.yaml:ro
+      - loki_data:/loki
     command: -config.file=/etc/loki/config.yaml
     restart: unless-stopped
     logging: *logging
@@ -207,4 +208,5 @@ services:
 volumes:
   postgres_data:
   prometheus_data:
+  loki_data:
   engine_cache:
